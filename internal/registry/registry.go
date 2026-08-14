@@ -1,0 +1,188 @@
+// Package registry 加载并索引 config/ 目录下的 provider 与模型注册表。
+// JSON 格式与原 Node 实现完全兼容：config/<vendor>/<vendor>.json 定义
+// provider，config/<vendor>/<method>/<model>.json 每文件声明若干模型。
+package registry
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+)
+
+// Provider 是一个可路由的上游服务定义。
+type Provider struct {
+	ID          string     `json:"id"`
+	DisplayName string     `json:"displayName"`
+	Kind        string     `json:"kind"` // 本 fork 只认 "openai-compatible"
+	OwnedBy     string     `json:"ownedBy"`
+	BaseURL     string     `json:"baseUrl"`
+	BaseURLEnv  string     `json:"baseUrlEnv"`
+	Protocol    string     `json:"protocol"` // "" = chat completions; "openai-responses"; "anthropic"
+	VariantOf   string     `json:"variantOf"`
+	Credential  Credential `json:"credential"`
+}
+
+// Credential 描述一个 provider 凭据的三层解析来源。
+type Credential struct {
+	Environment      []string `json:"environment"`
+	File             string   `json:"file"`
+	KeychainServices []string `json:"keychainServices"` // 取第一个
+	Prompt           string   `json:"prompt"`
+}
+
+// ReasoningLevel 是模型声明的一档推理强度。
+type ReasoningLevel struct {
+	Effort      string `json:"effort"`
+	Description string `json:"description"`
+}
+
+// Model 是注册表里的一个可路由模型。
+type Model struct {
+	Slug            string           `json:"slug"`
+	GatewayModel    string           `json:"gatewayModel"`
+	UpstreamModel   string           `json:"upstreamModel"`
+	Provider        string           `json:"provider"`
+	Listed          bool             `json:"listed"`
+	DisplayName     string           `json:"displayName"`
+	Description     string           `json:"description"`
+	Priority        int              `json:"priority"`
+	DefaultEffort   string           `json:"defaultEffort"`
+	ReasoningLevels []ReasoningLevel `json:"reasoningLevels"`
+	ContextWindow   int              `json:"contextWindow"`
+	AutoCompact     int              `json:"autoCompact"`
+	InputModalities []string         `json:"inputModalities"`
+	RequestProfile  string           `json:"requestProfile"`
+	CompHash        string           `json:"compHash"`
+}
+
+// Registry 是加载后的索引视图。
+type Registry struct {
+	Providers      map[string]*Provider
+	Models         []*Model
+	bySlug         map[string]*Model
+	byGatewayModel map[string]*Model
+}
+
+type providerFile struct {
+	Version   int        `json:"version"`
+	Providers []Provider `json:"providers"`
+}
+
+type modelFile struct {
+	Version int     `json:"version"`
+	Models  []Model `json:"models"`
+}
+
+// Load 读取 configRoot 下的全部注册表片段并构建索引。
+func Load(configRoot string) (*Registry, error) {
+	r := &Registry{
+		Providers:      map[string]*Provider{},
+		bySlug:         map[string]*Model{},
+		byGatewayModel: map[string]*Model{},
+	}
+	vendorDirs, err := os.ReadDir(configRoot)
+	if err != nil {
+		return nil, fmt.Errorf("read config root %s: %w", configRoot, err)
+	}
+	for _, vendor := range vendorDirs {
+		if !vendor.IsDir() {
+			continue
+		}
+		vendorDir := filepath.Join(configRoot, vendor.Name())
+		definition := filepath.Join(vendorDir, vendor.Name()+".json")
+		if raw, err := os.ReadFile(definition); err == nil {
+			var pf providerFile
+			if err := json.Unmarshal(raw, &pf); err != nil {
+				return nil, fmt.Errorf("parse %s: %w", definition, err)
+			}
+			for i := range pf.Providers {
+				p := pf.Providers[i]
+				if p.Kind != "openai-compatible" {
+					continue // 本 fork 不认 OAuth / keyless / anonymous provider
+				}
+				r.Providers[p.ID] = &p
+			}
+		}
+		// 每个 method 子目录里的模型片段
+		methodDirs, err := os.ReadDir(vendorDir)
+		if err != nil {
+			continue
+		}
+		for _, method := range methodDirs {
+			if !method.IsDir() {
+				continue
+			}
+			fragments, err := os.ReadDir(filepath.Join(vendorDir, method.Name()))
+			if err != nil {
+				continue
+			}
+			for _, fragment := range fragments {
+				if fragment.IsDir() || !strings.HasSuffix(fragment.Name(), ".json") {
+					continue
+				}
+				path := filepath.Join(vendorDir, method.Name(), fragment.Name())
+				raw, err := os.ReadFile(path)
+				if err != nil {
+					continue
+				}
+				var mf modelFile
+				if err := json.Unmarshal(raw, &mf); err != nil {
+					return nil, fmt.Errorf("parse %s: %w", path, err)
+				}
+				for _, m := range mf.Models {
+					model := m // 拷贝出循环变量
+					r.Models = append(r.Models, &model)
+					r.bySlug[model.Slug] = &model
+					r.byGatewayModel[model.GatewayModel] = &model
+				}
+			}
+		}
+	}
+	return r, nil
+}
+
+// FromDefinitions 用内存中的定义直接构建索引（测试与编程装配用；
+// Load 才是磁盘注册表的入口）。
+func FromDefinitions(providers []Provider, models []Model) *Registry {
+	r := &Registry{
+		Providers:      map[string]*Provider{},
+		bySlug:         map[string]*Model{},
+		byGatewayModel: map[string]*Model{},
+	}
+	for i := range providers {
+		p := providers[i]
+		r.Providers[p.ID] = &p
+	}
+	for _, m := range models {
+		model := m
+		r.Models = append(r.Models, &model)
+		r.bySlug[model.Slug] = &model
+		r.byGatewayModel[model.GatewayModel] = &model
+	}
+	return r
+}
+
+// ForSlug 按 picker slug 查模型（Codex 请求里的 model 字段）。
+func (r *Registry) ForSlug(slug string) *Model { return r.bySlug[slug] }
+
+// ForGatewayModel 按 gateway id 查模型（翻译层内部使用的 id）。
+func (r *Registry) ForGatewayModel(id string) *Model { return r.byGatewayModel[id] }
+
+// ProviderFor 返回模型所属的 provider 定义。
+func (r *Registry) ProviderFor(m *Model) *Provider {
+	if m == nil {
+		return nil
+	}
+	return r.Providers[m.Provider]
+}
+
+// CanonicalProviderID 把协议变体归并到其家族的主 id，
+// tray 与 usage 按订阅计费而不是按协议变体。
+func (r *Registry) CanonicalProviderID(id string) string {
+	if p, ok := r.Providers[id]; ok && p.VariantOf != "" {
+		return p.VariantOf
+	}
+	return id
+}
