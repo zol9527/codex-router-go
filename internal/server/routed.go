@@ -374,6 +374,12 @@ func (s *Server) serveChatTranslation(w http.ResponseWriter, r *http.Request,
 		s.agingMu.Unlock()
 	}
 
+	// 协作载荷解密：collab 的 encrypted_content 外部模型读不了，
+	// 先换成明文（native 密文走中继，外部明文直接用，均带缓存）。
+	if input, ok := payload["input"].([]any); ok {
+		payload["input"] = s.normalizeRoutedAgentInput(r.Context(), input)
+	}
+
 	// 请求方向 aging：老的大工具结果换回执，最新 frontier 逐字节保留。
 	aging := translate.AgingStats{}
 	if input, ok := payload["input"].([]any); ok {

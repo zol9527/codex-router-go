@@ -55,11 +55,15 @@ func (s *Server) handleRoutedCompaction(w http.ResponseWriter, r *http.Request,
 	providerID := s.opt.Registry.CanonicalProviderID(provider.ID)
 
 	// 请求构造：整段对话 + 压缩指令，非流式、无工具。
-	// 请求方向 aging 与普通回合一致（压缩重放全对话，老工具结果同样昂贵）。
+	// 压缩重放协作条目，agent 载荷解析与普通回合相同（缓存按密文键，
+	// 已解析过的会话零额外成本）；aging 亦与普通回合一致。
 	aging := translate.AgingStats{}
 	compactionPayload := map[string]any{}
 	for k, v := range payload {
 		compactionPayload[k] = v
+	}
+	if input, ok := compactionPayload["input"].([]any); ok {
+		compactionPayload["input"] = s.normalizeRoutedAgentInput(r.Context(), input)
 	}
 	if input, ok := compactionPayload["input"].([]any); ok {
 		if aged, stats := translate.AgeToolResults(input); true {
