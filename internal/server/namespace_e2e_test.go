@@ -11,7 +11,7 @@ import (
 
 // namespace 拍平端到端：上游收到 `<ns>__<tool>` 扁平工具与改名的
 // 历史；模型回发扁平调用名，客户端收到 {name, namespace} 形态
-//（含 create_thread 的会话模型注入）。
+// （含 create_thread 的会话模型注入）。
 func TestNamespaceFlattenEndToEnd(t *testing.T) {
 	var upstreamTools []any
 	var upstreamMessages []any

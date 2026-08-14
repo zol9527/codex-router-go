@@ -368,6 +368,12 @@ func (s *Server) serveChatTranslation(w http.ResponseWriter, r *http.Request,
 	}
 	setAging(aging)
 
+	// codex app 工具合并：客户端只发精简 codex_app namespace，快照补全
+	// deferLoading 推迟的部分，让路由模型看到与原生模型相同的工具集。
+	if merged, changed := translate.MergeCodexAppTools(payload["tools"]); changed {
+		payload["tools"] = merged
+	}
+
 	// namespace 拍平：协作运行时 / app 工具集 / MCP server 以 namespace
 	// 形态下发，chat 上游只认普通 function —— 展开成 `<ns>__<tool>`，
 	// 历史同步改名；响应方向的还原索引由同一个请求构建。
