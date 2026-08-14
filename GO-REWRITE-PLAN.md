@@ -1,14 +1,19 @@
-> 状态（2026-08-15，go-rewrite 分支）：**M1–M4 全部完成；M5 部分完成，仅剩配额卡片/tray 实测/切换。**
+> 状态（2026-08-15，go-rewrite 分支）：**M1–M5 全部编码完成；仅剩两项需操作者在场的收尾（tray 实测、launchd 切换）。**
 > 已落地（12 个功能提交，~9.4k 行 Go，9 包测试全绿，各里程碑有假上游端到端测试）：
 > - M1 协议核心：认证 / native 直通 / Responses↔chat 双向翻译 / Responses 直通 / zstd / retry
 > - M2 集成面：catalog（codex debug models）/ config.toml 标记块 / install·uninstall·doctor / launchd / control
 > - M3 全部：空补全守卫（流式）/ aging / prompt-token 补零 / usage JSONL / 错误翻译 / namespace 拍平（schema 归一·整数 token·spawn_agent 白岗）/ codex-app 快照合并 / compaction v1+v2 / rate-limit 收割 / subagent relay
 > - M4 核心：证据合同 / 引擎解析（pin·auto·回退·loopback 排除）/ 三路读图（registry·native 会话·本地 Ollama）/ 一图一购（缓存+in-flight）/ 重试 / state 门控
 > - M5 部分：presence（effectiveMode 覆盖）/ codex shim（全安全约束）
-> **M4 已全部完成**（周边工具：detached 下载 worker / 基准测量与策展目录
-> 排序 / Ollama runtime headless 拉起与进程所有权，提交 53779ec）。
-> **剩余仅 M5**：配额卡片（ChatGPT 账号用量 + zai/opencode 余额 API）、
-> tray 对接实测、launchd 切换（按共识：功能齐全 + 操作者在场验证后才切）。
+> **M4、M5 的全部编码工作已完成**（16 个功能提交，~11.5k 行 Go，10 个测试
+> 包全绿）。配额卡片已对真实环境验证：ChatGPT 账号窗口经本机登录会话读到
+> （planType plus / 主窗口 34%），zai 配额端点真连通（假 key 正确回传
+> "token expired or incorrect"）。
+> **仅剩两项需要操作者亲自在场的收尾**：
+> 1. tray 对接实测：把 apps/macos/ModelRouterTray 的 bin/control exec 目标
+>    改为 Go 二进制，在图形会话里过一遍按钮面板；
+> 2. launchd 切换：`install` 后卸载旧 Node 栈（按共识"功能齐全 + 操作者在场
+>    验证后才切"；回滚 = plist 指回 node start.mjs，旧 checkout 原样保留）。
 
 ## 目标形态
 
