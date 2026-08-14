@@ -65,6 +65,9 @@ func (s *Server) handleRoutedCompaction(w http.ResponseWriter, r *http.Request,
 	if input, ok := compactionPayload["input"].([]any); ok {
 		compactionPayload["input"] = s.normalizeRoutedAgentInput(r.Context(), input)
 	}
+	// 压缩重放整段对话，任何残留图片同样要在到达文本模型前被读掉
+	//（证据已由贴图回合缓存，这里多半免费）。
+	s.bridgeVision(w, r, compactionPayload, model)
 	if input, ok := compactionPayload["input"].([]any); ok {
 		if aged, stats := translate.AgeToolResults(input); true {
 			_ = aged

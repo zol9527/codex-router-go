@@ -380,6 +380,10 @@ func (s *Server) serveChatTranslation(w http.ResponseWriter, r *http.Request,
 		payload["input"] = s.normalizeRoutedAgentInput(r.Context(), input)
 	}
 
+	// 图片桥：文本模型收不到的贴图由视觉引擎代读，转录替换进回合
+	//（无图 / 桥关 / 无引擎零成本直通；失败降级为 stated failure）。
+	s.bridgeVision(w, r, payload, model)
+
 	// 请求方向 aging：老的大工具结果换回执，最新 frontier 逐字节保留。
 	aging := translate.AgingStats{}
 	if input, ok := payload["input"].([]any); ok {
