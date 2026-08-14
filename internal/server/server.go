@@ -31,9 +31,10 @@ type Options struct {
 	State       *state.State
 	Registry    *registry.Registry
 	Credentials *cred.Resolver
-	ListenAddr  string          // "127.0.0.1:4202"
-	NativeBase  string          // 默认 https://chatgpt.com/backend-api/codex
-	Usage       *usage.Recorder // usage-events.jsonl 管道（可空）
+	ListenAddr  string                // "127.0.0.1:4202"
+	NativeBase  string                // 默认 https://chatgpt.com/backend-api/codex
+	Usage       *usage.Recorder       // usage-events.jsonl 管道（可空）
+	RateLimits  *usage.RateLimitStore // rate-limits.json 收割（可空）
 }
 
 // Server 持有全部共享状态。

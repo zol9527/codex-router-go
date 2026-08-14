@@ -104,6 +104,7 @@ func cmdServe(args []string) error {
 		ListenAddr:  fmt.Sprintf("127.0.0.1:%d", *port),
 		NativeBase:  envOr("CODEX_NATIVE_BASE_URL", "https://chatgpt.com/backend-api/codex"),
 		Usage:       usage.NewRecorder(st.Dir),
+		RateLimits:  usage.NewRateLimitStore(st.Dir),
 	})
 	if err != nil {
 		return err

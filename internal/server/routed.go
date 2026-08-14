@@ -286,6 +286,11 @@ func (s *Server) runChatAttempt(ctx context.Context, target string, headers map[
 		return nil, err
 	}
 	defer resp.Body.Close()
+	// 被动限额收割：响应头自报配额，零额外请求；持久化绝不在
+	// time-to-first-byte 路径上（返回后由 usage 循环异步记录）。
+	if snapshot := usage.ParseRateLimitHeaders(resp.Header, time.Now()); snapshot != nil && s.opt.RateLimits != nil {
+		s.opt.RateLimits.Record(model.Provider, snapshot, time.Now())
+	}
 	if resp.StatusCode >= 400 {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		retryAfter := 0
