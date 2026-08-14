@@ -1,19 +1,13 @@
-# codex-router Go 重写计划（设计共识）
-
-> 状态（2026-08-15，go-rewrite 分支）：**M1、M2、M3 全部完成；M4 进行中。**
-> 已落地：协议核心（认证/native 直通/两条翻译路径/zstd/retry）、catalog 与
-> config.toml 集成、install/uninstall/doctor、control、空补全守卫（流式语义）、
-> tool-result aging、prompt-token 补零替换、usage-events.jsonl、完整错误翻译、
-> **namespace 工具拍平（含 schema 归一/整数 token 修复/spawn_agent 白名单）、
-> codex-app 工具快照合并（go:embed）、routed compaction v1+v2、rate-limit
-> 收割、subagent encrypted_content 中继**。全部测试绿（6 包）；各里程碑均有
-> 假上游端到端测试。
-> **M4 剩余**：vision bridge 核心 + 周边（引擎解析/转录/替换/缓存/state
-> 门控/download/benchmark/Ollama 底座）。
-> **M5（presence/shim/配额/tray 对接/切换）未开始。**
-> 按本计划"功能齐再切"的原则，切换前不得执行 launchd 切换。
->
-> 本文档是重写的唯一设计基线；与旧 AGENTS.md 冲突时以本文档为准。
+> 状态（2026-08-15，go-rewrite 分支）：**M1–M3 全部完成；M4 核心完成；M5 部分完成。**
+> 已落地（12 个功能提交，~9.4k 行 Go，9 包测试全绿，各里程碑有假上游端到端测试）：
+> - M1 协议核心：认证 / native 直通 / Responses↔chat 双向翻译 / Responses 直通 / zstd / retry
+> - M2 集成面：catalog（codex debug models）/ config.toml 标记块 / install·uninstall·doctor / launchd / control
+> - M3 全部：空补全守卫（流式）/ aging / prompt-token 补零 / usage JSONL / 错误翻译 / namespace 拍平（schema 归一·整数 token·spawn_agent 白岗）/ codex-app 快照合并 / compaction v1+v2 / rate-limit 收割 / subagent relay
+> - M4 核心：证据合同 / 引擎解析（pin·auto·回退·loopback 排除）/ 三路读图（registry·native 会话·本地 Ollama）/ 一图一购（缓存+in-flight）/ 重试 / state 门控
+> - M5 部分：presence（effectiveMode 覆盖）/ codex shim（全安全约束）
+> **剩余**：M4 周边工具（vision-download / benchmark / Ollama runtime 拉起）；
+> M5 配额卡片（ChatGPT 账号用量 + zai/opencode 余额 API）、tray 对接实测、
+> launchd 切换（按共识：功能齐全 + 操作者在场验证后才切）。
 
 ## 目标形态
 
