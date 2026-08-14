@@ -44,6 +44,21 @@ func main() {
 		err = cmdDoctor(os.Args[2:])
 	case "control":
 		err = cmdControl(os.Args[2:])
+	case "shim":
+		if len(os.Args) < 3 {
+			err = fmt.Errorf("shim requires install|uninstall|status")
+		} else {
+			switch os.Args[2] {
+			case "install":
+				err = cmdShimInstall(os.Args[3:])
+			case "uninstall":
+				err = cmdShimUninstall(os.Args[3:])
+			case "status":
+				err = cmdShimStatus(os.Args[3:])
+			default:
+				err = fmt.Errorf("unknown shim action %q", os.Args[2])
+			}
+		}
 	case "version", "--version":
 		fmt.Println("codex-router " + version)
 	case "help", "-h", "--help":
@@ -67,6 +82,7 @@ Usage:
   codex-router uninstall
   codex-router doctor
   codex-router control --json | control SERVICE ACTION | ...
+  codex-router shim install|uninstall|status
   codex-router version
 `)
 }
