@@ -131,6 +131,10 @@ func (s *Server) handleNativeTurn(w http.ResponseWriter, r *http.Request, route 
 	}
 	defer resp.Body.Close()
 	s.relayResponse(w, resp)
+	s.recordTurn(usage.Event{
+		Model: requestedModel, Provider: "openai",
+		Status: resp.StatusCode, DurationMs: time.Since(started).Milliseconds(),
+	})
 	logf("model=%s provider=openai status=%d duration_ms=%d",
 		requestedModel, resp.StatusCode, time.Since(started).Milliseconds())
 }

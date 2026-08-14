@@ -1,5 +1,5 @@
 #!/bin/sh
 set -eu
 
-repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-exec node "$repo_dir/src/control.mjs" "$@"
+# Go 重写版的 control 面。旧 Node 入口在 git 历史里（git checkout -- bin/control）。
+exec "${CODEX_ROUTER_GO_BINARY:-$HOME/.local/share/codex-router-go/codex-router}" control "$@"

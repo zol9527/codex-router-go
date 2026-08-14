@@ -38,10 +38,6 @@ func RoutedModel(template NativeModel, m *registry.Model) NativeModel {
 		}
 		levels = append(levels, entry)
 	}
-	modalityText := "text"
-	if len(m.InputModalities) > 0 {
-		modalityText = m.InputModalities[0]
-	}
 
 	next["slug"] = m.Slug
 	next["display_name"] = m.DisplayName
@@ -59,7 +55,13 @@ func RoutedModel(template NativeModel, m *registry.Model) NativeModel {
 	} else {
 		next["auto_compact_token_limit"] = m.ContextWindow * 9 / 10
 	}
-	next["input_modalities"] = modalityText
+	// input_modalities 是序列（Node 版传数组；原生条目的字符串形态是
+	// Codex 自己的形状，透传无妨，但 routed 条目必须按规格给数组）。
+	modalities := m.InputModalities
+	if len(modalities) == 0 {
+		modalities = []string{"text"}
+	}
+	next["input_modalities"] = modalities
 	next["comp_hash"] = m.CompHash
 	next["additional_speed_tiers"] = []any{}
 	next["default_service_tier"] = nil

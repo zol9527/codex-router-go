@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/loyd/codex-router/internal/httpx"
+	"github.com/loyd/codex-router/internal/usage"
 )
 
 var base64RawURL = base64.RawURLEncoding
@@ -93,6 +94,10 @@ func (s *Server) handleNative(w http.ResponseWriter, r *http.Request, route stri
 	}
 	defer resp.Body.Close()
 	s.relayResponse(w, resp)
+	s.recordTurn(usage.Event{
+		Model: requestedModel, Provider: "openai",
+		Status: resp.StatusCode, DurationMs: time.Since(started).Milliseconds(),
+	})
 	logf("model=%s provider=openai status=%d duration_ms=%d",
 		requestedModel, resp.StatusCode, time.Since(started).Milliseconds())
 }
