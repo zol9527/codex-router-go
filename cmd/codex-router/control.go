@@ -44,10 +44,39 @@ func cmdControl(args []string) error {
 		}
 		positional = append(positional, arg)
 	}
-	if err := fs.Parse(positional); err != nil {
+	// Go 的 flag 解析在首个非 flag 参数处停止 —— `control vision-bridge
+	// --state X pull` 的 --state 落不进 flag 域。把 --state 对从位置参数
+	// 中剥出来手动应用，分发到的子命令拿到的就是纯 action 序列。
+	stateFlag := ""
+	cleaned := make([]string, 0, len(positional))
+	for i := 0; i < len(positional); i++ {
+		arg := positional[i]
+		if arg == "--state" || arg == "-state" {
+			if i+1 < len(positional) {
+				stateFlag = positional[i+1]
+				i++
+			}
+			continue
+		}
+		if strings.HasPrefix(arg, "--state=") {
+			stateFlag = strings.TrimPrefix(arg, "--state=")
+			continue
+		}
+		if strings.HasPrefix(arg, "-state=") {
+			stateFlag = strings.TrimPrefix(arg, "-state=")
+			continue
+		}
+		cleaned = append(cleaned, arg)
+	}
+	if err := fs.Parse(cleaned); err != nil {
 		return err
 	}
 	rest := fs.Args()
+	if stateFlag != "" {
+		if err := fs.Set("state", stateFlag); err != nil {
+			*stateDir = stateFlag
+		}
+	}
 	if jsonFlag {
 		rest = append([]string{"--json"}, rest...)
 	}
@@ -71,6 +100,10 @@ func cmdControl(args []string) error {
 		return controlProvidersEnable(st, reg, rest[2:])
 	case len(rest) >= 1 && rest[0] == "credential" && len(rest) >= 2:
 		return controlCredential(st, reg, rest[1:])
+	case len(rest) >= 1 && rest[0] == "vision-bridge":
+		return controlVisionBridge(*stateDir, rest[1:])
+	case len(rest) >= 1 && rest[0] == "local-runtime":
+		return controlLocalRuntime(*stateDir, rest[1:])
 	case len(rest) >= 3 && rest[0] == "presence" && rest[1] == "set":
 		if err := state.SetPresenceMode(st.Dir, rest[2]); err != nil {
 			return err
@@ -93,6 +126,8 @@ func controlUsage() {
   control credential PROVIDER             read key from stdin (hidden prompt)
   control credential PROVIDER --remove
   control presence set always|follow-codex
+  control vision-bridge pull TAG | pull-status | benchmark [TAG] | catalog
+  control local-runtime status|start|stop
 `)
 }
 

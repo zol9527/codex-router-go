@@ -44,6 +44,8 @@ func main() {
 		err = cmdDoctor(os.Args[2:])
 	case "control":
 		err = cmdControl(os.Args[2:])
+	case "__vision-pull-worker":
+		err = cmdVisionPullWorker(os.Args[2:])
 	case "shim":
 		if len(os.Args) < 3 {
 			err = fmt.Errorf("shim requires install|uninstall|status")
