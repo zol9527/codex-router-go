@@ -16,6 +16,8 @@ import (
 	"github.com/loyd/codex-router/internal/cred"
 	"github.com/loyd/codex-router/internal/registry"
 	"github.com/loyd/codex-router/internal/state"
+	"github.com/loyd/codex-router/internal/translate"
+	"github.com/loyd/codex-router/internal/usage"
 )
 
 // CallerPathPrefix 与 Node 版一致：caller key 以 URL 路径形式出现。
@@ -29,8 +31,9 @@ type Options struct {
 	State       *state.State
 	Registry    *registry.Registry
 	Credentials *cred.Resolver
-	ListenAddr  string // "127.0.0.1:4202"
-	NativeBase  string // 默认 https://chatgpt.com/backend-api/codex
+	ListenAddr  string          // "127.0.0.1:4202"
+	NativeBase  string          // 默认 https://chatgpt.com/backend-api/codex
+	Usage       *usage.Recorder // usage-events.jsonl 管道（可空）
 }
 
 // Server 持有全部共享状态。
@@ -46,6 +49,9 @@ type Server struct {
 	lastModel    string
 	lastSession  string
 	errorUntil   time.Time
+
+	agingMu   sync.Mutex
+	lastAging translate.AgingStats
 }
 
 type activityEntry struct {

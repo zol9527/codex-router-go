@@ -33,6 +33,91 @@ type ChatToResponsesSSE struct {
 
 	usage map[string]any
 	done  bool
+
+	// 补零替换的状态（见 responsesUsage）。
+	estimatedInput       int
+	substitutedInput     int
+	observedPromptTokens int64
+}
+
+// WithEstimatedInputTokens 装载补零估算（仅大请求装载：小请求的零
+// 无关紧要 —— 原实现的 "do not bother" 下限）。
+func (t *ChatToResponsesSSE) WithEstimatedInputTokens(estimate int) *ChatToResponsesSSE {
+	t.estimatedInput = estimate
+	return t
+}
+
+// SubstitutedInputTokens 返回被替换进响应的估算值（0 = provider 自报）。
+func (t *ChatToResponsesSSE) SubstitutedInputTokens() int { return t.substitutedInput }
+
+// PromptTokens 返回 provider 报告的 prompt 数。
+func (t *ChatToResponsesSSE) PromptTokens() int64 { return t.observedPromptTokens }
+
+// OutputTokens / TotalTokens 从 usage 提取计量（usage 缺失为 0）。
+func (t *ChatToResponsesSSE) OutputTokens() int64 {
+	if v, ok := t.usage["completion_tokens"].(float64); ok {
+		return int64(v)
+	}
+	return 0
+}
+
+func (t *ChatToResponsesSSE) TotalTokens() int64 {
+	if v, ok := t.usage["total_tokens"].(float64); ok {
+		return int64(v)
+	}
+	return 0
+}
+
+// HasContent 报告本流是否产出过客户端可行动的内容
+// （输出文本或工具调用；纯 reasoning 不算 —— 空补全守卫的判定）。
+func (t *ChatToResponsesSSE) HasContent() bool {
+	if t.message != nil && t.message.text.Len() > 0 {
+		return true
+	}
+	for _, state := range t.functionCall {
+		if state != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// OutputBuffer 累积 Feed 产出的完整 SSE 块（守卫模式：
+// 选完尝试再整段写出，写流阶段复用同一缓冲）。
+type OutputBuffer struct {
+	buf []byte
+}
+
+// Write 记录一段翻译输出。
+func (e *OutputBuffer) Write(chunk []byte) { e.buf = append(e.buf, chunk...) }
+
+// Bytes 返回累积的全部字节。
+func (e *OutputBuffer) Bytes() []byte { return e.buf }
+
+// TranslateNonStreamChatWith 用现成翻译器处理非流式响应
+// （estimate 已在翻译器上装载）。
+func TranslateNonStreamChatWith(body map[string]any, t *ChatToResponsesSSE) map[string]any {
+	if id, ok := body["id"].(string); ok && id != "" {
+		t.responseID = id
+	}
+	choices, _ := body["choices"].([]any)
+	for _, raw := range choices {
+		choice, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if message, ok := choice["message"].(map[string]any); ok {
+			t.feedDelta(message)
+		}
+	}
+	if usage, ok := body["usage"].(map[string]any); ok {
+		t.usage = usage
+	}
+	t.close()
+	response := t.responseShell("completed")
+	response["output"] = t.completedOutput()
+	response["usage"] = t.responsesUsage(t.usage)
+	return response
 }
 
 type itemState struct {
@@ -131,7 +216,7 @@ func TranslateNonStreamChat(body map[string]any, responseID, model string) map[s
 	t.close()
 	response := t.responseShell("completed")
 	response["output"] = t.completedOutput()
-	response["usage"] = responsesUsage(t.usage)
+	response["usage"] = t.responsesUsage(t.usage)
 	return response
 }
 
@@ -270,7 +355,7 @@ func (t *ChatToResponsesSSE) close() []byte {
 	}
 	response := t.responseShell("completed")
 	response["output"] = t.completedOutput()
-	response["usage"] = responsesUsage(t.usage)
+	response["usage"] = t.responsesUsage(t.usage)
 	payloads = append(payloads, eventJSON("response.completed", map[string]any{
 		"response": response,
 	}))
@@ -397,20 +482,36 @@ func (t *ChatToResponsesSSE) responseShell(status string) map[string]any {
 }
 
 // responsesUsage 把 chat usage 字段名换成 Responses 字段名。
-// 保留 provider 原始计数，不做任何替换（补零替换是 M3 管线的事）。
-func responsesUsage(usage map[string]any) map[string]any {
+// Prompt-token 补零替换（#95）在此生效：上游对大 prompt 报
+// input_tokens: 0 会让 Codex 永不压缩、会话撑爆窗口。替换只落在
+// 显式零上、estimate 只高不低（压缩阈值有 14% 余量），替换事实通过
+// SubstitutedInputTokens 单独暴露 —— telemetry 永远保留 provider 原值。
+func (t *ChatToResponsesSSE) responsesUsage(usage map[string]any) map[string]any {
 	if usage == nil {
 		return nil
 	}
 	out := map[string]any{}
-	if v, ok := usage["prompt_tokens"]; ok {
-		out["input_tokens"] = v
-	}
-	if v, ok := usage["completion_tokens"]; ok {
-		out["output_tokens"] = v
-	}
-	if v, ok := usage["total_tokens"]; ok {
-		out["total_tokens"] = v
+	promptTokens, _ := usage["prompt_tokens"].(float64)
+	t.observedPromptTokens = int64(promptTokens)
+	if promptTokens == 0 && t.estimatedInput > 0 {
+		out["input_tokens"] = t.estimatedInput
+		t.substitutedInput = t.estimatedInput
+		if completion, ok := usage["completion_tokens"].(float64); ok {
+			out["output_tokens"] = completion
+			out["total_tokens"] = float64(t.estimatedInput) + completion
+		} else {
+			out["total_tokens"] = float64(t.estimatedInput)
+		}
+	} else {
+		if v, ok := usage["prompt_tokens"]; ok {
+			out["input_tokens"] = v
+		}
+		if v, ok := usage["completion_tokens"]; ok {
+			out["output_tokens"] = v
+		}
+		if v, ok := usage["total_tokens"]; ok {
+			out["total_tokens"] = v
+		}
 	}
 	if details, ok := usage["prompt_tokens_details"].(map[string]any); ok {
 		out["input_tokens_details"] = details

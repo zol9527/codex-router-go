@@ -20,6 +20,7 @@ import (
 	"github.com/loyd/codex-router/internal/registry"
 	"github.com/loyd/codex-router/internal/server"
 	"github.com/loyd/codex-router/internal/state"
+	"github.com/loyd/codex-router/internal/usage"
 )
 
 // version 在构建时通过 -ldflags 注入。
@@ -28,7 +29,7 @@ var version = "dev"
 func main() {
 	log.SetFlags(log.LstdFlags)
 	if len(os.Args) < 2 {
-		usage()
+		printUsage()
 		os.Exit(64)
 	}
 	var err error
@@ -46,10 +47,10 @@ func main() {
 	case "version", "--version":
 		fmt.Println("codex-router " + version)
 	case "help", "-h", "--help":
-		usage()
+		printUsage()
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n\n", os.Args[1])
-		usage()
+		printUsage()
 		os.Exit(64)
 	}
 	if err != nil {
@@ -57,7 +58,7 @@ func main() {
 	}
 }
 
-func usage() {
+func printUsage() {
 	fmt.Fprint(os.Stderr, `codex-router — Go rewrite of the codex-router service
 
 Usage:
@@ -102,6 +103,7 @@ func cmdServe(args []string) error {
 		Credentials: cred.New(st),
 		ListenAddr:  fmt.Sprintf("127.0.0.1:%d", *port),
 		NativeBase:  envOr("CODEX_NATIVE_BASE_URL", "https://chatgpt.com/backend-api/codex"),
+		Usage:       usage.NewRecorder(st.Dir),
 	})
 	if err != nil {
 		return err
