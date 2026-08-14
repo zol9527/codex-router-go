@@ -38,6 +38,20 @@ type ChatToResponsesSSE struct {
 	estimatedInput       int
 	substitutedInput     int
 	observedPromptTokens int64
+
+	// namespace 回写：模型发出的扁平 `<ns>__<tool>` 调用名还原为客户端
+	// 派发的 {name, namespace} 形态（含 spawn_agent 白名单清洗、
+	// create_thread 会话模型注入、整数 token 修复）。
+	namespaceIndex *NamespaceIndex
+	sessionModel   string
+}
+
+// WithNamespaceIndex 装载 namespace 还原索引（请求时 FlattenNamespaceTools
+// 的产物；nil 表示该请求没有 namespace 工具，回写为空操作）。
+func (t *ChatToResponsesSSE) WithNamespaceIndex(index *NamespaceIndex, sessionModel string) *ChatToResponsesSSE {
+	t.namespaceIndex = index
+	t.sessionModel = sessionModel
+	return t
 }
 
 // WithEstimatedInputTokens 装载补零估算（仅大请求装载：小请求的零
@@ -308,7 +322,7 @@ func (t *ChatToResponsesSSE) feedDelta(delta map[string]any) []string {
 				if !state.added {
 					payloads = append(payloads, eventJSON("response.output_item.added", map[string]any{
 						"output_index": state.outputIndex,
-						"item":         state.functionCallItem(""),
+						"item":         t.functionCallItem(state, ""),
 					}))
 					state.added = true
 				}
@@ -433,7 +447,7 @@ func (t *ChatToResponsesSSE) closeFunctionCall(chatIndex int) []string {
 	if !s.added {
 		payloads = append(payloads, eventJSON("response.output_item.added", map[string]any{
 			"output_index": s.outputIndex,
-			"item":         s.functionCallItem(""),
+			"item":         t.functionCallItem(s, ""),
 		}))
 	}
 	payloads = append(payloads,
@@ -444,7 +458,7 @@ func (t *ChatToResponsesSSE) closeFunctionCall(chatIndex int) []string {
 		}),
 		eventJSON("response.output_item.done", map[string]any{
 			"output_index": s.outputIndex,
-			"item":         s.functionCallItem(args),
+			"item":         t.functionCallItem(s, args),
 		}))
 	return payloads
 }
@@ -464,7 +478,7 @@ func (t *ChatToResponsesSSE) completedOutput() []any {
 			if args == "" {
 				args = "{}"
 			}
-			output = append(output, s.functionCallItem(args))
+			output = append(output, t.functionCallItem(s, args))
 		}
 	}
 	return output
@@ -551,13 +565,19 @@ func (s *itemState) messageDoneItem(text string) map[string]any {
 	}
 }
 
-func (s *itemState) functionCallItem(args string) map[string]any {
-	return map[string]any{
+func (t *ChatToResponsesSSE) functionCallItem(s *itemState, args string) map[string]any {
+	item := map[string]any{
 		"type": "function_call", "id": s.itemID,
 		"call_id":   orDefault(s.callID, "call_"+s.itemID),
 		"name":      s.name,
 		"arguments": args, "status": "completed",
 	}
+	if t.namespaceIndex != nil {
+		if rewritten := t.namespaceIndex.RewriteFunctionCallItem(item, t.sessionModel); rewritten != nil {
+			return rewritten
+		}
+	}
+	return item
 }
 
 // ---- SSE 基础设施 ----

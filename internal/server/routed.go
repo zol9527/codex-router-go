@@ -278,7 +278,8 @@ func (sr *streamRelay) finishFlushWith(payload []byte) error {
 // 守卫直写 client（liveness 起）；relay 为 nil 时全部累积在 events 缓冲
 // （隐形重试的第二次尝试用 —— 判定完再决定写不写）。
 func (s *Server) runChatAttempt(ctx context.Context, target string, headers map[string]string,
-	body []byte, model *registry.Model, estimate int, relay *streamRelay) (*attemptOutcome, error) {
+	body []byte, model *registry.Model, estimate int, nsIndex *translate.NamespaceIndex,
+	relay *streamRelay) (*attemptOutcome, error) {
 
 	resp, _, err := httpx.FetchWithRetry(ctx, http.MethodPost, target, headers, body, httpx.DefaultRetryOptions())
 	if err != nil {
@@ -296,7 +297,8 @@ func (s *Server) runChatAttempt(ctx context.Context, target string, headers map[
 		}
 	}
 	translator := translate.NewChatToResponsesSSE("", model.UpstreamModel).
-		WithEstimatedInputTokens(estimate)
+		WithEstimatedInputTokens(estimate).
+		WithNamespaceIndex(nsIndex, model.Slug)
 	events := &translate.OutputBuffer{}
 	created := translator.Created()
 	events.Write(created)
@@ -366,6 +368,18 @@ func (s *Server) serveChatTranslation(w http.ResponseWriter, r *http.Request,
 	}
 	setAging(aging)
 
+	// namespace 拍平：协作运行时 / app 工具集 / MCP server 以 namespace
+	// 形态下发，chat 上游只认普通 function —— 展开成 `<ns>__<tool>`，
+	// 历史同步改名；响应方向的还原索引由同一个请求构建。
+	nsIndex := (*translate.NamespaceIndex)(nil)
+	if flattened := translate.FlattenNamespaceTools(payload["tools"]); flattened.Flattened {
+		payload["tools"] = flattened.Tools
+		if input, ok := payload["input"].([]any); ok {
+			payload["input"] = translate.FlattenNamespacedHistory(input, flattened.Namespaces)
+		}
+		nsIndex = flattened.Index()
+	}
+
 	chat, err := translate.TranslateToChat(payload)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", err.Error()))
@@ -430,7 +444,8 @@ func (s *Server) serveChatTranslation(w http.ResponseWriter, r *http.Request,
 			return
 		}
 		translator := translate.NewChatToResponsesSSE("", model.UpstreamModel).
-			WithEstimatedInputTokens(estimate)
+			WithEstimatedInputTokens(estimate).
+			WithNamespaceIndex(nsIndex, model.Slug)
 		response := translate.TranslateNonStreamChatWith(chatBody, translator)
 		writeJSON(w, http.StatusOK, response)
 		s.recordTurn(usage.Event{
@@ -450,7 +465,7 @@ func (s *Server) serveChatTranslation(w http.ResponseWriter, r *http.Request,
 	if canFlush {
 		relay.flusher = flusher
 	}
-	first, firstErr := s.runChatAttempt(r.Context(), target, headers, normalized, model, estimate, relay)
+	first, firstErr := s.runChatAttempt(r.Context(), target, headers, normalized, model, estimate, nsIndex, relay)
 	if firstErr != nil {
 		var failure *upstreamFailure
 		if errors.As(firstErr, &failure) {
@@ -481,7 +496,7 @@ func (s *Server) serveChatTranslation(w http.ResponseWriter, r *http.Request,
 		} else {
 			// 静默空流：同字节同头隐形重试一次（client 一无所见）。
 			emptyRetried = true
-			second, secondErr := s.runChatAttempt(r.Context(), target, headers, normalized, model, estimate, nil)
+			second, secondErr := s.runChatAttempt(r.Context(), target, headers, normalized, model, estimate, nsIndex, nil)
 			switch {
 			case secondErr != nil:
 				var failure *upstreamFailure
