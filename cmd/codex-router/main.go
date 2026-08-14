@@ -35,6 +35,14 @@ func main() {
 	switch os.Args[1] {
 	case "serve":
 		err = cmdServe(os.Args[2:])
+	case "install":
+		err = cmdInstall(os.Args[2:])
+	case "uninstall":
+		err = cmdUninstall(os.Args[2:])
+	case "doctor":
+		err = cmdDoctor(os.Args[2:])
+	case "control":
+		err = cmdControl(os.Args[2:])
 	case "version", "--version":
 		fmt.Println("codex-router " + version)
 	case "help", "-h", "--help":
@@ -54,6 +62,10 @@ func usage() {
 
 Usage:
   codex-router serve [--port N] [--state DIR] [--config DIR]
+  codex-router install [--providers ID,ID] [--dry-run]
+  codex-router uninstall
+  codex-router doctor
+  codex-router control --json | control SERVICE ACTION | ...
   codex-router version
 `)
 }

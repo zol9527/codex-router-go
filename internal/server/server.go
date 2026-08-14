@@ -5,11 +5,9 @@ package server
 import (
 	"crypto/subtle"
 	"encoding/json"
-	"fmt"
 	"log"
 	"net"
 	"net/http"
-	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -359,6 +357,3 @@ func sessionNameFromHeaders(header http.Header) string {
 func logf(format string, args ...any) {
 	log.Printf("[codex-router] "+format, args...)
 }
-
-var _ = path.Clean // 保留引用（路由匹配用字符串精确比较）
-var _ = fmt.Sprintf
