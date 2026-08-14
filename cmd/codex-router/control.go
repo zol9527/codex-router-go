@@ -48,6 +48,13 @@ func cmdControl(args []string) error {
 		return controlProvidersEnable(st, reg, rest[2:])
 	case len(rest) >= 1 && rest[0] == "credential" && len(rest) >= 2:
 		return controlCredential(st, reg, rest[1:])
+	case len(rest) >= 3 && rest[0] == "presence" && rest[1] == "set":
+		if err := state.SetPresenceMode(st.Dir, rest[2]); err != nil {
+			return err
+		}
+		raw, _ := json.MarshalIndent(state.PresenceSnapshot(st.Dir), "", "  ")
+		fmt.Println(string(raw))
+		return nil
 	default:
 		controlUsage()
 		return fmt.Errorf("unsupported control command: %v", rest)
@@ -62,6 +69,7 @@ func controlUsage() {
   control providers enable ID [ID...]     (append to selection)
   control credential PROVIDER             read key from stdin (hidden prompt)
   control credential PROVIDER --remove
+  control presence set always|follow-codex
 `)
 }
 
@@ -108,6 +116,9 @@ func controlJSON(st *state.State, reg *registry.Registry) error {
 		"providers":        providers,
 		"models":           models,
 		"version":          version,
+		// presence 块：tray 读 effectiveMode 而非自行推导
+		//（两边各自推导必然漂移）。
+		"presence": state.PresenceSnapshot(st.Dir),
 	}
 	raw, err := json.MarshalIndent(payload, "", "  ")
 	if err != nil {
