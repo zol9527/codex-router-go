@@ -83,6 +83,16 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request, route s
 		return
 	}
 
+	// compaction 分流：v1 是 /responses/compact 路径；v2 是 input 尾部
+	// 的 compaction_trigger。压缩重放整个会话，永远走 chat 翻译路径
+	//（opencode-go-responses 也一样——上游是同一个 provider）。
+	compactV1 := strings.HasSuffix(route, "/responses/compact")
+	compactV2 := isCompactionV2(payload)
+	if compactV1 || compactV2 {
+		s.handleRoutedCompaction(w, r, payload, routeModel, provider, credential, compactV2, route, started)
+		return
+	}
+
 	if provider.Protocol == "openai-responses" {
 		s.serveResponsesPassthrough(w, r, payload, routeModel, provider, credential, started)
 		return
