@@ -24,10 +24,33 @@ func cmdControl(args []string) error {
 	}
 	fs := flag.NewFlagSet("control", flag.ContinueOnError)
 	stateDir := fs.String("state", state.DefaultDir(), "state directory")
-	if err := fs.Parse(args); err != nil {
+	// tray 的调用形态是 `control --json`：把 --json 从 flag 域剥离为
+	// 位置参数，避免与 --state 的解析顺序耦合。
+	normalized := make([]string, 0, len(args))
+	for _, arg := range args {
+		if arg == "--json" || arg == "-json" {
+			normalized = append(normalized, "--json")
+			continue
+		}
+		normalized = append(normalized, arg)
+	}
+	// --json 可能出现在任意位置；先剥出它再交给 flag 包解析其余。
+	jsonFlag := false
+	positional := make([]string, 0, len(normalized))
+	for _, arg := range normalized {
+		if arg == "--json" {
+			jsonFlag = true
+			continue
+		}
+		positional = append(positional, arg)
+	}
+	if err := fs.Parse(positional); err != nil {
 		return err
 	}
 	rest := fs.Args()
+	if jsonFlag {
+		rest = append([]string{"--json"}, rest...)
+	}
 	st, err := state.Open(*stateDir)
 	if err != nil {
 		return err
