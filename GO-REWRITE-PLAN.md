@@ -1,6 +1,15 @@
 # codex-router Go 重写计划（设计共识）
 
-> 状态：设计已确认（2026-08-15 grilling session 定稿），未开工。
+> 状态（2026-08-15，go-rewrite 分支）：**M1、M2 已完成；M3 主干已完成**。
+> 已落地：协议核心（认证/native 直通/两条翻译路径/zstd/retry）、catalog 与
+> config.toml 集成、install/uninstall/doctor、control、空补全守卫（流式语义）、
+> tool-result aging、prompt-token 补零替换、usage-events.jsonl、完整错误翻译。
+> 全部测试绿（5 包）；M1/M2/M3 各有假上游端到端冒烟验证。
+> **M3 剩余未做**：namespace 拍平、codex-app-tools 合并、subagent
+> encrypted_content relay、compaction（v1/v2）、rate-limit header 收割。
+> **M4（vision bridge 全家）、M5（presence/shim/配额/tray 对接/切换）未开始。**
+> 按本计划"功能齐再切"的原则，切换前不得执行 launchd 切换。
+>
 > 本文档是重写的唯一设计基线；与旧 AGENTS.md 冲突时以本文档为准。
 
 ## 目标形态
