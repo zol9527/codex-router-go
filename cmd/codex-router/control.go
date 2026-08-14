@@ -78,7 +78,7 @@ func cmdControl(args []string) error {
 		}
 	}
 	if jsonFlag {
-		rest = append([]string{"--json"}, rest...)
+		rest = append(rest, "--json")
 	}
 	st, err := state.Open(*stateDir)
 	if err != nil {
@@ -95,11 +95,15 @@ func cmdControl(args []string) error {
 	case len(rest) >= 1 && rest[0] == "service":
 		return controlService(rest[1:])
 	case len(rest) >= 1 && rest[0] == "providers" && len(rest) >= 2 && rest[1] == "list":
-		return controlProvidersList(st, reg, len(rest) > 2 && rest[2] == "--json")
+		return controlProvidersList(st, reg, hasJSONFlag(rest))
 	case len(rest) >= 1 && rest[0] == "providers" && len(rest) >= 3 && rest[1] == "enable":
 		return controlProvidersEnable(st, reg, rest[2:])
 	case len(rest) >= 1 && rest[0] == "credential" && len(rest) >= 2:
 		return controlCredential(st, reg, rest[1:])
+	case len(rest) >= 1 && rest[0] == "account":
+		return controlAccount(*stateDir, reg)
+	case len(rest) >= 1 && rest[0] == "provider-usage":
+		return controlProviderUsage(*stateDir, reg)
 	case len(rest) >= 1 && rest[0] == "vision-bridge":
 		return controlVisionBridge(*stateDir, rest[1:])
 	case len(rest) >= 1 && rest[0] == "local-runtime":
@@ -117,6 +121,16 @@ func cmdControl(args []string) error {
 	}
 }
 
+// hasJSONFlag 报告参数序列里是否带 --json。
+func hasJSONFlag(args []string) bool {
+	for _, arg := range args {
+		if arg == "--json" {
+			return true
+		}
+	}
+	return false
+}
+
 func controlUsage() {
 	fmt.Fprint(os.Stderr, `control commands:
   control --json                          full snapshot for the tray
@@ -126,6 +140,7 @@ func controlUsage() {
   control credential PROVIDER             read key from stdin (hidden prompt)
   control credential PROVIDER --remove
   control presence set always|follow-codex
+  control account --json | control provider-usage --json
   control vision-bridge pull TAG | pull-status | benchmark [TAG] | catalog
   control local-runtime status|start|stop
 `)
