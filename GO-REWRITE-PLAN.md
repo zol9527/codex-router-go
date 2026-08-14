@@ -1,4 +1,13 @@
-> 状态（2026-08-15，go-rewrite 分支）：**M1–M5 全部编码完成；仅剩两项需操作者在场的收尾（tray 实测、launchd 切换）。**
+> 状态（2026-08-15）：**切换已完成并经真实流量验证。** 本机生产路由现为
+> Go 单二进制（~/.local/share/codex-router-go/codex-router，launchd
+> io.github.codex-router.go，单进程 ~26MB），bin/control 已指向它。
+> 真实验证记录：codex exec 两轮全通（native 直通 200×N）、/health 与
+> usage-events.jsonl 计量在位、doctor 核心全绿。
+> 切换中修掉两个仅真实流量能暴露的 bug：input_modalities 必须是序列
+>（Codex 拒载 catalog）、native 路径漏记 usage。
+> **操作者待办**：`./bin/control credential zai-coding`（stdin 输入 key）
+> 与 `credential opencode-go` 启用路由模型；可选安装 tray app 做按钮
+> 面板 GUI 实测。回滚：`codex-router uninstall` + `git checkout -- bin/control`。
 > 已落地（12 个功能提交，~9.4k 行 Go，9 包测试全绿，各里程碑有假上游端到端测试）：
 > - M1 协议核心：认证 / native 直通 / Responses↔chat 双向翻译 / Responses 直通 / zstd / retry
 > - M2 集成面：catalog（codex debug models）/ config.toml 标记块 / install·uninstall·doctor / launchd / control
