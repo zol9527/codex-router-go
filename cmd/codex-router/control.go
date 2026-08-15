@@ -228,6 +228,18 @@ func controlJSON(st *state.State, reg *registry.Registry) error {
 		})
 	}
 	hidden := state.ReadPickerHidden(st.Dir)
+	// 分身裁决与 catalog 同规：注册表证明 OR 本地声明，disabled/隐藏
+	// 一票否决。UI 看到的必须是有效版本而不是注册表原始值 —— 否则
+	// 本地声明的模型（declared）在设置页里凭空消失。
+	subagentSettings := state.ReadSubagentSettings(st.Dir)
+	resolvedSubagents := map[string]*registry.Model{}
+	for _, m := range catalog.ApplySubagentMultiAgent(reg.Models, subagentSettings, hidden) {
+		resolvedSubagents[m.Slug] = m
+	}
+	declaredSubagents := map[string]bool{}
+	for _, slug := range subagentSettings.Declared {
+		declaredSubagents[slug] = true
+	}
 	for _, m := range reg.Models {
 		if !m.Listed || !st.ProviderEnabled(m.Provider, reg.CanonicalProviderID) {
 			continue
@@ -239,11 +251,15 @@ func controlJSON(st *state.State, reg *registry.Registry) error {
 			// 已启用 provider 下的已发布模型，恒为 true。
 			"enabled": st.ProviderEnabled(m.Provider, reg.CanonicalProviderID),
 			// visible = 未被 picker 隐藏；multiAgentVersion 供分身
-			// UI 判断候选资格（nil = v1）。
+			// UI 判断候选资格（nil = v1，取裁决后的有效值）。
 			"visible": !hidden[m.Slug],
+			// proven = 注册表证明；declared = 本地声明。UI 据此区分
+			// 开关语义：证明过的走 disabled 收窄，未证明的走声明通道。
+			"proven":   m.MultiAgentVersion == "v2",
+			"declared": declaredSubagents[m.Slug],
 		}
-		if m.MultiAgentVersion != "" {
-			entry["multiAgentVersion"] = m.MultiAgentVersion
+		if resolved := resolvedSubagents[m.Slug]; resolved != nil && resolved.MultiAgentVersion == "v2" {
+			entry["multiAgentVersion"] = "v2"
 		}
 		models = append(models, entry)
 	}

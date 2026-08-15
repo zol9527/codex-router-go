@@ -1416,6 +1416,15 @@ final class RouterStore: ObservableObject {
     )
   }
 
+  // 本地 v2 声明（用户主权通道）：未证明的路由模型由此提为分身候选。
+  func declareSubagentModel(_ slug: String) async {
+    await applyModelSettings(arguments: ["subagents", "declare", slug])
+  }
+
+  func undeclareSubagentModel(_ slug: String) async {
+    await applyModelSettings(arguments: ["subagents", "undeclare", slug])
+  }
+
   func setSubagentProvider(_ provider: String, enabled: Bool) async {
     await applyModelSettings(
       arguments: ["subagents", "provider", provider, enabled ? "on" : "off"]
@@ -2365,6 +2374,10 @@ struct RouterModel: Decodable, Identifiable {
   let enabled: Bool
   let multiAgentVersion: String?
   let visible: Bool?
+  // proven = 注册表 multiAgentVersion v2；declared = 本地声明。
+  // 开关语义分流：证明过的走 disabled 收窄，未证明的走声明通道。
+  let proven: Bool?
+  let declared: Bool?
   var id: String { slug }
 }
 
@@ -3367,10 +3380,14 @@ private struct TrayView: View {
     // a subagent either, but dropping its row made it look deleted and left no
     // way back to it from this panel -- the tray must always show every model
     // it can still change.
+    //
+    // 列出全部已启用路由模型而不只是 v2 候选：未证明的模型通过行开关
+    // 本地声明（declare）为 v2 —— 声明权在操作者手里，不再要求注册表
+    // 证明 + 重编。
     private var enabledExternalModels: [RouterModel] {
       target.models
         .filter {
-          $0.enabled && $0.provider != "openai" && $0.multiAgentVersion == "v2"
+          $0.enabled && $0.provider != "openai"
         }
         .sorted {
           if $0.provider != $1.provider { return $0.provider < $1.provider }
@@ -3455,17 +3472,20 @@ private struct TrayView: View {
             Text(routerLocalized("Subagent choices do not hide models from Codex's picker — use Model picker below for that."))
               .font(.system(size: 9))
               .foregroundStyle(routerMuted)
+            Text(routerLocalized("Turning on an unproven model declares it locally as a v2 subagent; turning it off removes the declaration."))
+              .font(.system(size: 9))
+              .foregroundStyle(routerMuted)
             toolbar(
               buttons: [
                 ("Subagents on", { Task { await store.selectAllSubagents() } }),
                 ("Subagents off", { Task { await store.unselectAllSubagents() } }),
               ]
             )
-            // 空态要说清楚"为什么空"：候选列表只收 v2 证明过的模型，
-            // 一时空 = 还没有模型通过协作探针，不是面板坏了。
+            // 空态 = 没有任何已启用 provider 的路由模型（分身面板现在
+            // 列全部可声明模型，不再只收 v2 候选）。
             if enabledExternalModels.isEmpty {
               Text(routerLocalized(
-                "No subagent candidates yet — a model appears here only after its collaboration probes pass (registry multiAgentVersion v2)."
+                "No routed models available — enable a provider first."
               ))
               .font(.system(size: 9))
               .foregroundStyle(routerMuted)
@@ -3494,7 +3514,20 @@ private struct TrayView: View {
                       isOn: Binding(
                         get: { isSubagent(model) },
                         set: { enabled in
-                          Task { await store.setSubagentModel(model.slug, enabled: enabled) }
+                          Task {
+                            if model.proven == true {
+                              // 注册表证明过的：走 disabled 收窄。
+                              await store.setSubagentModel(model.slug, enabled: enabled)
+                            } else if enabled {
+                              // 未证明的：开 = 本地声明（顺带清掉可能
+                              // 残留的 disabled 否决）。
+                              await store.setSubagentModel(model.slug, enabled: true)
+                              await store.declareSubagentModel(model.slug)
+                            } else {
+                              // 关 = 撤销本地声明。
+                              await store.undeclareSubagentModel(model.slug)
+                            }
+                          }
                         }
                       ),
                       disabled: busy || model.visible == false
@@ -3746,8 +3779,13 @@ private struct TrayView: View {
 
     private func subagentDetail(for model: RouterModel) -> String {
       if model.visible == false { return routerLocalized("Hidden from picker — show it below to use it here") }
-      if isSubagent(model) { return routerLocalized("Proven v2") }
-      return routerLocalized("Not selected")
+      if isSubagent(model) {
+        return model.proven == true
+          ? routerLocalized("Proven v2")
+          : routerLocalized("Locally declared v2")
+      }
+      if model.proven == true { return routerLocalized("Not selected") }
+      return routerLocalized("Off — turn on to declare it as a v2 subagent")
     }
 
   private var subagentSummary: String {
