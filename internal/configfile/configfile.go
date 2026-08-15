@@ -85,11 +85,16 @@ func mustJSON(value string) string {
 }
 
 // removeBlock 抠掉一个标记块（含）与其紧邻的前导空行。
-func removeBlock(lines []string, start, end string) []string {
+// 漂移保护：若宿主应用（Codex 桌面端重写 config.toml 时）把用户自己的
+// 配置包进了标记块，管理块内容只占块头的连续一段；从第一行外来内容起
+// 到 END 标记之间的所有行原样保留，绝不能跟着管理块一起被删。
+func removeBlock(lines []string, start, end string, isOurs func(string) bool) []string {
 	var out []string
 	inBlock := false
-	for i, line := range lines {
-		if strings.TrimSpace(line) == start {
+	sawForeign := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == start {
 			inBlock = true
 			// 吃掉块前的空行，避免反复启停留下空行堆积。
 			if len(out) > 0 && strings.TrimSpace(out[len(out)-1]) == "" {
@@ -98,15 +103,37 @@ func removeBlock(lines []string, start, end string) []string {
 			continue
 		}
 		if inBlock {
-			if strings.TrimSpace(line) == end {
+			if trimmed == end {
 				inBlock = false
+				continue
 			}
+			if !sawForeign && isOurs(trimmed) {
+				continue
+			}
+			sawForeign = true
+			out = append(out, line)
 			continue
 		}
-		_ = i
 		out = append(out, line)
 	}
 	return out
+}
+
+// rootOwnedLine 判断根级管理块内的一行是否归本路由所有。
+func rootOwnedLine(trimmed string) bool {
+	return trimmed == "" ||
+		strings.HasPrefix(trimmed, "openai_base_url =") ||
+		strings.HasPrefix(trimmed, "model_catalog_json =")
+}
+
+// providerOwnedLine 判断 provider 管理块内的一行是否归本路由所有。
+func providerOwnedLine(trimmed string) bool {
+	return trimmed == "" ||
+		trimmed == "[model_providers."+providerID+"]" ||
+		strings.HasPrefix(trimmed, "name = ") ||
+		strings.HasPrefix(trimmed, "base_url = ") ||
+		strings.HasPrefix(trimmed, "wire_api = ") ||
+		strings.HasPrefix(trimmed, "supports_standalone_web_search = ")
 }
 
 // splitManaged 检查非标记块内的冲突字段。
@@ -147,8 +174,8 @@ func Install(configPath string, cfg RouterConfig) error {
 			joinNamed(base, cat))
 	}
 	// 去掉旧管理块再重写（幂等）。
-	lines = removeBlock(lines, startMarker, endMarker)
-	lines = removeBlock(lines, providerStart, providerEnd)
+	lines = removeBlock(lines, startMarker, endMarker, rootOwnedLine)
+	lines = removeBlock(lines, providerStart, providerEnd, providerOwnedLine)
 	for len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "" {
 		lines = lines[:len(lines)-1]
 	}
@@ -191,8 +218,8 @@ func Uninstall(configPath string) error {
 		return err
 	}
 	lines := strings.Split(string(raw), "\n")
-	lines = removeBlock(lines, startMarker, endMarker)
-	lines = removeBlock(lines, providerStart, providerEnd)
+	lines = removeBlock(lines, startMarker, endMarker, rootOwnedLine)
+	lines = removeBlock(lines, providerStart, providerEnd, providerOwnedLine)
 	for len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "" {
 		lines = lines[:len(lines)-1]
 	}

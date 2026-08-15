@@ -168,3 +168,25 @@ func TestOverlayNeverOverridesEmbedded(t *testing.T) {
 		t.Fatal("embedded entry must win over overlay")
 	}
 }
+
+// TestCloneEntryDisplayNameDerivedFromUpstreamID 钉死显示名红线：
+// 克隆兜底条目的显示名必须由上游 ID 派生，绝不继承克隆源全名，
+// 否则同家族多个模型在选择表里显示成同一个名字，看起来像重复。
+func TestCloneEntryDisplayNameDerivedFromUpstreamID(t *testing.T) {
+	cloneSrc := &registry.Model{
+		Slug: "zai-coding/glm-5-turbo", GatewayModel: "zai-coding-glm-5-turbo",
+		UpstreamModel: "glm-5-turbo", DisplayName: "GLM-5-Turbo (Coding Plan)",
+		ContextWindow: 131072, ReasoningLevels: []registry.ReasoningLevel{{Effort: "low", Description: "low"}},
+	}
+	p := &registry.Provider{ID: "zai-coding"}
+	entry := buildEntry(p, "glm-4.5-air", cloneSrc, t.TempDir(), context.Background())
+	if entry.Model.DisplayName == cloneSrc.DisplayName {
+		t.Fatalf("clone inherited source display name %q", entry.Model.DisplayName)
+	}
+	if entry.Model.DisplayName != "GLM-4.5-Air (Coding Plan)" {
+		t.Fatalf("unexpected derived display name %q", entry.Model.DisplayName)
+	}
+	if entry.Model.Slug != "zai-coding/glm-4.5-air" {
+		t.Fatalf("unexpected slug %q", entry.Model.Slug)
+	}
+}

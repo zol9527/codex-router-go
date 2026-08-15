@@ -122,3 +122,42 @@ func TestStatus(t *testing.T) {
 		t.Errorf("status = %v %q %q", installed, baseURL, catalogPath)
 	}
 }
+
+// TestInstallPreservesForeignLinesInsideDriftedBlock 钉死漂移保护红线：
+// 宿主应用把用户自己的表（[desktop] 等）包进 provider 管理块后，
+// Install 重写管理块绝不能吞掉这些外来行。
+func TestInstallPreservesForeignLinesInsideDriftedBlock(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	drifted := strings.Join([]string{
+		"# BEGIN codex-router-provider-managed",
+		"[model_providers.codex-router]",
+		`name = "Codex Router (external models)"`,
+		`base_url = "http://127.0.0.1:4202/_codex-router/old/v1"`,
+		`wire_api = "responses"`,
+		"supports_standalone_web_search = true",
+		"",
+		"[desktop]",
+		`followUpQueueMode = "queue"`,
+		"",
+		"[mcp_servers.node_repl]",
+		"command = \"node\"",
+		"# END codex-router-provider-managed",
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(drifted), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := Install(path, RouterConfig{BaseURL: "http://127.0.0.1:4202/_codex-router/k/v1", CatalogPath: "/tmp/m.json"}); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := os.ReadFile(path)
+	got := string(raw)
+	for _, must := range []string{"[desktop]", `followUpQueueMode = "queue"`, "[mcp_servers.node_repl]", "command ="} {
+		if !strings.Contains(got, must) {
+			t.Fatalf("user-owned line lost from drifted block: %q\nfile:\n%s", must, got)
+		}
+	}
+	if strings.Contains(got, "old") {
+		t.Fatalf("stale managed base_url should be rewritten away:\n%s", got)
+	}
+}

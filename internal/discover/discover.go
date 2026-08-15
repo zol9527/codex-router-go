@@ -189,6 +189,47 @@ func BuildEntry(reg *registry.Registry, p *registry.Provider, upstreamID, stateD
 	return buildEntry(p, upstreamID, clone, stateDir, ctx)
 }
 
+// acronyms 是派生显示名时按全大写处理的模型家族缩写。
+var acronyms = map[string]string{
+	"glm":  "GLM",
+	"gpt":  "GPT",
+	"grok": "GROK",
+	"qwen": "Qwen",
+}
+
+// prettifyModelID 从上游模型 ID 派生人类可读且唯一的显示名。
+// 上游已带大写（如 "GLM-4.5-Air"）则原样使用；全小写（如 "glm-4.5-air"）
+// 则按连字符分词：缩写全大写，其余词首字母大写 → "GLM-4.5-Air"。
+func prettifyModelID(id string) string {
+	s := strings.TrimSpace(id)
+	if s == "" {
+		return s
+	}
+	if strings.ToLower(s) != s {
+		return s
+	}
+	parts := strings.Split(s, "-")
+	for i, p := range parts {
+		if up, ok := acronyms[p]; ok {
+			parts[i] = up
+			continue
+		}
+		if p != "" && p[0] >= 'a' && p[0] <= 'z' {
+			parts[i] = string(p[0]-'a'+'A') + p[1:]
+		}
+	}
+	return strings.Join(parts, "-")
+}
+
+// planSuffix 提取显示名末尾的括号套餐后缀（" (Coding Plan)" 等），
+// 用于克隆条目继承品牌后缀但不是克隆源的名字本身。
+func planSuffix(display string) string {
+	if i := strings.LastIndex(display, " ("); i >= 0 && strings.HasSuffix(display, ")") {
+		return display[i:]
+	}
+	return ""
+}
+
 func buildEntry(p *registry.Provider, upstreamID string, clone *registry.Model, stateDir string, ctx context.Context) registry.UserModelEntry {
 	now := time.Now().UTC().Format(time.RFC3339)
 	family := p.ID
@@ -214,9 +255,14 @@ func buildEntry(p *registry.Provider, upstreamID string, clone *registry.Model, 
 		UpstreamModel: upstreamID,
 		Provider:      family,
 		Listed:        true,
+		DisplayName:   prettifyModelID(upstreamID),
 	}
 	if clone != nil {
-		model.DisplayName = clone.DisplayName
+		// 显示名绝不能继承克隆源的全名：否则 glm-4.5/glm-4.6 等未收录
+		// models.dev 的模型会全部显示成 "GLM-5-Turbo (Coding Plan)"，
+		// 在 Codex 选择表里看起来像重复项。显示名由上游 ID 派生（天然
+		// 唯一），仅从克隆源继承括号里的套餐后缀（如 " (Coding Plan)"）。
+		model.DisplayName = prettifyModelID(upstreamID) + planSuffix(clone.DisplayName)
 		model.Description = clone.Description
 		model.Priority = clone.Priority
 		model.DefaultEffort = clone.DefaultEffort
