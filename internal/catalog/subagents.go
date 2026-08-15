@@ -2,8 +2,10 @@
 //
 // 语义移植自 src/multi-agent-state.mjs 与 src/codex-agent-catalog.mjs：
 //
-//   - ApplySubagentDemotions：disabled 列表里的路由模型降回 v1 ——
-//     本地状态只能收窄注册表的证明集合，永远不能放大
+//   - ApplySubagentMultiAgent：路由模型的多代理版本裁决 —— 注册表
+//     multiAgentVersion 与本地 declared 声明任一给出 v2 即 v2；
+//     disabled / picker 隐藏一票否决降回 v1。本地声明是用户主权通道
+//     （自己的机器自己证明），收窄永远赢过提升
 //   - PromoteNativeMultiAgent：原生条目按模式提升。上游把 gpt-5.6-luna
 //     静态标成 v1 但它实际跑在 v2 后端（spawn_agent 按静态值过滤候选，
 //     v1 条目永远不能被 v2 父代理委派）—— 白名单无条件提升；其余
@@ -31,13 +33,19 @@ import (
 // 无条件提升 —— 不经模式开关，不经设置页。
 var nativeV2BackendSlugs = map[string]bool{"gpt-5.6-luna": true}
 
-// ApplySubagentDemotions 把 disabled / picker 隐藏的路由模型降回 v1
-// （复制不改原）。隐藏即降权与 Node 版一致：从 picker 拿掉的模型
-// 不该再作为分身候选出现。
-func ApplySubagentDemotions(models []*registry.Model, settings state.SubagentSettings, hidden map[string]bool) []*registry.Model {
+// ApplySubagentMultiAgent 裁决路由模型的 multi_agent_version：
+// 注册表证明（multiAgentVersion=v2）或本地声明（settings.Declared）
+// 任一命中即 v2；disabled / picker 隐藏无条件降回 v1（复制不改原）。
+// 隐藏即降权与 Node 版一致：从 picker 拿掉的模型不该再作为分身候选
+// 出现。
+func ApplySubagentMultiAgent(models []*registry.Model, settings state.SubagentSettings, hidden map[string]bool) []*registry.Model {
 	disabled := map[string]bool{}
 	for _, slug := range settings.Disabled {
 		disabled[slug] = true
+	}
+	declared := map[string]bool{}
+	for _, slug := range settings.Declared {
+		declared[slug] = true
 	}
 	out := make([]*registry.Model, 0, len(models))
 	for _, m := range models {
@@ -45,6 +53,12 @@ func ApplySubagentDemotions(models []*registry.Model, settings state.SubagentSet
 			demoted := *m
 			demoted.MultiAgentVersion = "v1"
 			out = append(out, &demoted)
+			continue
+		}
+		if m.MultiAgentVersion != "v2" && declared[m.Slug] {
+			promoted := *m
+			promoted.MultiAgentVersion = "v2"
+			out = append(out, &promoted)
 			continue
 		}
 		out = append(out, m)

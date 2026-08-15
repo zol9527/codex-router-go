@@ -208,7 +208,7 @@ func Refresh(codexBinary, outputPath string, reg *registry.Registry, enabled fun
 	settings := state.ReadSubagentSettings(filepath.Dir(outputPath))
 	hidden := state.ReadPickerHidden(filepath.Dir(outputPath))
 	native = PromoteNativeMultiAgent(native, settings)
-	routedModels := ApplySubagentDemotions(reg.Models, settings, hidden)
+	routedModels := ApplySubagentMultiAgent(reg.Models, settings, hidden)
 	catalog := Build(native, routedModels, enabled, true, hidden)
 	if err := Write(outputPath, catalog); err != nil {
 		return 0, err

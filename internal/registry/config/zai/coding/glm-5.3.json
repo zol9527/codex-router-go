@@ -7,7 +7,6 @@
       "upstreamModel": "glm-5.3",
       "provider": "zai-coding",
       "listed": true,
-      "multiAgentVersion": "v2",
       "displayName": "GLM-5.3 (Coding Plan)",
       "description": "GLM-5.3 through the Z.ai GLM Coding Plan subscription with the documented 1M context window, low/high/max reasoning tiers for agentic coding and tool calls.",
       "priority": 10,

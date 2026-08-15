@@ -15,13 +15,13 @@ func v2Model(slug string) *registry.Model {
 }
 
 // 本地降权红线：disabled 把 v2 降回 v1，且不改动原注册表对象。
-func TestApplySubagentDemotions(t *testing.T) {
+func TestApplySubagentMultiAgent(t *testing.T) {
 	proven := v2Model("zai-coding/glm-5.3")
 	plain := &registry.Model{Slug: "zai-coding/glm-5.2", Provider: "zai-coding", Listed: true}
 	settings := state.SubagentSettings{Version: 2, Mode: state.SubagentModeProven,
 		Disabled: []string{"zai-coding/glm-5.3"}}
 
-	out := ApplySubagentDemotions([]*registry.Model{proven, plain}, settings, nil)
+	out := ApplySubagentMultiAgent([]*registry.Model{proven, plain}, settings, nil)
 	if out[0].MultiAgentVersion != "v1" {
 		t.Errorf("disabled model must demote to v1, got %q", out[0].MultiAgentVersion)
 	}
@@ -33,9 +33,40 @@ func TestApplySubagentDemotions(t *testing.T) {
 	}
 	// picker 隐藏同样降权 —— 从 picker 拿掉的模型不该是分身候选。
 	hidden := map[string]bool{"zai-coding/glm-5.3": true}
-	out = ApplySubagentDemotions([]*registry.Model{proven}, state.SubagentSettings{Version: 2, Mode: state.SubagentModeProven}, hidden)
+	out = ApplySubagentMultiAgent([]*registry.Model{proven}, state.SubagentSettings{Version: 2, Mode: state.SubagentModeProven}, hidden)
 	if out[0].MultiAgentVersion != "v1" {
 		t.Error("picker-hidden model must demote to v1")
+	}
+}
+
+// 本地声明（declared，用户主权通道）：注册表未证明的路由模型可提为
+// v2；disabled / 隐藏一票否决永远压过声明。
+func TestApplySubagentDeclaredPromotion(t *testing.T) {
+	plain := &registry.Model{Slug: "opencode-go/deepseek-v4-flash", Provider: "opencode-go", Listed: true}
+	settings := state.SubagentSettings{Version: 2, Mode: state.SubagentModeProven,
+		Declared: []string{"opencode-go/deepseek-v4-flash"}}
+
+	out := ApplySubagentMultiAgent([]*registry.Model{plain}, settings, nil)
+	if out[0].MultiAgentVersion != "v2" {
+		t.Errorf("declared model must promote to v2, got %q", out[0].MultiAgentVersion)
+	}
+	if plain.MultiAgentVersion != "" {
+		t.Error("original registry object must stay untouched")
+	}
+
+	// disabled 压过声明。
+	settings.Disabled = []string{"opencode-go/deepseek-v4-flash"}
+	out = ApplySubagentMultiAgent([]*registry.Model{plain}, settings, nil)
+	if out[0].MultiAgentVersion != "v1" {
+		t.Error("disabled must override declared promotion")
+	}
+
+	// picker 隐藏同样压过声明。
+	settings.Disabled = nil
+	out = ApplySubagentMultiAgent([]*registry.Model{plain}, settings,
+		map[string]bool{"opencode-go/deepseek-v4-flash": true})
+	if out[0].MultiAgentVersion != "v1" {
+		t.Error("picker-hidden must override declared promotion")
 	}
 }
 

@@ -167,7 +167,7 @@ func controlUsage() {
   control credential PROVIDER --remove    remove the provider's config.toml table
   control config init                     write the commented config.toml template
   control reload                          re-read config + refresh catalog, no restart
-  control subagents status|mode <m>|select-all|unselect-all|set <slug> on|off|provider <id> on|off
+  control subagents status|mode <m>|select-all|unselect-all|declare <slug>|undeclare <slug>|set <slug> on|off|provider <id> on|off
   control picker set <slug> show|hide | provider <id> show|hide | all show|hide | status
   control tool-result-aging status|on|off
   control models sync [PROVIDER]|list|remove <slug>|add PROVIDER <upstream-id>
@@ -614,8 +614,10 @@ func controlSubagents(st *state.State, reg *registry.Registry, args []string) er
 	case "status":
 		return printSnapshot()
 	case "select-all":
+		// 声明列表是独立通道，整体替换时保留。
 		if _, err := state.ReplaceSubagentSettings(st.Dir, state.SubagentSettings{
-			Mode: state.SubagentModeAll,
+			Mode:     state.SubagentModeAll,
+			Declared: state.ReadSubagentSettings(st.Dir).Declared,
 		}); err != nil {
 			return err
 		}
@@ -631,7 +633,20 @@ func controlSubagents(st *state.State, reg *registry.Registry, args []string) er
 		if _, err := state.ReplaceSubagentSettings(st.Dir, state.SubagentSettings{
 			Mode:     state.SubagentModeSelected,
 			Disabled: disabled,
+			Declared: state.ReadSubagentSettings(st.Dir).Declared,
 		}); err != nil {
+			return err
+		}
+	case "declare", "undeclare":
+		// 本地 v2 声明（用户主权通道）：把注册表未证明的路由模型提为
+		// 分身候选。disabled / picker 隐藏仍可一票否决。
+		if len(args) < 2 {
+			return fmt.Errorf("usage: control subagents %s <model-slug>", action)
+		}
+		if reg.BySlug(args[1]) == nil {
+			return fmt.Errorf("unknown model slug: %s", args[1])
+		}
+		if _, err := state.SetSubagentDeclared(st.Dir, []string{args[1]}, action == "declare"); err != nil {
 			return err
 		}
 	case "mode":
@@ -670,7 +685,7 @@ func controlSubagents(st *state.State, reg *registry.Registry, args []string) er
 			return err
 		}
 	default:
-		return fmt.Errorf("usage: control subagents status|mode <all|selected|proven>|select-all|unselect-all|set <slug> on|off|provider <id> on|off")
+		return fmt.Errorf("usage: control subagents status|mode <all|selected|proven>|select-all|unselect-all|declare <slug>|undeclare <slug>|set <slug> on|off|provider <id> on|off")
 	}
 	if err := refresh(); err != nil {
 		return err

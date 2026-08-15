@@ -24,11 +24,15 @@ const (
 )
 
 // SubagentSettings 是 multi-agent-settings.json 的形状。
+// Declared 是本地 v2 声明（用户主权通道）：把"注册表未证明"的路由
+// 模型提为 v2 分身候选 —— 自己的机器自己证明。disabled / hidden 仍然
+// 永远压过声明。
 type SubagentSettings struct {
 	Version  int      `json:"version"`
 	Mode     string   `json:"mode"`
 	Enabled  []string `json:"enabled"`
 	Disabled []string `json:"disabled"`
+	Declared []string `json:"declared"`
 }
 
 func validSubagentMode(mode string) bool {
@@ -36,7 +40,7 @@ func validSubagentMode(mode string) bool {
 }
 
 func defaultSubagentSettings() SubagentSettings {
-	return SubagentSettings{Version: 2, Mode: SubagentModeProven, Enabled: []string{}, Disabled: []string{}}
+	return SubagentSettings{Version: 2, Mode: SubagentModeProven, Enabled: []string{}, Disabled: []string{}, Declared: []string{}}
 }
 
 // legacySubagentSettings 迁移第一版的 bool 全局开关（multi-agent-all.json）。
@@ -72,6 +76,11 @@ func ReadSubagentSettings(stateDir string) SubagentSettings {
 		if json.Unmarshal(raw, &parsed) == nil &&
 			parsed.Version == 2 && validSubagentMode(parsed.Mode) &&
 			parsed.Enabled != nil && parsed.Disabled != nil {
+			// 旧版文件没有 declared 字段 —— 回填空集而不是拒读
+			// （拒读会把用户的 mode/all 静默重置回 proven）。
+			if parsed.Declared == nil {
+				parsed.Declared = []string{}
+			}
 			return parsed
 		}
 	}
@@ -88,6 +97,10 @@ func WriteSubagentSettings(stateDir string, settings SubagentSettings) error {
 	}
 	sort.Strings(settings.Enabled)
 	sort.Strings(settings.Disabled)
+	if settings.Declared == nil {
+		settings.Declared = []string{}
+	}
+	sort.Strings(settings.Declared)
 	raw, err := json.MarshalIndent(settings, "", "  ")
 	if err != nil {
 		return err
@@ -156,7 +169,36 @@ func SetSubagentModels(stateDir string, slugs []string, enabled bool) (SubagentS
 		Mode:     mode,
 		Enabled:  fromSet(enabledSet),
 		Disabled: fromSet(disabledSet),
+		Declared: current.Declared,
 	}
+	err := WriteSubagentSettings(stateDir, next)
+	return next, err
+}
+
+// SetSubagentDeclared 批量增删本地 v2 声明（declare/undeclare 通道）。
+// 与 enabled/disabled 正交：声明负责"可当分身"，disabled/hidden 负责
+// "一票否决"。
+func SetSubagentDeclared(stateDir string, slugs []string, declared bool) (SubagentSettings, error) {
+	unique := map[string]bool{}
+	for _, slug := range slugs {
+		if trimmed := trimNonEmpty(slug); trimmed != "" {
+			unique[trimmed] = true
+		}
+	}
+	if len(unique) == 0 {
+		return SubagentSettings{}, os.ErrInvalid
+	}
+	current := ReadSubagentSettings(stateDir)
+	declaredSet := toSet(current.Declared)
+	for slug := range unique {
+		if declared {
+			declaredSet[slug] = true
+		} else {
+			delete(declaredSet, slug)
+		}
+	}
+	next := current
+	next.Declared = fromSet(declaredSet)
 	err := WriteSubagentSettings(stateDir, next)
 	return next, err
 }
@@ -169,6 +211,7 @@ func SubagentSettingsSnapshot(stateDir string) map[string]any {
 		"mode":     settings.Mode,
 		"enabled":  settings.Enabled,
 		"disabled": settings.Disabled,
+		"declared": settings.Declared,
 		"all":      settings.Mode == SubagentModeAll,
 		"path":     subagentSettingsPath(stateDir),
 	}
