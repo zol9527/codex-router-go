@@ -150,9 +150,12 @@ func Sync(ctx context.Context, stateDir string, reg *registry.Registry, provider
 	return report
 }
 
-// familyCloneSource 选克隆源：同 provider 家族里 upstream 与目标 ID
-// 公共前缀最长的模型（glm-5-4 → glm-5.3 而不是 glm-4.7）；provider
-// 无模型时返回 nil（字段走零值，靠 models.dev 补齐）。
+// familyCloneSource 选克隆源。models.dev 未收录的模型只能抄家族参数，
+// 抄谁直接决定 ctx/档位这些猜测的保守程度：
+//
+//   - 前缀最近者优先（glm-5.1 → glm-5.2 而不是 glm-4.7：同代数形状最像）
+//   - 前缀并列时取 ctx 更小者 —— 克隆是猜测，猜测宁可低估（宁可让
+//     Codex 早压缩）也不虚标（虚标 1M 的 200K 模型会在长会话里溢出）
 func familyCloneSource(reg *registry.Registry, providerID, targetID string) *registry.Model {
 	target := NormalizeID(targetID)
 	var best *registry.Model
@@ -162,7 +165,8 @@ func familyCloneSource(reg *registry.Registry, providerID, targetID string) *reg
 			continue
 		}
 		n := commonPrefixLen(NormalizeID(m.UpstreamModel), target)
-		if best == nil || n > bestLen {
+		if best == nil || n > bestLen ||
+			(n == bestLen && m.ContextWindow < best.ContextWindow) {
 			best, bestLen = m, n
 		}
 	}
