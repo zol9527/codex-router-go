@@ -86,6 +86,7 @@ control credential PROVIDER             stdin 写入 api_key 到 config.toml
 control credential PROVIDER --remove    删除对应表
 control config init                     生成注释模板
 control reload                          重读配置+刷新 catalog，不重启
+control subagents status|mode|select-all|unselect-all|set|provider
 control presence set always|follow-codex
 control account --json | provider-usage --json    配额与用量
 control vision-bridge pull TAG | pull-status | benchmark | catalog
@@ -105,6 +106,7 @@ control local-runtime status|start|stop
 | **视觉桥** | 文本模型也能读图：结构化转写（六段证据合同）、一图一购缓存、引擎自动选择/回退/本地 Ollama |
 | Rate-limit 收割 | 从上游响应头攒限流窗口信息 |
 | 用量计量 | 每回合一行 JSONL：token、首 token 延迟、重试；App 用量卡片的数据源 |
+| **协作子代理** | Codex v2 协作的分身候选：注册表 `multiAgentVersion` 证明标记（真实探针通过才标）→ catalog 发布 + agents 目录按名 spawn 定义；`control subagents` 三模式管理（proven/selected/all），本地只能收窄不能放大 |
 | codex shim | 可选的 PATH 包装器，启动前确认路由器就绪（`codex-router shim install`） |
 
 ## 扩展协议
