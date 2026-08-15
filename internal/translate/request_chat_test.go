@@ -2,8 +2,12 @@ package translate
 
 import (
 	"encoding/json"
+	"fmt"
+	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/loyd/codex-router/internal/registry"
 )
 
 func obj(t *testing.T, raw string) map[string]any {
@@ -212,5 +216,233 @@ func TestGLMEffort(t *testing.T) {
 		if got := glmEffort(tc.requested, tc.levels); got != tc.want {
 			t.Errorf("glmEffort(%q, %v) = %q, want %q", tc.requested, tc.levels, got, tc.want)
 		}
+	}
+}
+
+// 思维链携带：reasoning item 的文本落到其后首条 assistant 消息的
+// 内部标记上（tool_calls 消息、空 assistant filler 之后的调用都要
+// 覆盖）；跨过 user 边界的孤儿 reasoning 丢弃。这是 opencode
+// DeepSeek thinking 模式回放契约的翻译期半边（2026-08-15 子代理
+// 首轮 400 事故的根因修复）。
+func TestReasoningCarryIntoAssistantMessages(t *testing.T) {
+	input := obj(t, `{
+		"input": [
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"go"}]},
+			{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"Thinking about ls"}]},
+			{"type":"function_call","call_id":"call_a","name":"shell","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_a","output":"done"},
+			{"type":"reasoning","id":"rs_2","summary":[{"type":"summary_text","text":"Second thought"}]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":""}]},
+			{"type":"function_call","call_id":"call_b","name":"shell","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_b","output":"ok"},
+			{"type":"reasoning","id":"rs_3","summary":[{"type":"summary_text","text":"Orphan"}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"next"}]},
+			{"type":"reasoning","id":"rs_4","content":[{"type":"output_text","text":"Content-array form"}]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Answer"}]}
+		]
+	}`)
+	chat, err := TranslateToChat(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	messages := chat.Body["messages"].([]map[string]any)
+	// user, assistant(call_a)+carry, tool, assistant(call_b)+carry, tool,
+	// user, assistant("Answer")+carry(content 数组形态)。空 assistant
+	// filler 在翻译期被丢弃，carry 必须落到后面的 call_b 上。
+	if len(messages) != 7 {
+		t.Fatalf("expected 7 messages, got %d: %+v", len(messages), messages)
+	}
+	if carry := messages[1][reasoningCarryKey]; carry != "Thinking about ls" {
+		t.Errorf("call_a assistant should carry reasoning, got %v", carry)
+	}
+	if carry := messages[3][reasoningCarryKey]; carry != "Second thought" {
+		t.Errorf("call_b assistant should carry reasoning past empty filler, got %v", carry)
+	}
+	if carry := messages[6][reasoningCarryKey]; carry != "Content-array form" {
+		t.Errorf("content-array reasoning should carry, got %v", carry)
+	}
+	for i, message := range messages {
+		if i == 1 || i == 3 || i == 6 {
+			continue
+		}
+		if _, ok := message[reasoningCarryKey]; ok {
+			t.Errorf("message %d must not carry reasoning", i)
+		}
+	}
+}
+
+// carry 必须在 CoalesceAssistantMessages 的合并中存活：reasoning 后的
+// assistant 文本与紧随的 function_call 合并成一条时，标记留在合并头。
+func TestReasoningCarrySurvivesCoalesce(t *testing.T) {
+	input := obj(t, `{
+		"input": [
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"go"}]},
+			{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"Plan"}]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Running it"}]},
+			{"type":"function_call","call_id":"call_a","name":"shell","arguments":"{}"}
+		]
+	}`)
+	chat, _ := TranslateToChat(input)
+	messages := chat.Body["messages"].([]map[string]any)
+	// user + 合并 assistant + 孤儿 call 的合成 tool 结果。
+	if len(messages) != 3 {
+		t.Fatalf("expected user + coalesced assistant + synthetic tool, got %d: %+v", len(messages), messages)
+	}
+	merged := messages[1]
+	if carry := merged[reasoningCarryKey]; carry != "Plan" {
+		t.Errorf("coalesced assistant must keep carry, got %v", carry)
+	}
+	if !strings.Contains(fmt.Sprint(merged["content"]), "Running it") {
+		t.Errorf("coalesced content wrong: %v", merged["content"])
+	}
+	if _, ok := merged["tool_calls"]; !ok {
+		t.Error("coalesced assistant must keep tool_calls")
+	}
+}
+
+// deepseek-thinking 画像：标记提升为 reasoning_content；强制
+// tool_choice 降级 auto（thinking 模式拒绝 "required"/function 对象）。
+func TestDeepSeekThinkingProfilePromotesCarry(t *testing.T) {
+	input := obj(t, `{
+		"input": [
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"go"}]},
+			{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"Prior thought"}]},
+			{"type":"function_call","call_id":"call_a","name":"shell","arguments":"{}"}
+		],
+		"tool_choice": "required"
+	}`)
+	chat, _ := TranslateToChat(input)
+	model := &registry.Model{RequestProfile: "deepseek-thinking"}
+	ApplyRequestProfile(chat.Body, "high", model)
+	messages := chat.Body["messages"].([]map[string]any)
+	if messages[1]["reasoning_content"] != "Prior thought" {
+		t.Errorf("carry must be promoted to reasoning_content, got %v", messages[1]["reasoning_content"])
+	}
+	if _, ok := messages[1][reasoningCarryKey]; ok {
+		t.Error("marker must be removed after promotion")
+	}
+	if chat.Body["tool_choice"] != "auto" {
+		t.Errorf("forced tool_choice must downgrade to auto, got %v", chat.Body["tool_choice"])
+	}
+	if _, ok := chat.Body["thinking"]; ok {
+		t.Error("opencode relay variant must not send a thinking object")
+	}
+}
+
+// 其余画像（默认 / glm-thinking）必须剥除内部标记：官方 DeepSeek API
+// 对输入里的 reasoning_content 报 400，标记字段也绝不外发。
+func TestOtherProfilesStripCarry(t *testing.T) {
+	input := obj(t, `{
+		"input": [
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"go"}]},
+			{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"Prior thought"}]},
+			{"type":"function_call","call_id":"call_a","name":"shell","arguments":"{}"}
+		]
+	}`)
+	for _, profile := range []string{"", "glm-thinking"} {
+		chat, _ := TranslateToChat(input)
+		ApplyRequestProfile(chat.Body, "high", &registry.Model{RequestProfile: profile})
+		messages := chat.Body["messages"].([]map[string]any)
+		if _, ok := messages[1][reasoningCarryKey]; ok {
+			t.Errorf("profile %q must strip the carry marker", profile)
+		}
+		if _, ok := messages[1]["reasoning_content"]; ok {
+			t.Errorf("profile %q must not emit reasoning_content", profile)
+		}
+	}
+}
+
+// custom 工具往返：声明翻译成 {input: string} function + 名字收集；
+// 响应侧对这些名字的调用还原成 custom_tool_call（自由文本 input）。
+// 背景（2026-08-15 事故）：catalog 继承了原生模板的
+// tool_mode=code_mode_only，Codex 以 custom 形态下发 code-mode exec，
+// 声明被静默丢弃后模型自造 {"cmd"/"command"} 载荷，Codex 报
+// "tool exec invoked with incompatible payload"。
+func TestCustomToolDeclarationTranslated(t *testing.T) {
+	input := obj(t, `{
+		"input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"go"}]}],
+		"tools": [
+			{"type":"custom","name":"exec","description":"Run code.","format":{"type":"text"}},
+			{"type":"function","name":"shell","description":"run a shell","parameters":{"type":"object"}}
+		]
+	}`)
+	chat, err := TranslateToChat(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chat.CustomTools) != 1 || chat.CustomTools[0] != "exec" {
+		t.Fatalf("custom tool names wrong: %v", chat.CustomTools)
+	}
+	tools := chat.Body["tools"].([]any)
+	if len(tools) != 2 {
+		t.Fatalf("both tools must be declared, got %d", len(tools))
+	}
+	fn := tools[0].(map[string]any)["function"].(map[string]any)
+	if fn["name"] != "exec" {
+		t.Fatalf("custom tool must keep its name, got %v", fn["name"])
+	}
+	params := fn["parameters"].(map[string]any)
+	if params["required"].([]any)[0] != "input" {
+		t.Errorf("custom tool schema must require input, got %v", params["required"])
+	}
+}
+
+// custom 工具的调用在 SSE 收尾时必须是 custom_tool_call item，
+// input 从伪装 schema 的 {"input": ...} 解出；done 事件携带完整载荷
+// （Codex 的解析器从 output_item.done 取 custom 调用）。
+func TestCustomToolCallRoundTripStream(t *testing.T) {
+	translator := NewChatToResponsesSSE("", "deepseek").WithCustomTools([]string{"exec"})
+	// arguments 是嵌套 JSON 字符串，用 strconv.Quote 构造避免手写转义出错。
+	chunk := `{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_x","function":{"name":"exec","arguments":` +
+		strconv.Quote(`{"input":"const x = 1;"}`) + `}}]}}]}`
+	var collected []byte
+	collected = append(collected, translator.Created()...)
+	collected = append(collected, translator.Feed(chunk)...)
+	collected = append(collected, translator.Feed("[DONE]")...)
+	text := string(collected)
+	if !strings.Contains(text, `"type":"custom_tool_call"`) {
+		t.Errorf("custom tool call must emit custom_tool_call items:\n%s", text)
+	}
+	if !strings.Contains(text, "const x = 1;") {
+		t.Errorf("custom_tool_call input must carry the payload text:\n%s", text)
+	}
+	if strings.Contains(text, `"type":"function_call"`) {
+		t.Errorf("custom tool call must not emit function_call items:\n%s", text)
+	}
+}
+
+// 模型没按伪装 schema 输出时（裸 JSON 字符串 / 乱形状），载荷退化到
+// 原始 arguments，调用不丢。
+func TestCustomToolInputFallbacks(t *testing.T) {
+	if got := customToolInput(`"raw string payload"`); got != "raw string payload" {
+		t.Errorf("bare JSON string should be unwrapped, got %q", got)
+	}
+	if got := customToolInput(`{"cmd":"ls"}`); got != `{"cmd":"ls"}` {
+		t.Errorf("unknown shape should fall back to raw arguments, got %q", got)
+	}
+}
+
+// 非流式路径：custom 调用出现在 completed 的 output 数组里。
+func TestCustomToolCallNonStream(t *testing.T) {
+	body := obj(t, `{
+		"choices": [{"message":{"role":"assistant","tool_calls":[
+			{"id":"call_y","type":"function","function":{"name":"exec","arguments":"{\"input\":\"await tools.read('/x')\"}"}}
+		]}}]
+	}`)
+	translator := NewChatToResponsesSSE("", "deepseek").WithCustomTools([]string{"exec"})
+	response := TranslateNonStreamChatWith(body, translator)
+	output := response["output"].([]any)
+	if len(output) != 1 {
+		t.Fatalf("expected one output item, got %d", len(output))
+	}
+	item := output[0].(map[string]any)
+	if item["type"] != "custom_tool_call" {
+		t.Fatalf("non-stream custom call must be custom_tool_call, got %v", item["type"])
+	}
+	if item["input"] != "await tools.read('/x')" {
+		t.Errorf("custom_tool_call input wrong: %v", item["input"])
+	}
+	if item["call_id"] != "call_y" {
+		t.Errorf("custom_tool_call call_id must survive, got %v", item["call_id"])
 	}
 }

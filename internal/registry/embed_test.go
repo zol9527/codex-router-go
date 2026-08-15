@@ -3,6 +3,7 @@ package registry
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -39,6 +40,28 @@ func TestEmbeddedRegistryMatchesDisk(t *testing.T) {
 			t.Errorf("model %q missing from embedded registry", m.Slug)
 		}
 	}
+}
+
+// glm-5.3 上游是 text-only（zai 的视觉能力在 glm-5v-* 变体上），但
+// Codex 的贴图入口只认 catalog 里的 image modality —— 声明它只是解锁
+// 客户端入口，实际读图由 vision bridge 代办。上游注册表与覆盖层都
+// 改不了它（覆盖层只新增不覆盖，内嵌必赢），所以这行声明只能住在
+// 内嵌注册表里。拿掉它，Codex 侧就会重新报"此模型不支持图像输入"。
+func TestEmbeddedGLM53DeclaresImageInput(t *testing.T) {
+	reg, err := LoadEmbedded()
+	if err != nil {
+		t.Fatalf("load embedded registry: %v", err)
+	}
+	m := reg.ForSlug("zai-coding/glm-5.3")
+	if m == nil {
+		t.Fatal("zai-coding/glm-5.3 missing from embedded registry")
+	}
+	for _, modality := range m.InputModalities {
+		if strings.EqualFold(modality, "image") {
+			return
+		}
+	}
+	t.Errorf("zai-coding/glm-5.3 inputModalities = %v, must declare image (vision bridge backs the picker attach entry)", m.InputModalities)
 }
 
 // LoadDefault：显式目录存在则用目录（开发覆盖），不存在落内嵌。

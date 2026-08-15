@@ -1,6 +1,8 @@
 package vision
 
 import (
+	"encoding/json"
+	"os"
 	"sort"
 	"strings"
 )
@@ -140,4 +142,80 @@ func LocalModelOf(settings Settings) string {
 		return settings.LocalModel
 	}
 	return DefaultLocalVisionModel
+}
+
+// NativeEnginesFromCatalogFile 从 merged-models.json 提取 listed 的
+// 视觉原生模型作为引擎候选（server 读图候选与 control 快照的
+// nativeEngines 列表共用）。exclude 是要排除的 slug 集合（调用方
+// 传 registry slug，防止路由条目被当成原生引擎）。
+// 文件缺失/损坏返回 nil —— 引擎候选是增强项，不是启动前提。
+func NativeEnginesFromCatalogFile(path string, exclude map[string]bool) []Engine {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var parsed struct {
+		Models []struct {
+			Slug            string `json:"slug"`
+			DisplayName     string `json:"display_name"`
+			Priority        any    `json:"priority"`
+			Visibility      string `json:"visibility"`
+			// 目录里 modality 有两种形态：原生条目是数组
+			// （["text","image"]），路由条目构造时也写数组；但历史
+			// 上出现过字符串形态，两种都兼容。
+			InputModalities any `json:"input_modalities"`
+			Efforts         []struct {
+				Effort string `json:"effort"`
+			} `json:"supported_reasoning_levels"`
+			DefaultEffort string `json:"default_reasoning_level"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return nil
+	}
+	var engines []Engine
+	for _, model := range parsed.Models {
+		if model.Visibility != "list" || exclude[model.Slug] {
+			continue
+		}
+		if !SupportsImage(modalityStrings(model.InputModalities)) {
+			continue
+		}
+		priority := 999
+		if p, ok := model.Priority.(float64); ok {
+			priority = int(p)
+		}
+		efforts := make([]string, 0, len(model.Efforts))
+		for _, level := range model.Efforts {
+			efforts = append(efforts, level.Effort)
+		}
+		engines = append(engines, Engine{
+			Slug: model.Slug, DisplayName: model.DisplayName,
+			GatewayModel: model.Slug, Native: true,
+			Priority: priority, Efforts: efforts, DefaultEffort: model.DefaultEffort,
+			ImageCapable: true,
+		})
+	}
+	return engines
+}
+
+// modalityStrings 把目录里的 modality 字段归一成字符串切片：
+// 数组取各元素，字符串按空格/逗号切分。
+func modalityStrings(field any) []string {
+	switch value := field.(type) {
+	case []any:
+		out := make([]string, 0, len(value))
+		for _, item := range value {
+			if s, ok := item.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out
+	case string:
+		return strings.FieldsFunc(value, func(r rune) bool {
+			return r == ' ' || r == ','
+		})
+	default:
+		return nil
+	}
 }

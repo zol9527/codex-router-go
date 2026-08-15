@@ -103,6 +103,59 @@ func TestUnrepairableAfterLiveness(t *testing.T) {
 	}
 }
 
+// 回归：custom-tool-only 流不产生任何活性事件（custom 调用刻意不发
+// function_call_arguments.delta，从 output_item.done 取完整载荷），
+// 头从未提交 —— 修复前 handler 静默返回 200 + content-length:0，
+// Codex 判 "stream closed before response.completed" 5 连重试耗尽
+// （2026-08-16 01:33-01:41 实发，GLM 无思考直接调 apply_patch 的轮次）。
+func TestCustomToolOnlyStreamFlushed(t *testing.T) {
+	var calls int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"apply_patch\",\"arguments\":\"*** Begin Patch\"}}]}}]}\n\n")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+
+	srv, ts := newTestServer(t)
+	srv.opt.Registry.Providers["zai-coding"].BaseURL = upstream.URL
+	srv.opt.Registry.Providers["zai-coding"].BaseURLEnv = ""
+	t.Setenv("ZAI_API_KEY", "")
+	callerKey, _ := srv.opt.State.CallerKey()
+
+	// 请求声明 custom 工具，上游的 tool_calls 才会被还原成
+	// custom_tool_call（无 arguments 增量）。
+	req, _ := http.NewRequest(http.MethodPost,
+		ts.URL+CallerPathPrefix+"/"+callerKey+"/v1/responses",
+		strings.NewReader(`{"model":"zai-coding/glm-5.3","input":"hi","stream":true,"tools":[{"type":"custom","name":"apply_patch","description":"apply a patch"}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	// custom 调用本身算内容（HasContent=true），不得触发隐形重试。
+	if calls != 1 {
+		t.Errorf("custom tool call is content, no silent retry expected, calls=%d", calls)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "text/event-stream" {
+		t.Errorf("SSE head must be committed before handler returns, got content-type %q", ct)
+	}
+	body := readAll(t, resp)
+	if !strings.Contains(body, "custom_tool_call") {
+		t.Errorf("custom tool call must reach the client:\n%s", body)
+	}
+	if !strings.Contains(body, "event: response.completed") {
+		t.Errorf("termination event must reach the client:\n%s", body)
+	}
+	if !strings.Contains(body, "data: [DONE]") {
+		t.Errorf("[DONE] sentinel must reach the client:\n%s", body)
+	}
+}
+
 // 补零替换：上游报 prompt_tokens:0 的大请求，completed 事件携带估算。
 func TestZeroPromptTokenSubstitution(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

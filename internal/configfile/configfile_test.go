@@ -42,6 +42,8 @@ func TestInstallIdempotent(t *testing.T) {
 	for _, want := range []string{
 		startMarker, endMarker, providerStart, providerEnd,
 		`[model_providers.codex-router]`, `wire_api = "responses"`,
+		`experimental_realtime_webrtc_call_base_url = "https://chatgpt.com/backend-api/codex"`,
+		`experimental_realtime_ws_base_url = "https://api.openai.com/v1"`,
 		`model = "gpt-5.5"`, // 用户内容保留
 		`trust_level = "trusted"`,
 		`[mcp_servers.github]`,
@@ -67,6 +69,11 @@ func TestInstallIdempotent(t *testing.T) {
 	}
 	if got := strings.Count(string(raw), providerStart); got != 1 {
 		t.Errorf("provider block duplicated: %d", got)
+	}
+	for _, key := range []string{realtimeCallBaseURLKey, realtimeWebSocketBaseURLKey} {
+		if got := strings.Count(string(raw), key+" ="); got != 1 {
+			t.Errorf("%s duplicated: %d", key, got)
+		}
 	}
 }
 
@@ -95,7 +102,10 @@ func TestUninstallRestores(t *testing.T) {
 	}
 	raw, _ := os.ReadFile(path)
 	after := string(raw)
-	for _, banned := range []string{startMarker, endMarker, providerStart, providerEnd, "codex-router"} {
+	for _, banned := range []string{
+		startMarker, endMarker, providerStart, providerEnd, "codex-router",
+		"experimental_realtime_webrtc_call_base_url", "experimental_realtime_ws_base_url",
+	} {
 		if strings.Contains(after, banned) {
 			t.Errorf("residue %q after uninstall:\n%s", banned, after)
 		}
@@ -104,6 +114,58 @@ func TestUninstallRestores(t *testing.T) {
 		if !strings.Contains(after, want) {
 			t.Errorf("user content lost: %q", want)
 		}
+	}
+}
+
+// 用户已指定语音端点时，router 只能接管文本 Responses，不能改写语音链路。
+func TestInstallPreservesUserOwnedRealtimeEndpoints(t *testing.T) {
+	original := `experimental_realtime_webrtc_call_base_url = "https://voice.example/calls"
+experimental_realtime_ws_base_url = "wss://voice.example/live"
+chatgpt_base_url = "https://chat.example/backend-api/"
+`
+	path := writeTemp(t, original)
+	if err := Install(path, RouterConfig{BaseURL: "http://x", CatalogPath: "/c"}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(raw)
+	for _, want := range []string{
+		`experimental_realtime_webrtc_call_base_url = "https://voice.example/calls"`,
+		`experimental_realtime_ws_base_url = "wss://voice.example/live"`,
+	} {
+		if count := strings.Count(got, want); count != 1 {
+			t.Errorf("%q count = %d, want 1 in:\n%s", want, count, got)
+		}
+	}
+	if err := Uninstall(path); err != nil {
+		t.Fatal(err)
+	}
+	raw, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(raw); got != original {
+		t.Errorf("uninstall must preserve user-owned realtime endpoints:\n%s", got)
+	}
+}
+
+// chatgpt_base_url 若被用户改到自定义原生网关，Voice 的 WebRTC 呼叫端点随之派生。
+func TestInstallDerivesRealtimeCallFromChatGPTBaseURL(t *testing.T) {
+	path := writeTemp(t, `chatgpt_base_url = "https://chat.example/backend-api/"
+`)
+	if err := Install(path, RouterConfig{BaseURL: "http://x", CatalogPath: "/c"}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(raw); !strings.Contains(got,
+		`experimental_realtime_webrtc_call_base_url = "https://chat.example/backend-api/codex"`) {
+		t.Errorf("missing derived native realtime endpoint in:\n%s", got)
 	}
 }
 

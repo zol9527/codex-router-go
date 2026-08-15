@@ -131,7 +131,7 @@ func cmdControl(args []string) error {
 	case len(rest) >= 1 && rest[0] == "provider-usage":
 		return controlProviderUsage(*stateDir, reg)
 	case len(rest) >= 1 && rest[0] == "vision-bridge":
-		return controlVisionBridge(*stateDir, rest[1:])
+		return controlVisionBridge(*stateDir, reg, rest[1:])
 	case len(rest) >= 1 && rest[0] == "local-runtime":
 		return controlLocalRuntime(*stateDir, rest[1:])
 	case len(rest) >= 3 && rest[0] == "presence" && rest[1] == "set":
@@ -173,6 +173,7 @@ func controlUsage() {
   control models sync [PROVIDER]|list|remove <slug>|add PROVIDER <upstream-id>
   control presence set always|follow-codex
   control account --json | control provider-usage --json
+  control vision-bridge on|off | status | engine <slug|local|auto> [effort] | effort <level|default> | local <tag>
   control vision-bridge pull TAG | pull-status | benchmark [TAG] | catalog
   control local-runtime status|start|stop
 `)
@@ -276,6 +277,8 @@ func controlJSON(st *state.State, reg *registry.Registry) error {
 			"subagents":       state.SubagentSettingsSnapshot(st.Dir),
 			"picker":          state.PickerSnapshot(st.Dir),
 			"toolResultAging": state.ToolResultAgingSnapshot(st.Dir),
+			// 视觉卡数据源：enabled/engine/effort/引擎列表/下载状态。
+			"visionBridge": visionBridgeSnapshot(st, reg),
 		},
 	}
 	payload := map[string]any{

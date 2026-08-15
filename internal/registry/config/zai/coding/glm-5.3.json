@@ -28,7 +28,8 @@
       "contextWindow": 1048576,
       "autoCompact": 943718,
       "inputModalities": [
-        "text"
+        "text",
+        "image"
       ],
       "requestProfile": "glm-thinking",
       "compHash": "zai-coding-glm-5-3-v1"

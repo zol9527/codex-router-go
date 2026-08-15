@@ -48,6 +48,12 @@ func NewRecorder(stateDir string) *Recorder {
 // Path 返回 JSONL 文件路径。
 func (r *Recorder) Path() string { return r.path }
 
+// usageRotateBytes 是 usage-events.jsonl 的轮转阈值。Recorder 每次
+// 写入都重新打开文件，重命名发生在两次打开之间是安全的；单代归档
+//（.1 覆盖旧的 .1）。provider-usage 聚合在文件缺失时返回空视图，
+// 轮转瞬间不丢正确性。可变以供测试缩小。
+var usageRotateBytes int64 = 8 << 20
+
 // Record 追加一条事件。失败只影响计量，绝不影响请求路径。
 func (r *Recorder) Record(event Event) {
 	if r == nil {
@@ -62,6 +68,11 @@ func (r *Recorder) Record(event Event) {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	// 尺寸轮转：8MB ≈ 数万回合。append-only 无限增长的文件对常驻
+	// 服务是慢性的磁盘泄漏，这里在写入前检查并归档单代。
+	if info, err := os.Stat(r.path); err == nil && info.Size() >= usageRotateBytes {
+		_ = os.Rename(r.path, r.path+".1")
+	}
 	file, err := os.OpenFile(r.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return

@@ -2081,6 +2081,14 @@ final class ServiceSupervisor {
     if let logHandle { return logHandle }
     let path = (stateDir as NSString).appendingPathComponent("router.log")
     let fm = FileManager.default
+    // 启动轮转：超过 2MB 归档为 router.log.1（单代，覆盖旧归档）。
+    // 只能在这里做 —— 句柄一旦创建（并被 serve 子进程继承 fd），
+    // 运行中改名会割裂 tray 与 serve 两路写入。首次调用早于 spawn，
+    // 因此每次 App 运行的轮转点必然在子进程接管句柄之前。
+    if let size = (try? fm.attributesOfItem(atPath: path)[.size]) as? Int, size > 2_000_000 {
+      try? fm.removeItem(atPath: path + ".1")
+      try? fm.moveItem(atPath: path, toPath: path + ".1")
+    }
     if !fm.fileExists(atPath: path) {
       fm.createFile(atPath: path, contents: nil, attributes: [.posixPermissions: 0o600])
     }

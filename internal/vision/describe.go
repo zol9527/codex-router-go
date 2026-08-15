@@ -25,13 +25,14 @@ const (
 )
 
 // DescribeCaller 是引擎调用的抽象：registry 引擎走 chat 上游、
-// native 走 ChatGPT 后端、local 直连 Ollama。由 server 装配。
-type DescribeCaller func(ctx context.Context, engine Engine, question string, dataURL string) (string, error)
+// native 走 ChatGPT 后端、local 直连 Ollama。effort 是本次读图的
+// 推理档（操作者 pin 优先，否则跟随会话档）。由 server 装配。
+type DescribeCaller func(ctx context.Context, engine Engine, effort, question, dataURL string) (string, error)
 
 // Reader 管理缓存与 in-flight 共享。
 type Reader struct {
 	Caller DescribeCaller
-	// Effort 是读图使用的推理档（跟随操作者的会话档）。
+	// Effort 是读图使用的推理档（操作者 pin 优先，否则跟随会话档）。
 	Effort string
 	// Account 是 native 引擎的账号键（转录按账号隔离）。
 	Account string
@@ -109,6 +110,7 @@ func (r *Reader) Read(ctx context.Context, engines []Engine, image ImagePart) (E
 // 回退在证据里标记（fellBack），日志由调用方打印。
 func (r *Reader) readWithFallback(ctx context.Context, engines []Engine, image ImagePart) (Evidence, error) {
 	var lastErr error
+	var failures []string
 	for index, engine := range engines {
 		transcript, err := r.readOneWithRetry(ctx, engine, image)
 		if err == nil {
@@ -117,9 +119,13 @@ func (r *Reader) readWithFallback(ctx context.Context, engines []Engine, image I
 				Question:   image.Question,
 				Transcript: transcript,
 				FellBack:   index > 0,
+				// 回退链上的失败随证据上浮：成功兜底不能吞掉
+				// 首选引擎的失败原因。
+				PriorFailures: failures,
 			}, nil
 		}
 		lastErr = fmt.Errorf("%s: %w", engineDisplayName(engine), err)
+		failures = append(failures, lastErr.Error())
 	}
 	return Evidence{}, lastErr
 }
@@ -173,6 +179,50 @@ func (e *transientError) Unwrap() error { return e.inner }
 // StatusError 暴露状态码（调用方判定重试）。
 func StatusError(status int, inner error) error { return &transientError{status: status, inner: inner} }
 
+// StatusErrorWithBody 构造带响应体片段的状态错误：上游 4xx 的拒绝
+// 理由必须进日志，否则只剩 "HTTP 400" 的悬案（2026-08-16 视觉桥
+// 三引擎全灭事故即因此多查了一轮）。
+func StatusErrorWithBody(status int, raw []byte) error {
+	snippet := BodySnippet(raw)
+	if snippet == "" {
+		return StatusError(status, nil)
+	}
+	return &transientError{status: status, inner: fmt.Errorf("%s", snippet)}
+}
+
+// BodySnippet 从错误响应体提取可读片段：优先 error.message /
+// error 字符串形态；否则压缩空白后取前 240 字节。空体返回 ""。
+func BodySnippet(raw []byte) string {
+	var parsed struct {
+		Error any `json:"error"`
+	}
+	if err := json.Unmarshal(raw, &parsed); err == nil {
+		switch value := parsed.Error.(type) {
+		case string:
+			if value != "" {
+				return clip(squeeze(value))
+			}
+		case map[string]any:
+			if message, ok := value["message"].(string); ok && message != "" {
+				return clip(squeeze(message))
+			}
+		}
+	}
+	return clip(squeeze(string(raw)))
+}
+
+func squeeze(value string) string {
+	return strings.Join(strings.Fields(value), " ")
+}
+
+func clip(value string) string {
+	runes := []rune(value)
+	if len(runes) <= 240 {
+		return value
+	}
+	return string(runes[:240]) + "…"
+}
+
 func isTransientVisionFailure(err error) bool {
 	var te *transientError
 	if ok := asTransient(err, &te); ok {
@@ -196,7 +246,7 @@ func (r *Reader) callEngine(ctx context.Context, engine Engine, image ImagePart)
 	if r.Caller == nil {
 		return "", fmt.Errorf("no vision caller configured")
 	}
-	transcript, err := r.Caller(ctx, engine, image.Question, image.DataURL)
+	transcript, err := r.Caller(ctx, engine, r.Effort, image.Question, image.DataURL)
 	if err != nil {
 		return "", err
 	}
@@ -228,6 +278,79 @@ func ChatDescribeRequest(model, question, dataURL string) map[string]any {
 		},
 		"stream": false,
 	}
+}
+
+// AnthropicDescribeRequest 构造 anthropic messages 形态的读图请求
+//（opencode 的 messages 协议变体引擎）。dataURL 必须是
+// data:<media>;base64,<payload> 形态，不合法返回 ok=false。
+func AnthropicDescribeRequest(model, question, dataURL string) (map[string]any, bool) {
+	mediaType, data, ok := splitDataURL(dataURL)
+	if !ok {
+		return nil, false
+	}
+	instructions := EvidenceInstructions
+	if question != "" {
+		instructions += FocusInstructions(question)
+	}
+	return map[string]any{
+		"model":      model,
+		"max_tokens": 4096,
+		"system":     instructions,
+		"messages": []any{
+			map[string]any{"role": "user", "content": []any{
+				map[string]any{"type": "text", "text": "Transcribe this image as evidence for a model that cannot see it."},
+				map[string]any{"type": "image", "source": map[string]any{
+					"type": "base64", "media_type": mediaType, "data": data,
+				}},
+			}},
+		},
+	}, true
+}
+
+// splitDataURL 拆出 data URL 的 media type 与 base64 载荷。
+func splitDataURL(dataURL string) (string, string, bool) {
+	if !strings.HasPrefix(dataURL, "data:") {
+		return "", "", false
+	}
+	rest := strings.TrimPrefix(dataURL, "data:")
+	comma := strings.Index(rest, ",")
+	if comma < 0 {
+		return "", "", false
+	}
+	meta := rest[:comma]
+	if !strings.HasSuffix(meta, ";base64") {
+		return "", "", false
+	}
+	mediaType := strings.TrimSuffix(meta, ";base64")
+	if mediaType == "" {
+		return "", "", false
+	}
+	return mediaType, rest[comma+1:], true
+}
+
+// ParseAnthropicDescribeResponse 从 anthropic messages 响应提取文本
+//（content 数组的 text block）。
+func ParseAnthropicDescribeResponse(raw []byte) (string, error) {
+	var parsed struct {
+		Content []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return "", err
+	}
+	var texts []string
+	for _, block := range parsed.Content {
+		if block.Type == "text" && block.Text != "" {
+			texts = append(texts, block.Text)
+		}
+	}
+	joined := strings.Join(texts, "\n")
+	if strings.TrimSpace(joined) == "" {
+		return "", fmt.Errorf("no transcript in anthropic engine response")
+	}
+	return joined, nil
 }
 
 // ParseChatDescribeResponse 从非流式 chat 响应提取转录文本。

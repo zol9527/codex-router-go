@@ -33,6 +33,7 @@
       "searchTool": {
         "mode": "standalone"
       },
+      "requestProfile": "deepseek-thinking",
       "compHash": "opencode-go-deepseek-v4-flash-v2"
     }
   ]

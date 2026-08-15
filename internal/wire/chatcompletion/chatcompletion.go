@@ -40,6 +40,8 @@ func (Protocol) Prepare(responsesRequest map[string]any, model *registry.Model) 
 		Body:   chat.Body,
 		Stream: stream,
 		Accept: accept,
+		// custom 工具名随请求产物下传，响应翻译还原 custom_tool_call。
+		CustomTools: chat.CustomTools,
 	}, nil
 }
 
@@ -54,7 +56,8 @@ func (Protocol) NeedsResponseTranslation() bool { return true }
 func (Protocol) NewStreamTranslator(_ *registry.Model, opts wire.StreamOptions) wire.StreamTranslator {
 	t := translate.NewChatToResponsesSSE("", "").
 		WithEstimatedInputTokens(opts.EstimateInput).
-		WithNamespaceIndex(opts.NamespaceIndex, opts.SessionModel)
+		WithNamespaceIndex(opts.NamespaceIndex, opts.SessionModel).
+		WithCustomTools(opts.CustomTools)
 	return t
 }
 
@@ -62,7 +65,8 @@ func (Protocol) NewStreamTranslator(_ *registry.Model, opts wire.StreamOptions) 
 func (Protocol) TranslateNonStream(upstreamBody map[string]any, _ *registry.Model, opts wire.StreamOptions) map[string]any {
 	t := translate.NewChatToResponsesSSE("", "").
 		WithEstimatedInputTokens(opts.EstimateInput).
-		WithNamespaceIndex(opts.NamespaceIndex, opts.SessionModel)
+		WithNamespaceIndex(opts.NamespaceIndex, opts.SessionModel).
+		WithCustomTools(opts.CustomTools)
 	return translate.TranslateNonStreamChatWith(upstreamBody, t)
 }
 

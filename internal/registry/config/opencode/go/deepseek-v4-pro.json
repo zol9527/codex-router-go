@@ -26,6 +26,7 @@
       "inputModalities": [
         "text"
       ],
+      "requestProfile": "deepseek-thinking",
       "compHash": "opencode-go-deepseek-v4-pro-v1"
     }
   ]

@@ -233,6 +233,10 @@ type Evidence struct {
 	Transcript string `json:"transcript"`
 	// FellBack 标记实际读图的引擎不是首选（回退发生过）。
 	FellBack bool `json:"fellBack,omitempty"`
+	// PriorFailures 记录回退链上先失败的引擎（"engine: err"）。
+	// 成功兜底时首选引擎的失败原因 otherwise 会被吞掉（2026-08-16
+	// qwen3.7-max anthropic 路径排查即卡在这）。
+	PriorFailures []string `json:"priorFailures,omitempty"`
 	// Incomplete 标记读图被尺寸上限截断（值得再看一眼）。
 	Incomplete bool `json:"incomplete,omitempty"`
 }
@@ -259,6 +263,10 @@ func RenderEvidence(evidence Evidence, filePath string) string {
 		header.WriteString(filePath)
 	}
 	header.WriteString("]\n")
+	// 抑制"再核实原图"的冲动：下游模型看到 file: 路径（Codex 的
+	// Files mentioned 提示也会给）时，会倾向发起工具轮去打开原图 ——
+	// 思考型模型一轮 60-90s，纯浪费。声明转录即全部视觉信息。
+	header.WriteString("[you cannot see images; this transcript is the complete visual information for the image. Do not attempt to open, view, or re-read the original file]\n")
 	if evidence.Question != "" {
 		header.WriteString("[read for question: ")
 		header.WriteString(truncateRunes(evidence.Question, 160))

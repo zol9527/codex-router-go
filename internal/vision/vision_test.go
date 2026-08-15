@@ -196,7 +196,7 @@ func TestReadSharedInflight(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	reader := NewReader(func(ctx context.Context, engine Engine, question, dataURL string) (string, error) {
+	reader := NewReader(func(ctx context.Context, engine Engine, effort, question, dataURL string) (string, error) {
 		status, body, err := PostJSON(ctx, http.DefaultClient, upstream.URL, nil,
 			ChatDescribeRequest("m", question, dataURL))
 		if err != nil {
@@ -244,7 +244,7 @@ func TestReadFallback(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	reader := NewReader(func(ctx context.Context, engine Engine, question, dataURL string) (string, error) {
+	reader := NewReader(func(ctx context.Context, engine Engine, effort, question, dataURL string) (string, error) {
 		status, body, err := PostJSON(ctx, http.DefaultClient, upstream.URL, nil, nil)
 		_ = body
 		if err != nil {
@@ -257,7 +257,7 @@ func TestReadFallback(t *testing.T) {
 	})
 	_ = reader
 	// 直接测 readWithFallback（绕开 HTTP 层）。
-	reader2 := NewReader(func(ctx context.Context, engine Engine, question, dataURL string) (string, error) {
+	reader2 := NewReader(func(ctx context.Context, engine Engine, effort, question, dataURL string) (string, error) {
 		if engine.Slug == "primary" {
 			return "", StatusError(503, nil)
 		}
@@ -282,7 +282,7 @@ func TestReadFallback(t *testing.T) {
 // 瞬时失败重试：429 重试后成功；400 不重试。
 func TestTransientRetry(t *testing.T) {
 	attempts := 0
-	reader := NewReader(func(ctx context.Context, engine Engine, question, dataURL string) (string, error) {
+	reader := NewReader(func(ctx context.Context, engine Engine, effort, question, dataURL string) (string, error) {
 		attempts++
 		if attempts == 1 {
 			return "", StatusError(429, nil)
@@ -296,7 +296,7 @@ func TestTransientRetry(t *testing.T) {
 	}
 
 	attempts = 0
-	reader2 := NewReader(func(ctx context.Context, engine Engine, question, dataURL string) (string, error) {
+	reader2 := NewReader(func(ctx context.Context, engine Engine, effort, question, dataURL string) (string, error) {
 		attempts++
 		return "", StatusError(400, nil)
 	})
@@ -305,5 +305,118 @@ func TestTransientRetry(t *testing.T) {
 	}
 	if attempts != 1 {
 		t.Errorf("400 must not be retried, attempts = %d", attempts)
+	}
+}
+
+// BodySnippet：error.message 形态优先、字符串 error 次之、裸文本兜底，
+// 片段限长 —— 400 的拒绝理由必须能进日志。
+func TestBodySnippet(t *testing.T) {
+	if got := BodySnippet([]byte(`{"error":{"message":"The ` + "`reasoning_content`" + ` in the thinking mode must be passed back to the API."}}`)); !strings.Contains(got, "must be passed back") {
+		t.Errorf("error.message should win, got %q", got)
+	}
+	if got := BodySnippet([]byte(`{"error":"model is offline"}`)); got != "model is offline" {
+		t.Errorf("string error should be extracted, got %q", got)
+	}
+	if got := BodySnippet([]byte("  plain   text\nbody  ")); got != "plain text body" {
+		t.Errorf("whitespace should be squeezed, got %q", got)
+	}
+	if got := BodySnippet([]byte(`{}`)); got != "{}" {
+		t.Errorf("empty error object falls back to raw, got %q", got)
+	}
+	if got := BodySnippet(nil); got != "" {
+		t.Errorf("empty body should be empty, got %q", got)
+	}
+}
+
+// anthropic 代读：data URL 拆解、请求形状（system + image source 块）、
+// 响应解析（text block 提取）。
+func TestAnthropicDescribe(t *testing.T) {
+	media, data, ok := splitDataURL("data:image/png;base64,AAAB")
+	if !ok || media != "image/png" || data != "AAAB" {
+		t.Fatalf("splitDataURL wrong: %q %q %v", media, data, ok)
+	}
+	if _, _, ok := splitDataURL("https://example.com/x.png"); ok {
+		t.Error("non-data URL must be rejected")
+	}
+	if _, _, ok := splitDataURL("data:image/png,AAAB"); ok {
+		t.Error("non-base64 data URL must be rejected")
+	}
+
+	body, ok := AnthropicDescribeRequest("qwen3.7-max", "read the error", "data:image/png;base64,AAAB")
+	if !ok {
+		t.Fatal("request must build")
+	}
+	if body["model"] != "qwen3.7-max" || body["max_tokens"] != 4096 {
+		t.Errorf("model/max_tokens wrong: %v %v", body["model"], body["max_tokens"])
+	}
+	if sys, _ := body["system"].(string); !strings.Contains(sys, "read the error") {
+		t.Errorf("question must fold into system instructions: %q", sys)
+	}
+	blocks := body["messages"].([]any)[0].(map[string]any)["content"].([]any)
+	image := blocks[1].(map[string]any)
+	if image["type"] != "image" {
+		t.Fatalf("second block must be image, got %v", image["type"])
+	}
+	source := image["source"].(map[string]any)
+	if source["media_type"] != "image/png" || source["data"] != "AAAB" || source["type"] != "base64" {
+		t.Errorf("image source wrong: %v", source)
+	}
+
+	got, err := ParseAnthropicDescribeResponse([]byte(`{"content":[{"type":"text","text":"A dialog."},{"type":"thinking","text":"..."},{"type":"text","text":"Reads boom."}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "A dialog.\nReads boom." {
+		t.Errorf("text blocks wrong: %q", got)
+	}
+	if _, err := ParseAnthropicDescribeResponse([]byte(`{"content":[]}`)); err == nil {
+		t.Error("empty content must error")
+	}
+}
+
+// 回退链的失败必须随证据上浮：成功兜底时首选引擎的错误进入
+// PriorFailures（否则排障只能看到 "fellBack=true" 而不知为何）。
+func TestReadWithFallbackSurfacesPriorFailures(t *testing.T) {
+	engines := []Engine{
+		{Slug: "e1", DisplayName: "Engine One"},
+		{Slug: "e2", DisplayName: "Engine Two"},
+	}
+	calls := 0
+	reader := NewReader(func(_ context.Context, engine Engine, _, _, _ string) (string, error) {
+		calls++
+		if engine.Slug == "e1" {
+			return "", fmt.Errorf("HTTP 400: anthropic rejected")
+		}
+		return "transcript", nil
+	})
+	evidence, err := reader.Read(context.Background(), engines, ImagePart{DataURL: "data:image/png;base64,QQ"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !evidence.FellBack || evidence.Engine != "Engine Two" {
+		t.Fatalf("fallback outcome wrong: %+v", evidence)
+	}
+	if len(evidence.PriorFailures) != 1 || !strings.Contains(evidence.PriorFailures[0], "Engine One") || !strings.Contains(evidence.PriorFailures[0], "anthropic rejected") {
+		t.Errorf("prior failures must surface: %v", evidence.PriorFailures)
+	}
+}
+
+// 证据头部必须声明"转录即全部视觉信息"并禁止尝试查看原图：
+// 下游模型看到 file: 路径会发起工具轮去开原图（思考型模型
+// 一轮 60-90s，2026-08-16 实测 glm 连续两轮"我先直接查看原图"）。
+func TestRenderEvidenceDiscouragesViewingOriginal(t *testing.T) {
+	text := RenderEvidence(Evidence{Engine: "Qwen3.5 Plus", Transcript: "## Summary\nA dialog."}, "/tmp/clip.png")
+	if !strings.Contains(text, "complete visual information") {
+		t.Errorf("header must state the transcript is complete:\n%s", text)
+	}
+	if !strings.Contains(text, "Do not attempt to open, view, or re-read") {
+		t.Errorf("header must discourage viewing the original:\n%s", text)
+	}
+	// 抑制行在 file: 行之后、转录正文之前。
+	fileIdx := strings.Index(text, "file: /tmp/clip.png")
+	noteIdx := strings.Index(text, "Do not attempt")
+	bodyIdx := strings.Index(text, "## Summary")
+	if !(fileIdx < noteIdx && noteIdx < bodyIdx) {
+		t.Errorf("header ordering wrong (file=%d note=%d body=%d):\n%s", fileIdx, noteIdx, bodyIdx, text)
 	}
 }

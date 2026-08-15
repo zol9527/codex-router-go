@@ -83,6 +83,39 @@ type Settings struct {
 	Defaulted    bool   `json:"defaulted,omitempty"` // engine 是默认值而非操作者选择
 	LocalModel   string `json:"localModel,omitempty"`
 	LocalBaseURL string `json:"localBaseUrl,omitempty"`
+	// Effort 是操作者 pin 的读图推理档；空 = 跟随会话档，
+	// "default" 由写入端归一为空（把档位交还给引擎自己的默认）。
+	Effort string `json:"effort,omitempty"`
+}
+
+// WriteSettings 原子写 vision-bridge.json（0600，tmp+rename）。
+// serve 进程只读不写，写方是 control 命令；并发的 control 调用
+// （tray 按钮 + 终端 CLI）用 CreateTemp 唯一临时名互不踩踏。
+func WriteSettings(stateDir string, settings Settings) error {
+	raw, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(stateDir, "vision-bridge.json.*.tmp")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	defer os.Remove(name) // rename 成功后删除是 no-op
+	if _, err := tmp.Write(append(raw, '\n')); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(name, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(name, filepath.Join(stateDir, "vision-bridge.json"))
 }
 
 // LocalEngineSlug 是本地引擎的固定 pin 名。

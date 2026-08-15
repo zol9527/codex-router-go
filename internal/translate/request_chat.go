@@ -18,6 +18,15 @@ import (
 // CompactionPrefix 与 Node 版一致：v2 压缩摘要的 kcr1: base64 封装。
 const CompactionPrefix = "kcr1:"
 
+// reasoningCarryKey 是翻译期携带思维链的内部标记字段：reasoning item
+// 的文本挂到其后首条 assistant 消息上，ApplyRequestProfile 按
+// requestProfile 决定提升为 reasoning_content（deepseek-thinking）或
+// 剥除（其余上游）。字段去留必须按上游契约门控 —— opencode 的
+// DeepSeek thinking 模式要求回传 reasoning_content（fork 出来的协作
+// 线程首轮就带父历史，丢弃即 400），而官方 DeepSeek API 对输入里的
+// reasoning_content 反而报 400，规则相反。
+const reasoningCarryKey = "_reasoning_carry"
+
 const summaryPrefix = "Another language model started this task and produced a continuation summary. Use it to continue without repeating completed work:"
 
 // ChatRequest 是翻译产物：发给 chat-completions 上游的请求体与
@@ -29,6 +38,13 @@ type ChatRequest struct {
 	RequestedEffort string
 	// HasStream 记录调用方是否要求流式。
 	HasStream bool
+	// CustomTools 是请求里以 custom 工具形态声明的工具名（code-mode
+	// exec 等）：chat 上游只见 function，声明被翻译成 {input: string}
+	// 单参形态；响应侧据此把对这些名字的调用还原成 custom_tool_call
+	// item —— 否则 Codex 的 custom 规格工具收到 function 形态调用会报
+	// "invoked with incompatible payload"（2026-08-15 deepseek 子代理
+	// 实发事故：模型自造 {"cmd"/"command"} 载荷三连击穿）。
+	CustomTools []string
 }
 
 // TranslateToChat 把一个 Responses 请求体翻译成 chat-completions 请求。
@@ -73,7 +89,9 @@ func TranslateToChat(responses map[string]any) (*ChatRequest, error) {
 		}
 	}
 
-	// input → messages
+	// input → messages。reasoning item 不直接产出消息：文本进
+	// pendingReasoning，等紧随其后的 assistant 输出（文本消息或
+	// tool_calls）落地后挂到它头上（见 reasoningCarryKey 注释）。
 	input, _ := responses["input"].([]any)
 	// input 也允许是纯字符串（Responses API 的简写形态）。
 	if text, ok := responses["input"].(string); ok {
@@ -82,12 +100,40 @@ func TranslateToChat(responses map[string]any) (*ChatRequest, error) {
 			"content": []any{map[string]any{"type": "input_text", "text": text}},
 		}}
 	}
+	pendingReasoning := ""
 	for _, raw := range input {
 		item, ok := raw.(map[string]any)
 		if !ok {
 			continue
 		}
-		messages = append(messages, inputItemToMessages(item)...)
+		if itemType, _ := item["type"].(string); itemType == "reasoning" {
+			if text := reasoningItemText(item); text != "" {
+				if pendingReasoning != "" {
+					pendingReasoning += "\n"
+				}
+				pendingReasoning += text
+			}
+			continue
+		}
+		expanded := inputItemToMessages(item)
+		if pendingReasoning != "" {
+			consumed := false
+			for _, message := range expanded {
+				if message["role"] == "assistant" && !consumed {
+					message[reasoningCarryKey] = pendingReasoning
+					consumed = true
+				}
+			}
+			if consumed {
+				pendingReasoning = ""
+			} else if role, _ := item["role"].(string); role != "assistant" {
+				// user/tool/system 边界跨不过去；被丢弃的空 assistant
+				// 消息（宣告 tool call 的 filler）不消耗 pending，
+				// 让它落到后面的 function_call 上。
+				pendingReasoning = ""
+			}
+		}
+		messages = append(messages, expanded...)
 	}
 
 	// tools：Responses 的扁平 function 形状 → chat 的嵌套 function 形状。
@@ -111,6 +157,30 @@ func TranslateToChat(responses map[string]any) (*ChatRequest, error) {
 				chatTools = append(chatTools, map[string]any{
 					"type": "function", "function": fn,
 				})
+			case "custom":
+				// Responses 的 custom 工具（自由文本载荷，code-mode exec
+				// 就是这个形态）在 chat 上游没有对应物：伪装成单参
+				// function（input 字符串），名字记进 CustomTools 供响应
+				// 侧还原。静默丢弃会让模型从历史里模仿自造载荷形状。
+				name, _ := tool["name"].(string)
+				if name == "" {
+					break
+				}
+				description, _ := tool["description"].(string)
+				chatTools = append(chatTools, map[string]any{
+					"type": "function",
+					"function": map[string]any{
+						"name":        name,
+						"description": description + "\n\nPass the entire freeform payload for this tool as the `input` string parameter.",
+						"parameters": map[string]any{
+							"type":                 "object",
+							"properties":           map[string]any{"input": map[string]any{"type": "string", "description": "The freeform text payload for this tool"}},
+							"required":             []any{"input"},
+							"additionalProperties": false,
+						},
+					},
+				})
+				chat.CustomTools = append(chat.CustomTools, name)
 			case "web_search", "web_search_preview":
 				// chat-completions 上游没有对应物；丢弃。
 			case "namespace", "mcp":
@@ -212,8 +282,8 @@ func inputItemToMessages(item map[string]any) []map[string]any {
 			"content":      toolOutputToText(item["output"]),
 		}}
 	case "reasoning":
-		// 思维链历史对 chat 上游不可回放；M3 移植 carry 逻辑后
-		// 会把 summary 并入后续 function_call 消息。M1 丢弃。
+		// 思维链历史在 TranslateToChat 的输入循环里被截住并携带
+		// （reasoningCarryKey），不会走到这里；保留分支兜底。
 		return nil
 	case "compaction_trigger":
 		// v2 压缩触发标记不进对话历史。
@@ -415,6 +485,36 @@ func decodeSummaryText(value any) string {
 		return ""
 	}
 	return string(decoded)
+}
+
+// reasoningItemText 提取 reasoning item 的可读文本（移植 Node 版
+// reasoningItemText）：summary 字符串/数组优先（Codex 回放的形态），
+// content 兜底 —— 部分 thinking 上游把思维链放 content 数组而不是
+// summary。无可读文本返回 ""。
+func reasoningItemText(item map[string]any) string {
+	if text := textFromPartsField(item["summary"]); text != "" {
+		return text
+	}
+	return textFromPartsField(item["content"])
+}
+
+// textFromPartsField 兼容字符串与 [{text:...}] 数组两种字段形态。
+func textFromPartsField(value any) string {
+	switch field := value.(type) {
+	case string:
+		return field
+	case []any:
+		var texts []string
+		for _, raw := range field {
+			if part, ok := raw.(map[string]any); ok {
+				if text, ok := part["text"].(string); ok && text != "" {
+					texts = append(texts, text)
+				}
+			}
+		}
+		return strings.Join(texts, "\n")
+	}
+	return ""
 }
 
 func orDefault(value, fallback string) string {

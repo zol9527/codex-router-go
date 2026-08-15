@@ -44,6 +44,24 @@ type ChatToResponsesSSE struct {
 	// create_thread 会话模型注入、整数 token 修复）。
 	namespaceIndex *NamespaceIndex
 	sessionModel   string
+
+	// customTools 是请求侧以 custom 形态声明的工具名：对这些名字的
+	// function 调用要还原成 custom_tool_call item（自由文本 input），
+	// 否则 Codex 的 custom 规格工具收到 function 载荷即
+	// "invoked with incompatible payload"。
+	customTools map[string]bool
+}
+
+// WithCustomTools 装载请求声明的 custom 工具名（空切片 = 无）。
+func (t *ChatToResponsesSSE) WithCustomTools(names []string) *ChatToResponsesSSE {
+	if len(names) == 0 {
+		return t
+	}
+	t.customTools = make(map[string]bool, len(names))
+	for _, name := range names {
+		t.customTools[name] = true
+	}
+	return t
 }
 
 // WithNamespaceIndex 装载 namespace 还原索引（请求时 FlattenNamespaceTools
@@ -144,6 +162,9 @@ type itemState struct {
 	text        strings.Builder
 	added       bool
 	closed      bool
+	// custom 标记：该调用属于请求声明的 custom 工具，收尾时发
+	// custom_tool_call item 而不是 function_call。
+	custom bool
 }
 
 var nowFunc = time.Now().Unix
@@ -317,21 +338,29 @@ func (t *ChatToResponsesSSE) feedDelta(delta map[string]any) []string {
 			}
 			if name, ok := fn["name"].(string); ok && name != "" && state.name == "" {
 				state.name = name
+				// custom 工具的调用按其真实形态回传（custom_tool_call）。
+				if t.customTools[name] {
+					state.custom = true
+				}
 			}
 			if args, ok := fn["arguments"].(string); ok && args != "" {
 				if !state.added {
 					payloads = append(payloads, eventJSON("response.output_item.added", map[string]any{
 						"output_index": state.outputIndex,
-						"item":         t.functionCallItem(state, ""),
+						"item":         t.callItemForState(state, ""),
 					}))
 					state.added = true
 				}
 				state.arguments.WriteString(args)
-				payloads = append(payloads, eventJSON("response.function_call_arguments.delta", map[string]any{
-					"item_id":      state.itemID,
-					"output_index": state.outputIndex,
-					"delta":        args,
-				}))
+				// custom 调用不发 function_call_arguments 增量：
+				// 形态不匹配，Codex 从 output_item.done 取完整载荷。
+				if !state.custom {
+					payloads = append(payloads, eventJSON("response.function_call_arguments.delta", map[string]any{
+						"item_id":      state.itemID,
+						"output_index": state.outputIndex,
+						"delta":        args,
+					}))
+				}
 			}
 		}
 	}
@@ -443,6 +472,9 @@ func (t *ChatToResponsesSSE) closeFunctionCall(chatIndex int) []string {
 	if args == "" {
 		args = "{}"
 	}
+	if s.custom {
+		return t.closeCustomToolCall(s, args)
+	}
 	var payloads []string
 	if !s.added {
 		payloads = append(payloads, eventJSON("response.output_item.added", map[string]any{
@@ -463,6 +495,62 @@ func (t *ChatToResponsesSSE) closeFunctionCall(chatIndex int) []string {
 	return payloads
 }
 
+// callItemForState 按调用形态构造 added/done 用的 item：custom 工具
+// 用 custom_tool_call（input 自由文本），其余用 function_call。
+func (t *ChatToResponsesSSE) callItemForState(s *itemState, payload string) map[string]any {
+	if s.custom {
+		return t.customToolCallItem(s, payload)
+	}
+	return t.functionCallItem(s, payload)
+}
+
+// closeCustomToolCall 把 custom 工具的 function 调用收尾成
+// custom_tool_call item：input 是自由文本载荷（从伪装 schema 的
+// input 参数解出）。Codex 的解析器从 output_item.done 取完整 item，
+// 不依赖增量事件。
+func (t *ChatToResponsesSSE) closeCustomToolCall(s *itemState, args string) []string {
+	input := customToolInput(args)
+	payloads := []string{}
+	if !s.added {
+		payloads = append(payloads, eventJSON("response.output_item.added", map[string]any{
+			"output_index": s.outputIndex,
+			"item":         t.customToolCallItem(s, ""),
+		}))
+	}
+	payloads = append(payloads, eventJSON("response.output_item.done", map[string]any{
+		"output_index": s.outputIndex,
+		"item":         t.customToolCallItem(s, input),
+	}))
+	return payloads
+}
+
+// customToolCallItem 构造 custom_tool_call item。
+func (t *ChatToResponsesSSE) customToolCallItem(s *itemState, payload string) map[string]any {
+	return map[string]any{
+		"type": "custom_tool_call", "id": s.itemID,
+		"call_id": orDefault(s.callID, "call_"+s.itemID), "name": s.name,
+		"input": payload, "status": "completed",
+	}
+}
+
+// customToolInput 从模型按伪装 schema 生成的 arguments 里解出自由文本
+// 载荷：{"input": "..."} 优先；整体是 JSON 字符串字面量则取字面量；
+// 都不是就把原始 arguments 当载荷（模型没按 schema 来时不至于丢调用）。
+func customToolInput(args string) string {
+	trimmed := strings.TrimSpace(args)
+	var asMap map[string]any
+	if err := json.Unmarshal([]byte(trimmed), &asMap); err == nil {
+		if input, ok := asMap["input"].(string); ok {
+			return input
+		}
+	}
+	var asString string
+	if err := json.Unmarshal([]byte(trimmed), &asString); err == nil {
+		return asString
+	}
+	return args
+}
+
 // completedOutput 汇总完整 output 数组（completed 事件与非流式响应共用）。
 func (t *ChatToResponsesSSE) completedOutput() []any {
 	var output []any
@@ -477,6 +565,15 @@ func (t *ChatToResponsesSSE) completedOutput() []any {
 			args := s.arguments.String()
 			if args == "" {
 				args = "{}"
+			}
+			if s.custom {
+				callID := orDefault(s.callID, "call_"+s.itemID)
+				output = append(output, map[string]any{
+					"type": "custom_tool_call", "id": s.itemID,
+					"call_id": callID, "name": s.name,
+					"input": customToolInput(args), "status": "completed",
+				})
+				continue
 			}
 			output = append(output, t.functionCallItem(s, args))
 		}

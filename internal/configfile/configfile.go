@@ -1,5 +1,5 @@
 // Package configfile 管理 ~/.codex/config.toml 里的路由标记块。
-// 只拥有两个块：根级（openai_base_url / model_catalog_json）与
+// 只拥有两个块：根级（Responses 路由、模型目录与 Voice 原生端点）与
 // provider 表（[model_providers.codex-router]）。其余一切内容 ——
 // 用户的 profile、trust、MCP、features —— 一概不碰。
 // 用户自有的 openai_base_url / model_catalog_json 是拒绝路径，不是覆盖路径。
@@ -19,6 +19,11 @@ const (
 	providerStart = "# BEGIN codex-router-provider-managed"
 	providerEnd   = "# END codex-router-provider-managed"
 	providerID    = "codex-router"
+
+	defaultChatGPTBaseURL           = "https://chatgpt.com/backend-api"
+	defaultRealtimeWebSocketBaseURL = "https://api.openai.com/v1"
+	realtimeCallBaseURLKey          = "experimental_realtime_webrtc_call_base_url"
+	realtimeWebSocketBaseURLKey     = "experimental_realtime_ws_base_url"
 )
 
 var (
@@ -33,14 +38,22 @@ type RouterConfig struct {
 	CatalogPath string // state/merged-models.json 绝对路径
 }
 
-// rootBlock 渲染根级标记块。
-func rootBlock(cfg RouterConfig) string {
-	return strings.Join([]string{
+// rootBlock 渲染根级标记块。Voice 使用的 WebRTC 会话和侧带 WebSocket
+// 不经过 Responses router；只有用户未显式指定时才写入原生端点。
+func rootBlock(cfg RouterConfig, addRealtimeCall, addRealtimeWebSocket bool, realtimeCallBaseURL string) string {
+	lines := []string{
 		startMarker,
 		fmt.Sprintf("openai_base_url = %s", tomlString(cfg.BaseURL)),
 		fmt.Sprintf("model_catalog_json = %s", tomlString(cfg.CatalogPath)),
-		endMarker,
-	}, "\n")
+	}
+	if addRealtimeCall {
+		lines = append(lines, fmt.Sprintf("%s = %s", realtimeCallBaseURLKey, tomlString(realtimeCallBaseURL)))
+	}
+	if addRealtimeWebSocket {
+		lines = append(lines, fmt.Sprintf("%s = %s", realtimeWebSocketBaseURLKey, tomlString(defaultRealtimeWebSocketBaseURL)))
+	}
+	lines = append(lines, endMarker)
+	return strings.Join(lines, "\n")
 }
 
 // providerBlock 渲染 provider 表标记块。
@@ -119,11 +132,16 @@ func removeBlock(lines []string, start, end string, isOurs func(string) bool) []
 	return out
 }
 
-// rootOwnedLine 判断根级管理块内的一行是否归本路由所有。
-func rootOwnedLine(trimmed string) bool {
-	return trimmed == "" ||
-		strings.HasPrefix(trimmed, "openai_base_url =") ||
-		strings.HasPrefix(trimmed, "model_catalog_json =")
+// rootOwnedLine 判断根级管理块内的一行是否归本路由所有。Realtime 字段仅在
+// 值等于 router 会写入的原生默认值时才视为受管，避免吞掉用户手写的覆盖值。
+func rootOwnedLine(realtimeCallBaseURL string) func(string) bool {
+	return func(trimmed string) bool {
+		return trimmed == "" ||
+			strings.HasPrefix(trimmed, "openai_base_url =") ||
+			strings.HasPrefix(trimmed, "model_catalog_json =") ||
+			lineHasTomlValue(trimmed, realtimeCallBaseURLKey, realtimeCallBaseURL) ||
+			lineHasTomlValue(trimmed, realtimeWebSocketBaseURLKey, defaultRealtimeWebSocketBaseURL)
+	}
 }
 
 // providerOwnedLine 判断 provider 管理块内的一行是否归本路由所有。
@@ -174,7 +192,8 @@ func Install(configPath string, cfg RouterConfig) error {
 			joinNamed(base, cat))
 	}
 	// 去掉旧管理块再重写（幂等）。
-	lines = removeBlock(lines, startMarker, endMarker, rootOwnedLine)
+	realtimeCallBaseURL := nativeRealtimeCallBaseURL(lines)
+	lines = removeBlock(lines, startMarker, endMarker, rootOwnedLine(realtimeCallBaseURL))
 	lines = removeBlock(lines, providerStart, providerEnd, providerOwnedLine)
 	for len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "" {
 		lines = lines[:len(lines)-1]
@@ -187,7 +206,12 @@ func Install(configPath string, cfg RouterConfig) error {
 			break
 		}
 	}
-	block := strings.Split(rootBlock(cfg), "\n")
+	block := strings.Split(rootBlock(
+		cfg,
+		!hasRootValue(lines, realtimeCallBaseURLKey),
+		!hasRootValue(lines, realtimeWebSocketBaseURLKey),
+		realtimeCallBaseURL,
+	), "\n")
 	rest := append([]string{}, lines[insertAt:]...)
 	lines = append(lines[:insertAt], block...)
 	if len(rest) > 0 {
@@ -218,13 +242,52 @@ func Uninstall(configPath string) error {
 		return err
 	}
 	lines := strings.Split(string(raw), "\n")
-	lines = removeBlock(lines, startMarker, endMarker, rootOwnedLine)
+	lines = removeBlock(lines, startMarker, endMarker, rootOwnedLine(nativeRealtimeCallBaseURL(lines)))
 	lines = removeBlock(lines, providerStart, providerEnd, providerOwnedLine)
 	for len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "" {
 		lines = lines[:len(lines)-1]
 	}
 	next := strings.TrimRight(strings.Join(lines, "\n"), "\n") + "\n"
 	return os.WriteFile(configPath, []byte(next), 0o600)
+}
+
+// nativeRealtimeCallBaseURL 保持 Voice 的会话创建仍然走 ChatGPT 原生
+// backend；当用户给 chatgpt_base_url 配了私有网关时，同步从该根路径派生。
+func nativeRealtimeCallBaseURL(lines []string) string {
+	baseURL := defaultChatGPTBaseURL
+	if value, ok := rootValue(lines, "chatgpt_base_url"); ok && value != "" {
+		baseURL = value
+	}
+	baseURL = strings.TrimRight(baseURL, "/")
+	if strings.HasSuffix(baseURL, "/codex") {
+		return baseURL
+	}
+	return baseURL + "/codex"
+}
+
+// hasRootValue 只看首个 TOML 表头之前的根级字段，防止把项目或 provider
+// 表中的同名字段误当作用户对全局 Voice 端点的覆盖。
+func hasRootValue(lines []string, key string) bool {
+	_, ok := rootValue(lines, key)
+	return ok
+}
+
+func rootValue(lines []string, key string) (string, bool) {
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "[") {
+			return "", false
+		}
+		if value, ok := tomlValue(line, key); ok {
+			return value, true
+		}
+	}
+	return "", false
+}
+
+func lineHasTomlValue(line, key, want string) bool {
+	value, ok := tomlValue(line, key)
+	return ok && value == want
 }
 
 // Status 报告集成状态（脱敏：不回完整 base URL）。

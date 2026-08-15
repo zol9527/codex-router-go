@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "models": [
+    {
+      "slug": "zai-coding/glm-4.6v",
+      "gatewayModel": "zai-coding-glm-4-6v",
+      "upstreamModel": "glm-4.6v",
+      "provider": "zai-coding",
+      "listed": false,
+      "displayName": "GLM-4.6V (Coding Plan)",
+      "description": "GLM-4.6V vision model through the Z.ai GLM Coding Plan subscription. Registered as a vision-bridge engine (not listed in the picker): reads images for text-only routed models using the coding-plan quota.",
+      "priority": 15,
+      "contextWindow": 131072,
+      "autoCompact": 118000,
+      "inputModalities": [
+        "text",
+        "image"
+      ],
+      "compHash": "zai-coding-glm-4-6v-v1"
+    }
+  ]
+}

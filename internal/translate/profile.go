@@ -77,6 +77,21 @@ func ApplyRequestProfile(body map[string]any, requestedEffort string, model *reg
 		}
 		delete(body, "temperature")
 		delete(body, "top_p")
+	case "deepseek-thinking":
+		// opencode 的 DeepSeek thinking 模式要求历史 assistant 回合
+		// 把 reasoning_content 传回 —— fork 出来的协作子代理首轮就带
+		// 父线程历史，翻译若丢弃思维链即 400（实发事故 2026-08-15：
+		// deepseek-v4-flash 子代理）。翻译期已把 reasoning item 的文本
+		// 挂在 _reasoning_carry 标记上，此处提升为正式字段。
+		// 与 Node 版直连 DeepSeek 分支有意不同：不再发送 thinking 对象
+		// 或清洗采样参数 —— opencode 中继的 thinking 默认已开（输出侧
+		// reasoning_content 增量实测回流），未知字段反而可能被中继拒绝。
+		promoteReasoningCarry(body)
+		// thinking 模式拒绝强制 tool_choice（兼容性探测发 "required"、
+		// 协作载荷中继发 function 对象），降级 auto 保住工具调用。
+		if choice, ok := body["tool_choice"]; ok && choice != "none" {
+			body["tool_choice"] = "auto"
+		}
 	default:
 		// 无特殊 profile：reasoning.effort 已收集为 requestedEffort，
 		// 作为标准 reasoning_effort 透传（上游不认时会拒绝或忽略，
@@ -88,6 +103,33 @@ func ApplyRequestProfile(body map[string]any, requestedEffort string, model *reg
 	// thinking 载荷里可能残留 Responses 侧的 reasoning 对象形态，清掉。
 	delete(body, "reasoning")
 	delete(body, "web_search_options")
+	// 内部携带标记绝不外发：未提升（deepseek-thinking）的一律剥除。
+	if model.RequestProfile != "deepseek-thinking" {
+		promoteReasoningCarryBody(body, false)
+	}
+}
+
+// promoteReasoningCarry 把消息里的 _reasoning_carry 标记提升为
+// reasoning_content 并剥除标记。
+func promoteReasoningCarry(body map[string]any) {
+	promoteReasoningCarryBody(body, true)
+}
+
+func promoteReasoningCarryBody(body map[string]any, promote bool) {
+	messages, ok := body["messages"].([]map[string]any)
+	if !ok {
+		return
+	}
+	for _, message := range messages {
+		carry, _ := message[reasoningCarryKey].(string)
+		if carry == "" {
+			continue
+		}
+		delete(message, reasoningCarryKey)
+		if promote {
+			message["reasoning_content"] = carry
+		}
+	}
 }
 
 // UpstreamHeadersFrom 构造发往 chat 上游的请求头：只保留转发白名单外的

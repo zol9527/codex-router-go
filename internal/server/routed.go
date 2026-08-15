@@ -310,6 +310,17 @@ func (s *Server) runChatAttempt(ctx context.Context, target string, headers map[
 				return &attemptOutcome{translator: translator, events: events, status: resp.StatusCode},
 					fmt.Errorf("upstream stream ended before completion: %w", readErr)
 			}
+			// EOF 而未见 [DONE] 哨兵（zai 偶发不发）：主动收尾补齐
+			// response.completed —— 否则 Codex 判定 "stream closed
+			// before response.completed" 整轮重试，思考型模型每轮
+			// 60-90s 直接不可用（2026-08-16 01:10-01:12 实发三连重试）。
+			// close() 幂等：正常路径已收尾则此处零输出。
+			if closing := translator.Feed("[DONE]"); len(closing) > 0 {
+				events.Write(closing)
+				if relay != nil {
+					relay.emit(closing)
+				}
+			}
 			return &attemptOutcome{translator: translator, events: events, status: resp.StatusCode}, nil
 		}
 	}
@@ -478,6 +489,7 @@ func (s *Server) serveRouted(w http.ResponseWriter, r *http.Request,
 		}
 		response := proto.TranslateNonStream(chatBody, model, wire.StreamOptions{
 			SessionModel: model.Slug, EstimateInput: estimate, NamespaceIndex: nsIndex,
+			CustomTools: prepared.CustomTools,
 		})
 		writeJSON(w, http.StatusOK, response)
 		// 计量从翻译后的 Responses usage 读取（协议无关形状）。
@@ -501,6 +513,7 @@ func (s *Server) serveRouted(w http.ResponseWriter, r *http.Request,
 	}
 	streamOpts := wire.StreamOptions{
 		SessionModel: model.Slug, EstimateInput: estimate, NamespaceIndex: nsIndex,
+		CustomTools: prepared.CustomTools,
 	}
 	first, firstErr := s.runChatAttempt(r.Context(), target, headers, normalized, model, proto, streamOpts, relay)
 	if firstErr != nil {
@@ -569,6 +582,20 @@ func (s *Server) serveRouted(w http.ResponseWriter, r *http.Request,
 					}
 				}
 			}
+		}
+	}
+
+	// 兜底写出：custom-tool-only 流全程无活性事件（custom 调用刻意不
+	// 发 function_call_arguments.delta），头从未提交 —— 不补写的话
+	// handler 静默返回 200 + content-length:0，Codex 判
+	// "stream closed before response.completed" 整轮重试至耗尽
+	//（2026-08-16 01:33-01:41 实发 5/5）。守卫语义不变：活性直通、
+	// 隐形重试或失败声明的路径头均已提交，此处零输出。
+	if !relay.headersWritten() && relay.writeErr == nil && r.Context().Err() == nil {
+		if err := relay.finishFlushWith(chosen.events.Bytes()); err != nil {
+			s.recordTurn(usage.Event{Model: model.Slug, Provider: providerID, Status: 0,
+				DurationMs: time.Since(started).Milliseconds()})
+			return
 		}
 	}
 

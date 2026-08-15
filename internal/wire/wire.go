@@ -31,6 +31,10 @@ type Request struct {
 	Stream bool
 	// Accept 是响应协商头（"text/event-stream" / "application/json"）。
 	Accept string
+	// CustomTools 是请求里 custom 工具的名字集合（chat 协议把声明
+	// 伪装成 function，响应翻译需要知道哪些名字要还原成
+	// custom_tool_call）。非 chat 协议为空。
+	CustomTools []string
 }
 
 // StreamOptions 携带响应翻译所需的会话上下文。
@@ -41,6 +45,9 @@ type StreamOptions struct {
 	EstimateInput int
 	// NamespaceIndex 是本请求的 namespace 还原索引（可空）。
 	NamespaceIndex *translate.NamespaceIndex
+	// CustomTools 是本请求的 custom 工具名（可空）—— 来自 Prepare
+	// 的产物，响应侧据此还原 custom_tool_call 形态。
+	CustomTools []string
 }
 
 // StreamTranslator 把上游协议的 SSE 流增量翻译成 Responses 事件。

@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -47,6 +46,11 @@ func (s *Server) bridgeVision(w http.ResponseWriter, r *http.Request,
 			reader.Effort = effort
 		}
 	}
+	// 操作者 pin 的读图档优先于会话档（tray 的 effort 选择存在
+	// vision-bridge.json；不 pin 时保持跟随会话的既有行为）。
+	if settings.Effort != "" {
+		reader.Effort = settings.Effort
+	}
 	if account := r.Header.Get("Chatgpt-Account-Id"); account != "" {
 		reader.Account = account
 	}
@@ -75,6 +79,9 @@ func (s *Server) bridgeVision(w http.ResponseWriter, r *http.Request,
 			}
 			if result.FellBack {
 				logf("vision read fellBack=true engine=%s", result.Engine)
+			}
+			for _, failure := range result.PriorFailures {
+				logf("vision engine attempt failed: %s", failure)
 			}
 			evidence[vision.ImageKey(image.DataURL)] = result
 		}()
@@ -120,9 +127,12 @@ func (s *Server) visionCandidates(r *http.Request) []vision.Engine {
 	}
 	// native 候选：调用方带上游会话头（Codex 总是带）。
 	if s.hasUpstreamAuthorization(r) {
-		for _, model := range s.readNativeVisionModels() {
-			candidates = append(candidates, model)
+		registrySlugs := map[string]bool{}
+		for _, model := range s.opt.Registry.Models {
+			registrySlugs[model.Slug] = true
 		}
+		candidates = append(candidates, vision.NativeEnginesFromCatalogFile(
+			filepath.Join(s.opt.State.Dir, "merged-models.json"), registrySlugs)...)
 	}
 	return candidates
 }
@@ -135,77 +145,63 @@ func (s *Server) hasUpstreamAuthorization(r *http.Request) bool {
 	return !s.isRouterLocalToken(header)
 }
 
-// readNativeVisionModels 从 merged 目录提取 listed 的视觉原生模型。
-func (s *Server) readNativeVisionModels() []vision.Engine {
-	raw, err := os.ReadFile(filepath.Join(s.opt.State.Dir, "merged-models.json"))
-	if err != nil {
-		return nil
-	}
-	var parsed struct {
-		Models []struct {
-			Slug            string `json:"slug"`
-			DisplayName     string `json:"display_name"`
-			Priority        any    `json:"priority"`
-			Visibility      string `json:"visibility"`
-			InputModalities string `json:"input_modalities"`
-			Efforts         []struct {
-				Effort string `json:"effort"`
-			} `json:"supported_reasoning_levels"`
-			DefaultEffort string `json:"default_reasoning_level"`
-		} `json:"models"`
-	}
-	if err := json.Unmarshal(raw, &parsed); err != nil {
-		return nil
-	}
-	// registry slug 形如 "vendor/model"，native slug 无斜杠。
-	registrySlugs := map[string]bool{}
-	for _, model := range s.opt.Registry.Models {
-		registrySlugs[model.Slug] = true
-	}
-	var engines []vision.Engine
-	for _, model := range parsed.Models {
-		if model.Visibility != "list" || registrySlugs[model.Slug] {
-			continue
-		}
-		if !strings.Contains(strings.ToLower(model.InputModalities), "image") {
-			continue
-		}
-		priority := 999
-		if p, ok := model.Priority.(float64); ok {
-			priority = int(p)
-		}
-		efforts := make([]string, 0, len(model.Efforts))
-		for _, level := range model.Efforts {
-			efforts = append(efforts, level.Effort)
-		}
-		engines = append(engines, vision.Engine{
-			Slug: model.Slug, DisplayName: model.DisplayName,
-			GatewayModel: model.Slug, Native: true,
-			Priority: priority, Efforts: efforts, DefaultEffort: model.DefaultEffort,
-			ImageCapable: true,
-		})
-	}
-	return engines
-}
-
 // describeCaller 装配三路读图调用。native 路径经闭包捕获原始请求
 // （它贡献会话头，而 DescribeCaller 的抽象签名不携带请求）。
 func (s *Server) describeCaller(routeModel *registry.Model, r *http.Request) vision.DescribeCaller {
 	_ = routeModel
-	return func(ctx context.Context, engine vision.Engine, question, dataURL string) (string, error) {
+	return func(ctx context.Context, engine vision.Engine, effort, question, dataURL string) (string, error) {
 		switch {
 		case engine.Local:
-			return s.describeLocal(ctx, engine, question, dataURL)
+			return s.describeLocal(ctx, engine, effort, question, dataURL)
 		case engine.Native:
-			return s.describeNative(ctx, engine, question, dataURL, r)
+			return s.describeNative(ctx, engine, effort, question, dataURL, r)
 		default:
-			return s.describeRegistry(ctx, engine, question, dataURL)
+			// anthropic 协议的引擎（opencode 的 messages 变体）走
+			// messages 形态；chat 形态发过去只会 404/400。
+			if provider := s.opt.Registry.Providers[engine.Provider]; provider != nil && provider.Protocol == "anthropic" {
+				return s.describeAnthropic(ctx, engine, question, dataURL)
+			}
+			return s.describeRegistry(ctx, engine, effort, question, dataURL)
 		}
 	}
 }
 
+// describeAnthropic：anthropic messages 协议引擎读图。x-api-key +
+// anthropic-version 头；非流式即可 —— "stream 必须 true" 是 ChatGPT
+// 后端的约束，不适用于 opencode 中继。effort 无对应字段，不传。
+func (s *Server) describeAnthropic(ctx context.Context, engine vision.Engine, question, dataURL string) (string, error) {
+	provider := s.opt.Registry.Providers[engine.Provider]
+	if provider == nil {
+		return "", fmt.Errorf("vision engine provider missing: %s", engine.Provider)
+	}
+	credential, _ := s.opt.Credentials.Resolve(provider)
+	if credential == "" {
+		return "", fmt.Errorf("vision engine credential missing: %s", engine.Provider)
+	}
+	body, ok := vision.AnthropicDescribeRequest(engine.GatewayModel, question, dataURL)
+	if !ok {
+		return "", fmt.Errorf("image data URL is not base64 form")
+	}
+	headers := translate.UpstreamHeadersFrom(nil, credential, Version)
+	headers["Content-Type"] = "application/json"
+	headers["Accept"] = "application/json"
+	headers["x-api-key"] = credential
+	headers["anthropic-version"] = "2023-06-01"
+	target := strings.TrimSuffix(providerBaseURL(provider), "/") + "/messages"
+	status, raw, err := vision.PostJSON(ctx, s.client, target, headers, body)
+	if err != nil {
+		return "", err
+	}
+	if status != http.StatusOK {
+		return "", vision.StatusErrorWithBody(status, raw)
+	}
+	return vision.ParseAnthropicDescribeResponse(raw)
+}
+
 // describeRegistry：经 chat 上游读图（与普通回合同一凭据/头清洗）。
-func (s *Server) describeRegistry(ctx context.Context, engine vision.Engine, question, dataURL string) (string, error) {
+// effort 走标准 reasoning_effort 字段 —— 上游不认时会拒绝或忽略，
+// 与路由回合同一契约。
+func (s *Server) describeRegistry(ctx context.Context, engine vision.Engine, effort, question, dataURL string) (string, error) {
 	provider := s.opt.Registry.Providers[engine.Provider]
 	if provider == nil {
 		return "", fmt.Errorf("vision engine provider missing: %s", engine.Provider)
@@ -215,6 +211,9 @@ func (s *Server) describeRegistry(ctx context.Context, engine vision.Engine, que
 		return "", fmt.Errorf("vision engine credential missing: %s", engine.Provider)
 	}
 	body := vision.ChatDescribeRequest(engine.GatewayModel, question, dataURL)
+	if effort != "" {
+		body["reasoning_effort"] = effort
+	}
 	headers := translate.UpstreamHeadersFrom(nil, credential, Version)
 	headers["Content-Type"] = "application/json"
 	headers["Accept"] = "application/json"
@@ -224,13 +223,13 @@ func (s *Server) describeRegistry(ctx context.Context, engine vision.Engine, que
 		return "", err
 	}
 	if status != http.StatusOK {
-		return "", vision.StatusError(status, nil)
+		return "", vision.StatusErrorWithBody(status, raw)
 	}
 	return vision.ParseChatDescribeResponse(raw)
 }
 
 // describeLocal：无凭据直连 Ollama 兼容端点（显式 pin 才会出现）。
-func (s *Server) describeLocal(ctx context.Context, engine vision.Engine, question, dataURL string) (string, error) {
+func (s *Server) describeLocal(ctx context.Context, engine vision.Engine, effort, question, dataURL string) (string, error) {
 	settings, _ := vision.ReadSettings(s.opt.State.Dir)
 	base := vision.LocalBaseURLOf(settings)
 	body := vision.ChatDescribeRequest(vision.LocalModelOf(settings), question, dataURL)
@@ -241,19 +240,22 @@ func (s *Server) describeLocal(ctx context.Context, engine vision.Engine, questi
 		return "", err
 	}
 	if status != http.StatusOK {
-		return "", vision.StatusError(status, nil)
+		return "", vision.StatusErrorWithBody(status, raw)
 	}
 	return vision.ParseChatDescribeResponse(raw)
 }
 
 // describeNative：调用方的活会话 + ChatGPT 后端 /responses 读图。
 // 不落任何新凭据；FORWARD_HEADERS 里只有会话头会跟随。
-func (s *Server) describeNative(ctx context.Context, engine vision.Engine, question, dataURL string, sourceRequest *http.Request) (string, error) {
+func (s *Server) describeNative(ctx context.Context, engine vision.Engine, effort, question, dataURL string, sourceRequest *http.Request) (string, error) {
 	instructions := vision.EvidenceInstructions
 	if question != "" {
 		instructions += vision.FocusInstructions(question)
 	}
-	effort := engine.DefaultEffort
+	// 档位优先级：操作者/会话传入的 effort > 引擎默认 > 声明阶梯末档。
+	if effort == "" {
+		effort = engine.DefaultEffort
+	}
 	if effort == "" && len(engine.Efforts) > 0 {
 		effort = engine.Efforts[len(engine.Efforts)-1]
 	}
@@ -267,14 +269,16 @@ func (s *Server) describeNative(ctx context.Context, engine vision.Engine, quest
 				map[string]any{"type": "input_image", "image_url": dataURL},
 			},
 		}},
-		"stream": false,
+		// 后端强制流式：非流式 400 {"detail":"Stream must be set to true"}
+		// （2026-08-16 错误体实锤）。协作载荷中继同款 stream:true 已在生产验证。
+		"stream": true,
 		"store":  false,
 	}
 	if effort != "" {
 		requestBody["reasoning"] = map[string]any{"effort": effort}
 	}
 	headers := s.nativeHeaders(sourceRequest)
-	// native 端点非流式也接受；压缩对大 base64 无益。
+	headers["Accept"] = "text/event-stream"
 	raw, err := json.Marshal(requestBody)
 	if err != nil {
 		return "", err
@@ -296,13 +300,52 @@ func (s *Server) describeNative(ctx context.Context, engine vision.Engine, quest
 		return "", err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", vision.StatusError(resp.StatusCode, nil)
+		return "", vision.StatusErrorWithBody(resp.StatusCode, payload)
 	}
-	// Responses 非流式：output 数组里 message.content[].text。
-	return parseNativeTranscript(payload)
+	return parseNativeTranscriptStream(payload)
 }
 
-// parseNativeTranscript 从 native /responses 非流式体提取文本。
+// parseNativeTranscriptStream 从 native /responses 的 SSE 流提取文本：
+// 聚合 response.output_text.delta；completed 事件携带的完整 output
+// 作兜底（两种形态都在流里，先到先用）。
+func parseNativeTranscriptStream(payload []byte) (string, error) {
+	var deltas strings.Builder
+	completed := json.RawMessage(nil)
+	for _, line := range strings.Split(string(payload), "\n") {
+		line = strings.TrimRight(line, "\r")
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "" || data == "[DONE]" {
+			continue
+		}
+		var event struct {
+			Type     string          `json:"type"`
+			Delta    string          `json:"delta"`
+			Response json.RawMessage `json:"response"`
+		}
+		if err := json.Unmarshal([]byte(data), &event); err != nil {
+			continue
+		}
+		switch event.Type {
+		case "response.output_text.delta":
+			deltas.WriteString(event.Delta)
+		case "response.completed":
+			completed = event.Response
+		}
+	}
+	if text := deltas.String(); strings.TrimSpace(text) != "" {
+		return text, nil
+	}
+	if len(completed) > 0 {
+		return parseNativeTranscript(completed)
+	}
+	return "", fmt.Errorf("native engine returned no transcript")
+}
+
+// parseNativeTranscript 从 native /responses 响应对象提取文本
+//（completed 事件的 response 兜底路径）。
 func parseNativeTranscript(payload []byte) (string, error) {
 	var parsed struct {
 		Output []struct {

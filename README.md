@@ -50,6 +50,11 @@ open ~/Applications/"Model Router.app"      # 服务随 App 启动
 
 完全退出并重开 Codex，新建任务，picker 里选路由模型。
 
+> Voice 不走 Responses router。安装会在受管根级块中写入 Codex 的原生
+> WebRTC 与 WebSocket 端点，避免 Voice 把 `/live` 请求发到本地 `4202`
+> 后得到 404。若你已在 `~/.codex/config.toml` 自行设置这两个 Realtime
+> 端点，router 会保留该设置且卸载时不改动它。
+
 ## 凭证：`~/.codex-router/config.toml`
 
 Claude Code 式的配置文件，改完**下一回合请求即生效**，无需重启：
@@ -97,6 +102,7 @@ control picker set <slug> show|hide | provider <id> | all | status
 control tool-result-aging status|on|off
 control presence set always|follow-codex
 control account --json | provider-usage --json    配额与用量
+control vision-bridge on|off | status | engine <slug|local|auto> [effort] | effort <level|default> | local <tag>
 control vision-bridge pull TAG | pull-status | benchmark | catalog
 control local-runtime status|start|stop
 ```
