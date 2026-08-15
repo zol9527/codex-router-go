@@ -16,20 +16,6 @@ let routerMuted = Color.primary.opacity(0.76)
 let routerMutedStrong = Color.primary.opacity(0.90)
 let removalArmWindow: TimeInterval = 4
 
-enum LocalModelOperationKind: Equatable {
-  case uninstall
-
-  var label: String {
-    switch self {
-    case .uninstall: return routerLocalized("Uninstalling")
-    }
-  }
-}
-
-struct LocalModelOperation: Equatable {
-  let tag: String
-  let kind: LocalModelOperationKind
-}
 
 enum RouterActivityState: String, Decodable {
   case idle
@@ -168,13 +154,9 @@ final class RouterStore: ObservableObject {
   @Published private(set) var providerSetup: [String: ProviderSetupState] = [:]
   @Published private(set) var providerOperation: String?
   @Published private(set) var visionDownload: VisionDownloadState?
-  @Published private(set) var localDownload: VisionDownloadState?
-  @Published private(set) var localModelOperation: LocalModelOperation?
   @Published private(set) var benchmarkingTag: String?
   @Published private(set) var maintenanceMessage: String?
   @Published private(set) var maintenanceSucceeded = false
-  @Published private(set) var harnessMessage: String?
-  @Published private(set) var harnessSucceeded = false
   @Published private(set) var islandMode: IslandMode
   // Publishing the language makes every view re-render on change, so the
   // panel switches in place instead of waiting for the next relaunch.
@@ -338,7 +320,6 @@ final class RouterStore: ObservableObject {
     snapshot.targets["codex"]?.signedRouting == true
   }
 
-  var harnessRunning: Bool { providerOperation == "harness" }
 
   var maintenanceRunning: Bool {
     providerOperation == "maintenance" || providerOperation == "doctor"
@@ -1000,42 +981,6 @@ final class RouterStore: ObservableObject {
       let output = try await runControl(arguments: ["--json"])
       snapshot = try JSONDecoder().decode(RouterSnapshot.self, from: output)
       updateRouterPinsServiceOn(snapshot.presence?.effectiveMode == "always")
-      let reportedLocalModels = snapshot.targets["codex"]?.modelSettings?.localModels
-      let installedLocalTags = Set(reportedLocalModels?.models.map(\.tag) ?? [])
-      let rawReportedLocalDownload = reportedLocalModels?.download
-      // The protected download record intentionally survives completion, but
-      // it stops describing reality after that model is removed from Ollama.
-      // Never render a stale "ready · 100%" result for an uninstalled tag.
-      let reportedLocalDownload: VisionDownloadState?
-      if let reported = rawReportedLocalDownload,
-         reported.status == "done",
-         let tag = reported.tag,
-         !installedLocalTags.contains(tag) {
-        reportedLocalDownload = nil
-      } else {
-        reportedLocalDownload = rawReportedLocalDownload
-      }
-      // A click publishes an optimistic state before the control process has
-      // finished its registry/runtime preflight. Do not let a concurrent
-      // refresh replace that state with an older snapshot (or nil), otherwise
-      // the tray appears to do nothing for the first seconds of a pull.
-      if let current = localDownload, current.isRunning {
-        if let reported = reportedLocalDownload,
-          reported.tag == current.tag,
-          (reported.updatedAt ?? 0) >= (current.startedAt ?? .greatestFiniteMagnitude) {
-          localDownload = reported
-        }
-      } else if let current = localDownload, current.status == "error" {
-        // Keep a preflight failure visible until a newer record for that tag
-        // arrives; a nil/stale probe should not erase the explanation.
-        if let reported = reportedLocalDownload,
-          reported.tag == current.tag,
-          (reported.updatedAt ?? 0) >= (current.updatedAt ?? .greatestFiniteMagnitude) {
-          localDownload = reported
-        }
-      } else {
-        localDownload = reportedLocalDownload
-      }
       resolveInitialUsageProvider()
       lastUpdated = .now
       message = nil
@@ -1386,111 +1331,20 @@ final class RouterStore: ObservableObject {
     }
   }
 
-  // Install the harness if it is absent, then publish the routed models into
-  // its own documents. One button, because "install it" and "point it at this
-  // router" are never wanted separately -- an installed harness that routes
-  // nowhere is not a state anybody asked for.
-  func setupHarness() async {
-    guard providerOperation == nil else { return }
-    providerOperation = "harness"
-    harnessSucceeded = false
-    harnessMessage = snapshot.harness?.installed == true
-      ? routerLocalized("Publishing routed models…")
-      : routerLocalized("Installing DeepSeek Harness…")
-    defer { providerOperation = nil }
-    do {
-      let output = try await runControl(arguments: ["harness", "setup"])
-      let result = try JSONDecoder().decode(HarnessSetupResult.self, from: output)
-      await refresh()
-      harnessSucceeded = true
-      // The row now offers the play button; say so rather than leaving the
-      // count sitting there as if nothing further were expected.
-      harnessMessage = routerFormat(
-        routerLocalized("%d models published. Press play to open the harness."),
-        result.published.models
-      )
-    } catch {
-      harnessMessage = error.localizedDescription
-      await refresh()
-    }
-  }
 
   // Opening is not a router action -- there is nothing to run and nothing that
   // can fail slowly -- so it stays off the serialized operation queue that the
   // install and publish share.
-  func openHarnessWeb() {
-    guard let raw = snapshot.harness?.web?.url, let url = URL(string: raw) else { return }
-    NSWorkspace.shared.open(url)
-  }
 
   // Start without republishing. Offered when the models are already published
   // and only the browser UI is down, which is the state a machine lands in
   // after a reboot.
-  func startHarnessWeb() async {
-    guard providerOperation == nil else { return }
-    providerOperation = "harness"
-    harnessSucceeded = false
-    harnessMessage = routerLocalized("Starting DeepSeek Harness…")
-    defer { providerOperation = nil }
-    do {
-      _ = try await runControl(arguments: ["harness", "start"])
-      await refresh()
-      harnessSucceeded = true
-      harnessMessage = nil
-      openHarnessWeb()
-    } catch {
-      harnessMessage = error.localizedDescription
-      await refresh()
-    }
-  }
 
-  // Stop the running harness. This is the resource question -- a booted harness
   // holds a Node process and its plugin tree resident -- not the integration
   // question, so it leaves the published route alone and the row goes straight
   // back to offering play.
-  func stopHarnessWeb() async {
-    guard providerOperation == nil else { return }
-    providerOperation = "harness"
-    harnessSucceeded = false
-    harnessMessage = routerLocalized("Stopping…")
-    defer { providerOperation = nil }
-    do {
-      let output = try await runControl(arguments: ["harness", "stop"])
-      let result = try JSONDecoder().decode(HarnessStopResult.self, from: output)
-      await refresh()
-      if result.stopped {
-        harnessSucceeded = true
-        harnessMessage = routerLocalized("Stopped. Memory and CPU released.")
-      } else {
-        // Never signal a process this router did not start. Say where it came
-        // from instead of failing silently or killing somebody's terminal.
-        harnessSucceeded = false
-        harnessMessage = routerLocalized("This harness was started outside the router — stop it where you started it.")
-      }
-    } catch {
-      harnessMessage = error.localizedDescription
-      await refresh()
-    }
-  }
 
-  // Remove the router's models from the harness. Distinct from stopping: this
   // is about the integration, not about what is resident.
-  func disconnectHarness() async {
-    guard providerOperation == nil else { return }
-    providerOperation = "harness"
-    harnessSucceeded = false
-    harnessMessage = routerLocalized("Disconnecting…")
-    defer { providerOperation = nil }
-    do {
-      _ = try await runControl(arguments: ["harness", "disconnect"])
-      await refresh()
-      harnessSucceeded = true
-      harnessMessage = routerLocalized("Turned off. The harness and its own settings were kept.")
-    } catch {
-      harnessMessage = error.localizedDescription
-      await refresh()
-    }
-  }
 
   func fixAndVerify() async {
     guard providerOperation == nil else { return }
@@ -1623,26 +1477,9 @@ final class RouterStore: ObservableObject {
     await applyModelSettings(arguments: ["vision-bridge", "effort", effort])
   }
 
-  func setLocalModelEnabled(_ tag: String, enabled: Bool) async {
-    await applyModelSettings(arguments: ["local-models", "set", tag, enabled ? "on" : "off"])
-  }
 
   /// Deletes the model from disk. Irreversible short of downloading it again,
   /// so the tray arms the row before this is reachable.
-  func uninstallLocalModel(_ tag: String) async {
-    guard providerOperation == nil, localModelOperation == nil else { return }
-    let startedAt = Date()
-    localModelOperation = LocalModelOperation(tag: tag, kind: .uninstall)
-    await applyModelSettings(arguments: ["local-models", "uninstall", tag, "--yes"])
-    // A local delete can complete before SwiftUI presents the next frame, and
-    // refresh removes the model row that used to own the only progress UI.
-    // Keep the operation banner around long enough to be perceived.
-    let remaining = 0.8 - Date().timeIntervalSince(startedAt)
-    if remaining > 0 {
-      try? await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000))
-    }
-    localModelOperation = nil
-  }
 
   /// Switches the reader to an already-installed local model.
   func useLocalVisionModel(_ tag: String) async {
@@ -1716,71 +1553,6 @@ final class RouterStore: ObservableObject {
   /// `force` carries the operator's deliberate override for a model this
   /// machine is rated too small for. Every catalog entry is offered, so the
   /// only way to attempt an oversized one is to say so explicitly here.
-  func downloadLocalModel(_ tag: String, force: Bool = false) async {
-    guard localDownload?.isRunning != true else { return }
-    let startedAt = Date().timeIntervalSince1970 * 1_000
-    localDownload = VisionDownloadState(
-      tag: tag,
-      status: "downloading",
-      detail: "starting",
-      percent: 0,
-      error: nil,
-      startedAt: startedAt,
-      updatedAt: startedAt
-    )
-    do {
-      // `--yes` consents to installing and starting Ollama headlessly when it
-      // is missing, so one click covers both the runtime and the model.
-      var arguments = ["local-models", "install", tag, "--yes"]
-      if force { arguments.append("--force") }
-      _ = try await runControl(arguments: arguments)
-    } catch {
-      message = error.localizedDescription
-      localDownload = VisionDownloadState(
-        tag: tag,
-        status: "error",
-        detail: "failed",
-        percent: 0,
-        error: error.localizedDescription,
-        startedAt: startedAt,
-        updatedAt: Date().timeIntervalSince1970 * 1_000
-      )
-      return
-    }
-    await pollLocalDownload()
-  }
-
-  func updateLocalOllama() async {
-    guard providerOperation == nil else { return }
-    providerOperation = "models"
-    defer { providerOperation = nil }
-    do {
-      _ = try await runControl(arguments: ["local-models", "runtime", "update", "--yes"])
-      await refresh()
-      message = "Ollama updated. Its headless server will be reused for local models."
-    } catch {
-      message = error.localizedDescription
-    }
-  }
-
-  private func pollLocalDownload() async {
-    while !Task.isCancelled {
-      try? await Task.sleep(nanoseconds: 1_000_000_000)
-      guard let data = try? await runControl(arguments: ["local-models", "list", "--json"]),
-        let decoded = try? JSONDecoder().decode(LocalModelsSnapshot.self, from: data)
-      else { continue }
-      let state = decoded.download
-      localDownload = state
-      guard let state else { continue }
-      if state.isRunning { continue }
-      await refresh()
-      message = state.status == "done"
-        ? "\(state.tag ?? "Model") ready for Codex. Restart Codex to refresh its picker."
-        : (state.error ?? "The local model download failed.")
-      return
-    }
-  }
-
   private func pollVisionDownload() async {
     while !Task.isCancelled {
       try? await Task.sleep(nanoseconds: 1_000_000_000)
@@ -2321,37 +2093,7 @@ struct RouterSnapshot: Decodable {
   // Absent from an older router's output, so the tray keeps working against one
   // rather than failing the whole decode over a field it gained later.
   let presence: RouterPresence?
-  let harness: RouterHarness?
-  static let empty = RouterSnapshot(targets: [:], presence: nil, harness: nil)
-}
-
-struct HarnessStopResult: Decodable {
-  let stopped: Bool
-  let reason: String?
-}
-
-struct HarnessSetupResult: Decodable {
-  struct Published: Decodable { let models: Int }
-  let published: Published
-  let launch: String
-  let web: RouterHarnessWeb?
-}
-
-struct RouterHarness: Decodable {
-  let package: String
-  let installed: Bool
-  let version: String?
-  let published: Bool
-  let nodeVersion: String
-  let nodeSupported: Bool
-  let minimumNode: String
-  let web: RouterHarnessWeb?
-}
-
-struct RouterHarnessWeb: Decodable {
-  let running: Bool
-  let url: String?
-  let port: Int?
+  static let empty = RouterSnapshot(targets: [:], presence: nil)
 }
 
 struct RouterPresence: Decodable {
@@ -2596,7 +2338,6 @@ struct ModelSettingsSnapshot: Decodable {
   let subagents: SubagentSettingsSnapshot
   let picker: PickerSettingsSnapshot
   let toolResultAging: ToolResultAgingSnapshot?
-  let localModels: LocalModelsSnapshot?
   let visionBridge: VisionBridgeSnapshot?
 }
 
@@ -2682,124 +2423,19 @@ struct ToolResultAgingCache: Decodable {
   }
 }
 
-struct LocalModelsSnapshot: Decodable {
-  let installed: Int
-  let enabled: Int
-  let usableAsChat: Int?
-  let totalGb: Double
-  let models: [InstalledLocalModel]
-  // Optional so a tray built against this snapshot keeps decoding one from an
-  // older router that has no suggestions to offer.
-  let available: [AvailableLocalModel]?
-  let availableVision: [AvailableVisionModel]?
-  let availableExplore: [AvailableLocalModel]?
-  let machine: String?
-  let families: [LocalModelFamily]?
-  let download: VisionDownloadState?
-  let runtime: LocalRuntimeSnapshot?
-  let catalog: LocalCatalogSnapshot?
-}
-
-struct LocalRuntimeSnapshot: Decodable {
-  let installed: Bool?
-  let version: String?
-  let running: Bool?
-  let managed: Bool?
-  let modelsPath: String?
-}
 
 struct LocalCatalogSnapshot: Decodable {
   let mode: String?
   let note: String?
 }
 
-struct LocalModelFamily: Decodable, Identifiable {
-  let family: String
-  let displayName: String
-  let variants: [String]
-  var id: String { family }
-}
 
 /// A model/tag worth displaying, already rated against this machine's memory
 /// by the router. Cloud aliases are intentionally visible but non-downloadable.
-struct AvailableLocalModel: Decodable, Identifiable, Equatable {
-  let tag: String
-  let family: String?
-  let variant: String?
-  let displayName: String?
-  let sizeGb: Double
-  let tools: Bool
-  let context: Int?
-  /// What running the real Codex client against this model actually produced.
-  /// A tool template predicts it in neither direction, so "untested" stays
-  /// untested rather than reading as a recommendation.
-  let codex: String?
-  let note: String
-  let fit: String
-  let diskFit: String?
-  let speedStatus: String?
-  let downloadable: Bool?
-  /// Research captured from the official Ollama family page. This is kept
-  /// separate from `tools` and `codex`: upstream capability labels are not a
-  /// substitute for a real post-install Codex check.
-  let researchStatus: String?
-  let researchCapabilities: [String]?
-  let researchNote: String?
-  var id: String { tag }
-
-  var isVerified: Bool { codex == "verified" }
-}
 
 /// A model that can only read images. Ranked by what it actually scored
 /// against a known image, never by size alone.
-struct AvailableVisionModel: Decodable, Identifiable, Equatable {
-  let tag: String
-  let sizeGb: Double
-  let accuracy: String
-  let note: String
-  let fit: String
-  let diskFit: String?
-  var id: String { tag }
-}
 
-struct InstalledLocalModel: Decodable, Identifiable, Equatable {
-  let tag: String
-  let family: String?
-  let variant: String?
-  let sizeGb: Double
-  let modified: String?
-  let enabled: Bool
-  let running: Bool
-  let vision: Bool
-  let tools: Bool?
-  let accuracy: String?
-  let agent: String?
-  let tokensPerSecond: Double?
-  let speedStatus: String?
-  var id: String { tag }
-
-  /// Codex drives every turn through tool calls, so a model without them
-  /// cannot be a chat model here however good it is. It stays useful as a
-  /// vision reader, and the row has to say so or the checkbox looks broken.
-  var canBeChatModel: Bool { tools == true }
-
-  /// What this model is good for as a Codex chat model, from a measured run of
-  /// the real client where one exists. Tool support alone is not enough: a
-  /// model can call tools perfectly on a short prompt and still fall apart on
-  /// Codex's real instructions.
-  var chatRoleLabel: String {
-    if tools != true { return routerLocalized("no tools — can't chat") }
-    switch agent {
-    case "agent": return routerLocalized("works in Codex")
-    case "flaky": return routerLocalized("unreliable in Codex")
-    case "not-published": return routerLocalized("not offered yet")
-    case .some: return routerLocalized("fails in Codex")
-    default: return routerLocalized("chat — untested")
-    }
-  }
-
-  var chatRoleGood: Bool { tools == true && agent == "agent" }
-}
 
 struct VisionEngineOption: Decodable, Identifiable, Equatable {
   let slug: String
@@ -3057,6 +2693,19 @@ private struct TrayView: View {
       loginItemError = error.localizedDescription
     }
     refreshLoginItemStatus()
+  }
+
+  // 重载配置：control reload（校验 config.toml / 刷 catalog / 重发布
+  // 集成块）。服务进程不动 —— 凭证本来就逐请求解析。
+  private func reloadConfiguration() {
+    Task {
+      do {
+        _ = try await store.runControlPublic(arguments: ["reload"])
+        await store.refresh()
+      } catch {
+        // 错误经 store.message 呈现（runControl 抛 RouterError 带 stderr）。
+      }
+    }
   }
 
   // 打开凭证配置：不存在则先生成带注释的模板（control config init），
@@ -3543,10 +3192,16 @@ private struct TrayView: View {
         .foregroundStyle(routerMuted)
       }
       Spacer()
-      Button(routerLocalized("Open Config")) {
-        openCredentialsConfig()
+      HStack(spacing: 6) {
+        Button(routerLocalized("Reload")) {
+          reloadConfiguration()
+        }
+        .buttonStyle(AccentButtonStyle())
+        Button(routerLocalized("Open Config")) {
+          openCredentialsConfig()
+        }
+        .buttonStyle(AccentButtonStyle())
       }
-      .buttonStyle(AccentButtonStyle())
     }
     .padding(.vertical, 2)
     HStack(spacing: 12) {
@@ -3610,7 +3265,6 @@ private struct TrayView: View {
       isDisabled: store.providerOperation != nil
         || target.modelSettings?.toolResultAging?.environmentOverride == true
     )
-    harnessRow
     maintenanceRow
     AccordionPanel(
       title: routerLocalized("Providers"),
@@ -3648,20 +3302,8 @@ private struct TrayView: View {
     @State private var subagentsExpanded = true
     @State private var pickerExpanded = true
     @State private var visionExpanded = true
-    // Local models are a first-class install surface. Keep this section open
-    // on launch so the catalog is not hidden behind the other settings cards.
-    @State private var localLlmExpanded = true
-    @State private var localDetailsExpanded = false
-    @State private var expandedLocalFamilies = Set<String>()
-    @State private var expandedLocalVariants = Set<String>()
-    @State private var variantHelpExpanded = false
-    @State private var localCatalogFilter = ""
-    @State private var installTag = ""
-    @State private var armedRemoval: String?
-    // Set to the tag awaiting an "it will not fit here" confirmation. Held as
-    // the tag rather than a Bool so the alert can name the model.
-    @State private var pendingOversizedInstall: String?
-    @State private var quickPicksExpanded = false
+    // "Subagent models" / "Model picker" 各 provider 分组的折叠状态（按
+    // section:provider 键控，见 providerBinding）。
     @State private var collapsedProviders = Set<String>()
 
     private struct ProviderModels: Identifiable {
@@ -3670,15 +3312,6 @@ private struct TrayView: View {
       var id: String { provider }
     }
 
-    private struct LocalCatalogFamily: Identifiable {
-      let family: String
-      let displayName: String
-      let models: [AvailableLocalModel]
-      let researchStatus: String?
-      let researchCapabilities: [String]
-      let researchNote: String?
-      var id: String { family }
-    }
 
     private var settings: ModelSettingsSnapshot? { target.modelSettings }
     private var busy: Bool { store.providerOperation == "models" }
@@ -3868,14 +3501,6 @@ private struct TrayView: View {
           }
         }
 
-        AccordionPanel(
-          title: routerLocalized("Local LLMs"),
-          summary: localLlmSummary,
-          expanded: $localLlmExpanded
-        ) {
-          localLlmPanel
-        }
-
         // Header says "Vision" and nothing else; the state it used to summarise
         // is one line below, in the toggle's own detail.
         AccordionPanel(
@@ -3886,1020 +3511,21 @@ private struct TrayView: View {
           visionPanel
         }
       }
-      .alert(
-        routerLocalized("Download anyway?"),
-        isPresented: Binding(
-          get: { pendingOversizedInstall != nil },
-          set: { presented in if !presented { pendingOversizedInstall = nil } }
-        ),
-        presenting: pendingOversizedInstall
-      ) { tag in
-        Button("\(routerLocalized("Download")) \(tag)", role: .destructive) {
-          pendingOversizedInstall = nil
-          Task { await store.downloadLocalModel(tag, force: true) }
-        }
-        Button(routerLocalized("Cancel"), role: .cancel) { pendingOversizedInstall = nil }
-      } message: { tag in
-        Text(
-          RouterLanguage.isSimplifiedChinese
-            ? "\(tag) 对本机内存或可用磁盘空间来说过大。仍会下载，但可能无法加载或运行非常缓慢。"
-            : "\(tag) is rated too large for this machine's memory or free disk. "
-              + "It will download, but it may fail to load or run very slowly."
-        )
-      }
-    }
-
-    // Everything installed through Ollama, in one place: check the ones to
-    // offer Codex, install more by tag, remove the ones eating disk. Checking a
-    // model is not the same as downloading it and not the same as deleting it,
-    // so the three actions stay visibly separate.
-    //
-    // The popover is 352pt wide, so identity stays on one compact line and
-    // secondary actions live behind an overflow menu. Long tags and role
-    // phrases truncate in place instead of making the panel wider or taller.
-    @ViewBuilder private var localLlmPanel: some View {
-      VStack(alignment: .leading, spacing: 10) {
-        Text(routerLocalized("Run models locally through Ollama. Enable an installed model to make it available to Codex."))
-          .font(.system(size: 9))
-          .foregroundStyle(routerMuted)
-        if let operation = store.localModelOperation {
-          localModelOperationStatus(operation)
-            .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .top)))
-        }
-        if let download = store.localDownload {
-          localDownloadStatus(download)
-        }
-        localInstalledSection
-        localQuickPicksSection
-        if let explore = localModels?.availableExplore, !explore.isEmpty {
-          localCatalogSection(explore)
-        }
-        localInstallSection
-        Button(routerLocalized(localDetailsExpanded ? "Hide machine & runtime" : "Machine & runtime")) {
-          withAnimation(.easeOut(duration: 0.15)) { localDetailsExpanded.toggle() }
-        }
-        .buttonStyle(.borderless)
-        .font(.system(size: 9, weight: .medium))
-        .foregroundStyle(routerMutedStrong)
-        if localDetailsExpanded {
-          localDetails
-        }
-      }
-      .animation(.easeOut(duration: 0.2), value: store.localModelOperation)
-    }
-
-    @ViewBuilder private func localModelOperationStatus(_ operation: LocalModelOperation) -> some View {
-      HStack(spacing: 9) {
-        OperationPulse(tint: routerRed)
-        VStack(alignment: .leading, spacing: 2) {
-          Text("\(routerLocalized(operation.kind.label)) \(routerLocalized("local model"))")
-            .font(.system(size: 9, weight: .semibold))
-            .foregroundStyle(routerRed)
-          Text(operation.tag)
-            .font(.system(size: 9, weight: .medium, design: .monospaced))
-            .foregroundStyle(routerMutedStrong)
-            .lineLimit(1)
-            .truncationMode(.middle)
-        }
-        Spacer(minLength: 4)
-        ProgressView()
-          .controlSize(.small)
-          .tint(routerRed)
-      }
-      .padding(8)
-      .background(
-        routerRed.opacity(0.08),
-        in: RoundedRectangle(cornerRadius: 8, style: .continuous)
-      )
-      .accessibilityElement(children: .combine)
-      .accessibilityLabel("\(routerLocalized(operation.kind.label)) \(routerLocalized("local model")) \(operation.tag)")
-    }
-
-    @ViewBuilder private var localInstalledSection: some View {
-      let installedCount = sortedLocalModels.count
-      let detail = installedCount == 0
-        ? routerLocalized("none installed")
-        : "\(installedCount) \(routerLocalized("installed")) · \(String(format: "%.1f", localModels?.totalGb ?? 0)) GB"
-      downloadHeader("ON THIS MAC", detail: detail)
-      if sortedLocalModels.isEmpty {
-        Text(routerLocalized("Nothing installed yet. Start with a quick pick or browse the Ollama catalog below."))
-          .font(.system(size: 9))
-          .foregroundStyle(routerMutedStrong)
-      } else {
-        HStack(spacing: 0) {
-          Text(routerLocalized("CODEX"))
-            .frame(width: Self.checkColumnWidth, alignment: .leading)
-          Text(routerLocalized("MODEL"))
-          Spacer()
-          Text(routerLocalized("SIZE"))
-        }
-        .font(.system(size: 8, weight: .semibold))
-        .foregroundStyle(routerMuted)
-        .padding(.horizontal, 2)
-        VStack(spacing: 7) {
-          ForEach(sortedLocalModels) { model in
-            installedLocalRow(model)
-          }
-        }
-      }
-    }
-
-    @ViewBuilder private var localQuickPicksSection: some View {
-      if !suggestedLocalModels.isEmpty || !suggestedVisionModels.isEmpty {
-        downloadHeader("QUICK PICKS", detail: "shortlist for this Mac")
-        if !visibleQuickCodingModels.isEmpty {
-          Text(routerLocalized("CODING"))
-            .font(.system(size: 8, weight: .semibold))
-            .foregroundStyle(routerMuted)
-          VStack(spacing: 3) {
-            ForEach(visibleQuickCodingModels) { model in
-              quickCodingRow(model)
-            }
-          }
-        }
-        if !visibleQuickVisionModels.isEmpty {
-          Text(routerLocalized("IMAGE READING"))
-            .font(.system(size: 8, weight: .semibold))
-            .foregroundStyle(routerMuted)
-            .padding(.top, 2)
-          VStack(spacing: 3) {
-            ForEach(visibleQuickVisionModels) { model in
-              quickVisionRow(model)
-            }
-          }
-        }
-        if quickPickRemainingCount > 0 || quickPicksExpanded {
-          Button(
-            quickPicksExpanded
-              ? routerLocalized("Show fewer quick picks")
-              : (RouterLanguage.isSimplifiedChinese
-                  ? "再显示 \(quickPickRemainingCount) 个快速选项"
-                  : "Show \(quickPickRemainingCount) more quick picks")
-          ) {
-            withAnimation(.easeOut(duration: 0.15)) { quickPicksExpanded.toggle() }
-          }
-          .buttonStyle(.borderless)
-          .font(.system(size: 8, weight: .medium))
-          .foregroundStyle(routerMutedStrong)
-        }
-      }
-    }
-
-    @ViewBuilder private func localCatalogSection(_ explore: [AvailableLocalModel]) -> some View {
-      let cloudCount = explore.filter { $0.downloadable == false }.count
-      let visibleTagCount = localCatalogFamilies.reduce(0) { $0 + $1.models.count }
-      let visibleCloudCount = localCatalogFamilies
-        .flatMap(\.models)
-        .filter { $0.downloadable == false }
-        .count
-      let showingAllCatalog = localCatalogFilter.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-      let shownCloudCount = showingAllCatalog ? cloudCount : visibleCloudCount
-      let catalogDetail = RouterLanguage.isSimplifiedChinese
-        ? (showingAllCatalog
-            ? "\(localCatalogFamilies.count) 个系列 · \(explore.count) 个标签"
-            : "\(localCatalogFamilies.count) 个系列 · \(visibleTagCount) 个匹配")
-        : (showingAllCatalog
-            ? "\(localCatalogFamilies.count) families · \(explore.count) tags"
-            : "\(localCatalogFamilies.count) families · \(visibleTagCount) matches")
-      downloadHeader(
-        "DISCOVER OLLAMA",
-        detail: catalogDetail +
-          (shownCloudCount > 0
-            ? (RouterLanguage.isSimplifiedChinese ? " · \(shownCloudCount) 个仅云端" : " · \(shownCloudCount) cloud-only")
-            : "")
-      )
-      Button(routerLocalized(variantHelpExpanded ? "Hide tag guide" : "What do these tags mean?")) {
-        withAnimation(.easeOut(duration: 0.15)) { variantHelpExpanded.toggle() }
-      }
-      .buttonStyle(.borderless)
-      .font(.system(size: 8, weight: .medium))
-      .foregroundStyle(routerMutedStrong)
-      if variantHelpExpanded {
-        Text(routerLocalized("Size tags choose the model scale. Q4/Q8/BF16 are weight precision; MLX/NVFP4 are hardware-oriented builds; cloud tags run remotely. Codex compatibility is checked only after a pull."))
-          .font(.system(size: 8))
-          .foregroundStyle(routerMuted)
-          .fixedSize(horizontal: false, vertical: true)
-          .padding(.top, 2)
-      }
-      HStack(spacing: 6) {
-        TextField(routerLocalized("Search family or tag"), text: $localCatalogFilter)
-          .textFieldStyle(.roundedBorder)
-          .font(.system(size: 10))
-        if !localCatalogFilter.isEmpty {
-          Button(routerLocalized("Clear")) { localCatalogFilter = "" }
-            .buttonStyle(.borderless)
-            .font(.system(size: 9, weight: .medium))
-            .foregroundStyle(routerMutedStrong)
-        }
-      }
-      if localCatalogFamilies.isEmpty {
-        Text(
-          RouterLanguage.isSimplifiedChinese
-            ? "没有匹配“\(localCatalogFilter)”的 Ollama 标签。"
-            : "No Ollama tags match \"\(localCatalogFilter)\"."
-        )
-          .font(.system(size: 9))
-          .foregroundStyle(routerMutedStrong)
-          .padding(.top, 2)
-      } else {
-        VStack(spacing: 0) {
-          ForEach(localCatalogFamilies) { family in
-            localFamilySection(family)
-          }
-        }
-      }
-    }
-
-    @ViewBuilder private var localInstallSection: some View {
-      downloadHeader("INSTALL A MODEL", detail: "Ollama tag or URL")
-      Text(routerLocalized("Use a tag or model-page URL. Downloads stay headless."))
-        .font(.system(size: 8))
-        .foregroundStyle(routerMuted)
-      HStack(spacing: 6) {
-        TextField(routerLocalized("gemma4:12b or ollama.com/library/gemma4:12b"), text: $installTag)
-          .textFieldStyle(.roundedBorder)
-          .font(.system(size: 10))
-          .disabled(busy || store.localDownload?.isRunning == true)
-          .onSubmit { submitInstall() }
-        Button(routerLocalized("Install")) { submitInstall() }
-          .buttonStyle(.borderless)
-          .font(.system(size: 9, weight: .medium))
-          .foregroundStyle(canInstall ? routerMint : routerMutedStrong)
-          .disabled(!canInstall)
-      }
-    }
-
-    @ViewBuilder private func localFamilySection(_ family: LocalCatalogFamily) -> some View {
-      Button(action: {
-        withAnimation(.easeOut(duration: 0.15)) {
-          if expandedLocalFamilies.contains(family.id) {
-            expandedLocalFamilies.remove(family.id)
-          } else {
-            expandedLocalFamilies.insert(family.id)
-          }
-        }
-      }) {
-        HStack(spacing: 8) {
-          VStack(alignment: .leading, spacing: 2) {
-            Text(family.displayName)
-              .font(.system(size: 10, weight: .medium))
-              .lineLimit(1)
-            Text(localFamilySummary(family))
-              .font(.system(size: 8))
-              .foregroundStyle(routerMutedStrong)
-              .lineLimit(1)
-          }
-          Spacer(minLength: 4)
-          Image(systemName: expandedLocalFamilies.contains(family.id) ? "chevron.down" : "chevron.right")
-            .font(.system(size: 9, weight: .semibold))
-            .foregroundStyle(routerMuted)
-        }
-        .padding(.vertical, 7)
-        .contentShape(Rectangle())
-      }
-      .buttonStyle(.plain)
-      if expandedLocalFamilies.contains(family.id) {
-        localFamilyPanel(family)
-          .padding(.bottom, 7)
-      }
-      Divider()
-    }
-
-    @ViewBuilder private func localFamilyPanel(_ family: LocalCatalogFamily) -> some View {
-      let recommended = recommendedLocalVariant(in: family.models)
-      let expanded = expandedLocalVariants.contains(family.id)
-      let visibleVariants = expanded
-        ? family.models
-        : localPreviewVariants(in: family.models, excluding: recommended)
-      let rows = visibleVariants.filter { $0.tag != recommended?.tag }
-      let shownCount = rows.count + (recommended == nil ? 0 : 1)
-      let hiddenCount = max(0, family.models.count - shownCount)
-
-      if let status = family.researchStatus {
-        HStack(spacing: 4) {
-          Text(status)
-          if !family.researchCapabilities.isEmpty {
-            Text("· " + family.researchCapabilities.joined(separator: " · "))
-          }
-        }
-        .font(.system(size: 8, weight: .medium))
-        .foregroundStyle(routerMutedStrong)
-        .lineLimit(1)
-        .truncationMode(.tail)
-      }
-      if let note = family.researchNote {
-        Text(note)
-          .font(.system(size: 8))
-          .foregroundStyle(routerMuted)
-          .fixedSize(horizontal: false, vertical: true)
-          .padding(.bottom, 2)
-      }
-      if let recommended {
-        Text(routerLocalized("BEST FIT FOR THIS MAC"))
-          .font(.system(size: 8, weight: .semibold))
-          .foregroundStyle(routerMint)
-          .padding(.bottom, 1)
-        exploreLocalRow(recommended, isRecommended: true)
-      } else if family.models.allSatisfy({ $0.downloadable == false }) {
-        Text(routerLocalized("CLOUD ONLY · NO LOCAL DOWNLOAD"))
-          .font(.system(size: 8, weight: .semibold))
-          .foregroundStyle(routerMutedStrong)
-          .padding(.bottom, 1)
-      } else {
-        Text(routerLocalized("NO LOCAL VARIANT FITS THIS MAC"))
-          .font(.system(size: 8, weight: .semibold))
-          .foregroundStyle(routerRed)
-          .padding(.bottom, 1)
-      }
-
-      if !rows.isEmpty {
-        VStack(spacing: 6) {
-          ForEach(rows) { model in
-            exploreLocalRow(model)
-          }
-        }
-        .padding(.top, 3)
-      }
-      if expanded || hiddenCount > 0 {
-        Button(
-          expanded
-            ? routerLocalized("Show fewer tags")
-            : (RouterLanguage.isSimplifiedChinese
-                ? "查看全部 \(family.models.count) 个标签"
-                : "View all \(family.models.count) tags")
-        ) {
-          withAnimation(.easeOut(duration: 0.15)) {
-            if expandedLocalVariants.contains(family.id) {
-              expandedLocalVariants.remove(family.id)
-            } else {
-              expandedLocalVariants.insert(family.id)
-            }
-          }
-        }
-        .buttonStyle(.borderless)
-        .font(.system(size: 9, weight: .medium))
-        .foregroundStyle(routerMutedStrong)
-      }
-    }
-
-    @ViewBuilder private var localDetails: some View {
-      VStack(alignment: .leading, spacing: 4) {
-        if let machine = localModels?.machine {
-          Text(machine)
-            .font(.system(size: 8))
-            .foregroundStyle(routerMuted)
-        }
-        if let runtime = localModels?.runtime {
-          let runtimeLabel = runtime.installed == true
-            ? "Ollama \(runtime.version ?? routerLocalized("installed"))"
-            : (RouterLanguage.isSimplifiedChinese ? "Ollama 未安装" : "Ollama not installed")
-          let serverState = runtime.running == true
-            ? routerLocalized("managed")
-            : routerLocalized("not started")
-          Text(
-            RouterLanguage.isSimplifiedChinese
-              ? "\(runtimeLabel) · 后台服务器 \(serverState)"
-              : "\(runtimeLabel) · headless server \(serverState)"
-          )
-            .font(.system(size: 8))
-            .foregroundStyle(runtime.installed == true ? routerMint : routerYellow)
-          if let modelsPath = runtime.modelsPath {
-            Text("\(routerLocalized("Models:")) \(modelsPath)")
-              .font(.system(size: 8))
-              .foregroundStyle(routerMuted)
-              .lineLimit(1)
-              .truncationMode(.middle)
-          }
-          if runtime.installed == true {
-            Button(routerLocalized("Update Ollama")) { Task { await store.updateLocalOllama() } }
-              .buttonStyle(.borderless)
-              .font(.system(size: 8, weight: .medium))
-              .foregroundStyle(routerMutedStrong)
-              .disabled(busy)
-          }
-        }
-        if let families = localModels?.families, !families.isEmpty {
-          Text(
-            RouterLanguage.isSimplifiedChinese
-              ? "上方已按系列归类 \(families.count) 个 Ollama 系列的具体标签。"
-              : "\(families.count) Ollama families; exact tags are grouped above."
-          )
-            .font(.system(size: 8))
-            .foregroundStyle(routerMuted)
-        }
-        Text(
-          RouterLanguage.isSimplifiedChinese
-            ? "安装后会使用 Ollama 的评测计数器测量速度；未测量的模型不会显示臆造的数字。"
-            : "Speed is measured after install with Ollama's eval counters; unmeasured models show no invented number."
-        )
-          .font(.system(size: 8))
-          .foregroundStyle(routerMuted)
-      }
-      .padding(.horizontal, 2)
-    }
-
-    @ViewBuilder private func exploreLocalRow(
-      _ model: AvailableLocalModel,
-      isRecommended: Bool = false
-    ) -> some View {
-      let downloadable = model.downloadable != false
-      let tooLarge = model.fit == "too-large" || model.diskFit == "too-large"
-      HStack(spacing: 5) {
-        VStack(alignment: .leading, spacing: 1) {
-          HStack(spacing: 4) {
-            Text(localVariantTitle(model))
-              .font(.system(size: 9, weight: isRecommended ? .semibold : .medium))
-              .lineLimit(1)
-              .truncationMode(.tail)
-            if let badge = localVariantBadge(model, isRecommended: isRecommended) {
-              Text(badge)
-                .font(.system(size: 7, weight: .semibold))
-                .foregroundStyle(localVariantBadgeColor(model, isRecommended: isRecommended))
-            }
-          }
-          Text(model.tag)
-            .font(.system(size: 8))
-            .foregroundStyle(routerMuted)
-            .lineLimit(1)
-            .truncationMode(.tail)
-        }
-        Spacer(minLength: 3)
-        Text(downloadable ? String(format: "%.1f GB", model.sizeGb) : routerLocalized("cloud"))
-          .font(.system(size: 8))
-          .foregroundStyle(routerMuted)
-          .monospacedDigit()
-        Text(downloadable ? (tooLarge ? routerLocalized("won't fit") : routerLocalized(model.fit)) : routerLocalized("cloud only"))
-          .font(.system(size: 8))
-          .foregroundStyle(!downloadable ? routerMuted : (tooLarge ? routerRed : routerMutedStrong))
-        if downloadable {
-          // A model rated too large is still offered, because refusing to show
-          // the button left those tags with no install path at all. The label
-          // changes to name the risk and the tap asks once before spending the
-          // gigabytes; confirming sends --force.
-          Button(tooLarge ? routerLocalized("Anyway") : routerLocalized("Download")) {
-            if tooLarge {
-              pendingOversizedInstall = model.tag
-            } else {
-              Task { await store.downloadLocalModel(model.tag) }
-            }
-          }
-          .buttonStyle(.borderless)
-          .font(.system(size: 8, weight: .medium))
-          .foregroundStyle(
-            !canDownloadLocalSuggestion ? routerMutedStrong : (tooLarge ? routerRed : routerMint)
-          )
-          .disabled(!canDownloadLocalSuggestion)
-        } else {
-          Text(routerLocalized("cloud only"))
-            .font(.system(size: 8, weight: .medium))
-            .foregroundStyle(routerMutedStrong)
-        }
-      }
-    }
-
-    private func localVariantTitle(_ model: AvailableLocalModel) -> String {
-      guard let variant = model.variant, !variant.isEmpty else { return model.tag }
-      switch variant.lowercased() {
-      case "latest": return routerLocalized("Default")
-      case "cloud": return routerLocalized("Cloud")
-      default: break
-      }
-      if localVariantIsStandard(model) { return variant.uppercased() }
-      let lower = variant.lowercased()
-      if lower.contains("mlx") { return routerLocalized("Apple Silicon build") }
-      if lower.contains("nvfp4") { return routerLocalized("NVFP4 build") }
-      if lower.contains("q4") || lower.contains("int4") { return routerLocalized("4-bit build") }
-      if lower.contains("q8") || lower.contains("int8") { return routerLocalized("8-bit build") }
-      if lower.contains("bf16") { return routerLocalized("BF16 build") }
-      if lower.contains("coding") { return routerLocalized("Coding build") }
-      return routerLocalized("Specialized build")
-    }
-
-    private func localVariantBadge(
-      _ model: AvailableLocalModel,
-      isRecommended: Bool
-    ) -> String? {
-      if isRecommended { return routerLocalized("BEST FIT") }
-      if model.downloadable == false { return routerLocalized("CLOUD") }
-      if model.variant == "latest" { return routerLocalized("DEFAULT") }
-      if model.fit == "tight" || model.diskFit == "tight" { return routerLocalized("TIGHT") }
-      if !localModelFits(model) { return routerLocalized("WON'T FIT") }
-      return nil
-    }
-
-    private func localVariantBadgeColor(
-      _ model: AvailableLocalModel,
-      isRecommended: Bool
-    ) -> Color {
-      if isRecommended || localModelFits(model) { return routerMint }
-      if model.downloadable == false { return routerMutedStrong }
-      if model.fit == "tight" || model.diskFit == "tight" { return routerYellow }
-      return routerRed
-    }
-
-    @ViewBuilder private func quickCodingRow(_ model: AvailableLocalModel) -> some View {
-      HStack(spacing: 6) {
-        VStack(alignment: .leading, spacing: 1) {
-          Text(model.tag)
-            .font(.system(size: 9, weight: .medium))
-            .lineLimit(1)
-          Text(
-            routerLocalized(
-              model.fit == "tight" ? "memory tight" : (model.isVerified ? "verified" : "untested")
-            )
-          )
-            .font(.system(size: 8))
-            .foregroundStyle(model.fit == "tight" ? routerYellow : (model.isVerified ? routerMint : routerMuted))
-            .lineLimit(1)
-        }
-        Spacer()
-        Text(String(format: "%.1f GB", model.sizeGb))
-          .font(.system(size: 8))
-          .foregroundStyle(routerMuted)
-          .monospacedDigit()
-        Button(routerLocalized("Download")) {
-          Task { await store.downloadLocalModel(model.tag) }
-        }
-        .buttonStyle(.borderless)
-        .font(.system(size: 8, weight: .medium))
-        .foregroundStyle(canDownloadLocalSuggestion ? routerMint : routerMutedStrong)
-        .disabled(!canDownloadLocalSuggestion)
-      }
-      .padding(.vertical, 1)
-    }
-
-    @ViewBuilder private func quickVisionRow(_ model: AvailableVisionModel) -> some View {
-      HStack(spacing: 6) {
-        VStack(alignment: .leading, spacing: 1) {
-          Text(model.tag)
-            .font(.system(size: 9, weight: .medium))
-            .lineLimit(1)
-          Text(
-            RouterLanguage.isSimplifiedChinese
-              ? "\(routerLocalized(model.accuracy)) · \(routerLocalized(model.fit))"
-              : "\(model.accuracy) · \(model.fit)"
-          )
-            .font(.system(size: 8))
-            .foregroundStyle(model.accuracy == "accurate" ? routerMint : routerMuted)
-            .lineLimit(1)
-        }
-        Spacer()
-        Text(String(format: "%.1f GB", model.sizeGb))
-          .font(.system(size: 8))
-          .foregroundStyle(routerMuted)
-          .monospacedDigit()
-        Button(routerLocalized("Download")) {
-          Task { await store.downloadLocalModel(model.tag) }
-        }
-        .buttonStyle(.borderless)
-        .font(.system(size: 8, weight: .medium))
-        .foregroundStyle(canDownloadLocalSuggestion ? routerMint : routerMutedStrong)
-        .disabled(!canDownloadLocalSuggestion)
-      }
-      .padding(.vertical, 1)
-    }
-
-    @ViewBuilder private func downloadHeader(_ title: String, detail: String?) -> some View {
-      Divider().padding(.vertical, 2)
-      HStack(spacing: 4) {
-        Text(routerLocalized(title))
-        Spacer()
-        if let detail {
-          Text(routerLocalized(detail)).lineLimit(1).truncationMode(.tail)
-        }
-      }
-      .font(.system(size: 8, weight: .semibold))
-      .foregroundStyle(routerMuted)
-      .padding(.horizontal, 2)
-    }
-
-    private var canDownloadLocalSuggestion: Bool {
-      !busy && store.localDownload?.isRunning != true
-    }
-
-    private var suggestedLocalModels: [AvailableLocalModel] {
-      localModels?.available ?? []
-    }
-
-    private var suggestedVisionModels: [AvailableVisionModel] {
-      localModels?.availableVision ?? []
-    }
-
-    private var visibleQuickCodingModels: [AvailableLocalModel] {
-      quickPicksExpanded ? suggestedLocalModels : Array(suggestedLocalModels.prefix(1))
-    }
-
-    private var visibleQuickVisionModels: [AvailableVisionModel] {
-      quickPicksExpanded ? suggestedVisionModels : Array(suggestedVisionModels.prefix(1))
-    }
-
-    private var quickPickRemainingCount: Int {
-      suggestedLocalModels.count + suggestedVisionModels.count
-        - visibleQuickCodingModels.count - visibleQuickVisionModels.count
     }
 
     private static let checkColumnWidth: CGFloat = 38
 
-    @ViewBuilder private func localDownloadStatus(_ download: VisionDownloadState) -> some View {
-      let isDone = download.status == "done"
-      let isError = download.status == "error"
-      let tint = isError ? routerRed : (isDone ? routerMint : routerYellow)
-      VStack(alignment: .leading, spacing: 4) {
-        HStack(spacing: 6) {
-          if download.isRunning {
-            OperationPulse(tint: tint)
-          } else {
-            Circle()
-              .fill(tint)
-              .frame(width: 6, height: 6)
-          }
-          Text(
-            isError
-              ? routerLocalized("Local model install failed")
-              : (isDone ? routerLocalized("Local model ready") : routerLocalized("Installing local model"))
-          )
-            .font(.system(size: 9, weight: .semibold))
-            .foregroundStyle(tint)
-          Spacer(minLength: 4)
-          if let percent = download.percent, !isError {
-            Text("\(percent)%")
-              .font(.system(size: 9, weight: .medium))
-              .foregroundStyle(routerMutedStrong)
-              .monospacedDigit()
-          }
-        }
-        if let tag = download.tag {
-          Text(tag)
-            .font(.system(size: 9, weight: .medium))
-            .lineLimit(1)
-            .truncationMode(.middle)
-        }
-        if let detail = download.error ?? download.detail, !detail.isEmpty {
-          Text(detail)
-            .font(.system(size: 8))
-            .foregroundStyle(isError ? routerRed : routerMuted)
-            .lineLimit(2)
-        }
-        if download.isRunning {
-          ProgressView(value: Double(download.percent ?? 0), total: 100)
-            .progressViewStyle(.linear)
-            .tint(routerMint)
-        }
-      }
-      .padding(7)
-      .background(tint.opacity(0.08), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
-    }
-
-    @ViewBuilder private func downloadBar(tag: String?, percent: Int?) -> some View {
-      let tagLabel = tag.map { " \($0)" } ?? ""
-      HStack(spacing: 6) {
-        OperationPulse(tint: routerMint)
-        ProgressView(value: Double(percent ?? 0), total: 100)
-          .progressViewStyle(.linear)
-          .tint(routerMint)
-        Text("\(routerLocalized("Installing"))\(tagLabel) · \(percent ?? 0)%")
-          .font(.system(size: 9, weight: .medium))
-          .foregroundStyle(routerMint)
-          .lineLimit(1)
-          .monospacedDigit()
-      }
-    }
-
-    @ViewBuilder private func installedLocalRow(_ model: InstalledLocalModel) -> some View {
-      let operation = store.localModelOperation?.tag == model.tag
-        ? store.localModelOperation
-        : nil
-      HStack(alignment: .top, spacing: 0) {
-        // Codex drives every turn through tool calls, so a model without them
-        // can never be a chat model. The checkbox goes dead rather than
-        // silently doing nothing, and the role line below says why.
-        Toggle("", isOn: Binding(
-          get: { model.enabled },
-          set: { on in Task { await store.setLocalModelEnabled(model.tag, enabled: on) } }
-        ))
-        .labelsHidden()
-        .toggleStyle(.checkbox)
-        .controlSize(.mini)
-        .disabled(busy || operation != nil || !model.canBeChatModel)
-        .frame(width: Self.checkColumnWidth, alignment: .leading)
-        VStack(alignment: .leading, spacing: 3) {
-          HStack(spacing: 6) {
-            Text(model.tag)
-              .font(.system(size: 11, weight: .medium))
-              .lineLimit(1)
-              .truncationMode(.middle)
-            if model.running {
-              Text(routerLocalized("loaded"))
-                .font(.system(size: 8, weight: .medium))
-                .foregroundStyle(routerMint)
-            }
-            Spacer(minLength: 6)
-            Text(String(format: "%.1f GB", model.sizeGb))
-              .font(.system(size: 9))
-              .foregroundStyle(routerMutedStrong)
-              .layoutPriority(1)
-            Menu {
-              Button(routerLocalized("Measure speed")) {
-                Task { await store.benchmarkLocalModelSpeed(model.tag) }
-              }
-              .disabled(busy || store.benchmarkingTag != nil)
-              if model.vision {
-                Button(routerLocalized("Test image reading")) {
-                  Task { await store.benchmarkLocalVisionModel(model.tag) }
-                }
-                .disabled(busy || store.benchmarkingTag != nil)
-                if isVisionEngine(model) {
-                  Label(routerLocalized("Reading images"), systemImage: "checkmark")
-                } else {
-                  Button(routerLocalized("Use for image reading")) {
-                    Task { await store.useLocalVisionModel(model.tag) }
-                  }
-                  .disabled(busy)
-                }
-              }
-              Divider()
-              Button(routerLocalized("Remove model"), role: .destructive) {
-                armedRemoval = model.tag
-              }
-              .disabled(busy)
-            } label: {
-              Image(systemName: "ellipsis")
-                .font(.system(size: 10, weight: .semibold))
-                .frame(width: 16, height: 16)
-                .contentShape(Rectangle())
-            }
-            .menuStyle(.borderlessButton)
-            .buttonStyle(.borderless)
-            .accessibilityLabel(
-              RouterLanguage.isSimplifiedChinese
-                ? "\(model.tag) 的操作"
-                : "Actions for \(model.tag)"
-            )
-          }
-          if let operation {
-            HStack(spacing: 7) {
-              OperationPulse(tint: routerRed)
-              Text("\(operation.kind.label)…")
-                .font(.system(size: 9, weight: .semibold))
-                .foregroundStyle(routerRed)
-              ProgressView()
-                .controlSize(.mini)
-                .tint(routerRed)
-            }
-            .transition(.opacity.combined(with: .scale(scale: 0.97, anchor: .leading)))
-            .accessibilityElement(children: .combine)
-            .accessibilityLabel("\(operation.kind.label) \(model.tag)")
-          } else if let download = store.localDownload,
-            download.isRunning,
-            download.tag == model.tag {
-            downloadBar(tag: nil, percent: download.percent)
-          } else {
-            if store.benchmarkingTag == model.tag {
-              Text(routerLocalized("testing…"))
-                .font(.system(size: 9, weight: .medium))
-                .foregroundStyle(routerYellow)
-            } else {
-              roleLine(model)
-            }
-          }
-          if armedRemoval == model.tag {
-            HStack(spacing: 6) {
-              Text(routerLocalized("Confirm removal?"))
-                .font(.system(size: 8, weight: .medium))
-                .foregroundStyle(routerRed)
-              Button(routerLocalized("Confirm")) {
-                armedRemoval = nil
-                Task { await store.uninstallLocalModel(model.tag) }
-              }
-              .buttonStyle(.borderless)
-              .font(.system(size: 8, weight: .semibold))
-              .foregroundStyle(routerRed)
-              .disabled(busy)
-              Button(routerLocalized("Cancel")) { armedRemoval = nil }
-                .buttonStyle(.borderless)
-                .font(.system(size: 8))
-                .foregroundStyle(routerMutedStrong)
-            }
-          }
-        }
-      }
-      .padding(.horizontal, 2)
-      .animation(.easeOut(duration: 0.2), value: operation)
-    }
 
     // What this model is for, in one truncating phrase rather than a row of
     // competing badges: its Codex role first, then how well it reads images if
     // that has been measured.
-    @ViewBuilder private func roleLine(_ model: InstalledLocalModel) -> some View {
-      HStack(spacing: 5) {
-        Text(localRoleLabel(model))
-          .foregroundStyle(localRoleColor(model))
-        if let accuracy = model.accuracy, model.vision {
-          Text("· \(RouterLanguage.isSimplifiedChinese ? routerLocalized(accuracy) : accuracy)")
-            .foregroundStyle(accuracy == "accurate" ? routerMint : routerRed)
-        }
-        if let speed = model.tokensPerSecond {
-          Text("· \(String(format: "%.1f", speed)) tok/s")
-            .foregroundStyle(routerMutedStrong)
-            .monospacedDigit()
-        } else {
-          Text("· \(routerLocalized("speed unmeasured"))")
-            .foregroundStyle(routerMuted)
-        }
-      }
-      .font(.system(size: 9))
-      .lineLimit(1)
-    }
 
-    private func localRoleLabel(_ model: InstalledLocalModel) -> String {
-      if model.canBeChatModel { return model.chatRoleLabel }
-      return model.vision ? routerLocalized("vision only — no tools") : model.chatRoleLabel
-    }
-
-    private func localRoleColor(_ model: InstalledLocalModel) -> Color {
-      if model.chatRoleGood { return routerMint }
-      return model.canBeChatModel || model.vision ? routerYellow : routerMutedStrong
-    }
-
-    private var localModels: LocalModelsSnapshot? { settings?.localModels }
-
-    private var localCatalogFamilies: [LocalCatalogFamily] {
-      let allModels = localModels?.availableExplore ?? []
-      let query = localCatalogFilter.trimmingCharacters(in: .whitespacesAndNewlines)
-        .localizedLowercase
-      let filtered = query.isEmpty
-        ? allModels
-        : allModels.filter { model in
-          [model.tag, model.family ?? "", model.displayName ?? ""]
-            .contains { $0.localizedLowercase.contains(query) }
-        }
-      let grouped = Dictionary(grouping: filtered, by: localCatalogFamilyID)
-      return grouped
-        .map { family, models in
-          let sorted = models.sorted { localVariantSort($0, $1) }
-          let research = sorted.first
-          return LocalCatalogFamily(
-            family: family,
-            displayName: localCatalogFamilyName(family),
-            models: sorted,
-            researchStatus: research?.researchStatus,
-            researchCapabilities: research?.researchCapabilities ?? [],
-            researchNote: research?.researchNote
-          )
-        }
-        .sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
-    }
-
-    private func localCatalogFamilyID(_ model: AvailableLocalModel) -> String {
-      if let family = model.family, !family.isEmpty { return family }
-      return model.tag.split(separator: ":", maxSplits: 1).first.map(String.init) ?? model.tag
-    }
-
-    private func localCatalogFamilyName(_ family: String) -> String {
-      guard let label = localModels?.families?.first(where: { $0.family == family })?.displayName else {
-        return family
-      }
-      return label.components(separatedBy: " · ").first ?? label
-    }
-
-    private func localVariantSort(_ left: AvailableLocalModel, _ right: AvailableLocalModel) -> Bool {
-      let leftLatest = left.variant == "latest"
-      let rightLatest = right.variant == "latest"
-      if leftLatest != rightLatest { return leftLatest }
-      let leftFits = localModelFits(left)
-      let rightFits = localModelFits(right)
-      if leftFits != rightFits { return leftFits }
-      if left.sizeGb != right.sizeGb { return left.sizeGb < right.sizeGb }
-      return left.tag.localizedCaseInsensitiveCompare(right.tag) == .orderedAscending
-    }
-
-    private func localPreviewVariants(
-      in models: [AvailableLocalModel],
-      excluding recommended: AvailableLocalModel?
-    ) -> [AvailableLocalModel] {
-      let candidates = models.filter { $0.tag != recommended?.tag }
-      let previewLimit = recommended == nil ? 3 : 2
-      var selected: [AvailableLocalModel] = []
-      var sizes = Set<String>()
-
-      func add(_ model: AvailableLocalModel?) {
-        guard let model, selected.count < previewLimit else { return }
-        // `latest` and a plain size tag often point to the same digest. Avoid
-        // showing two rows for one download while leaving every exact tag in
-        // the full list.
-        let sizeKey = model.downloadable == false
-          ? "cloud"
-          : String(format: "%.1f", model.sizeGb)
-        guard sizes.insert(sizeKey).inserted else { return }
-        selected.append(model)
-      }
-
-      add(candidates.first(where: { $0.variant == "latest" }))
-
-      let standard = candidates.filter { localVariantIsStandard($0) }
-      add(standard.first(where: localModelFits))
-      add(standard.last(where: localModelFits))
-      add(candidates.first(where: { $0.downloadable == false }))
-      add(standard.first)
-      add(candidates.first)
-      return selected
-    }
-
-    private func localVariantIsStandard(_ model: AvailableLocalModel) -> Bool {
-      guard let variant = model.variant?.lowercased(), !variant.isEmpty else { return false }
-      if variant == "latest" || variant == "cloud" { return true }
-      // Plain size tags such as `9b`, `35b`, or `e4b` are the understandable
-      // family choices. Everything with a suffix is a precision, runtime, or
-      // task-specific build and belongs behind “View all tags”.
-      return !variant.contains("-") && !variant.contains("_")
-    }
-
-    private func localModelFits(_ model: AvailableLocalModel) -> Bool {
-      model.downloadable != false
-        && model.fit != "too-large"
-        && model.diskFit != "too-large"
-    }
-
-  private func localFamilySummary(_ family: LocalCatalogFamily) -> String {
-    let fits = family.models.filter(localModelFits).count
-    let cloud = family.models.filter { $0.downloadable == false }.count
-    var parts = [RouterLanguage.isSimplifiedChinese ? "\(family.models.count) 个标签" : "\(family.models.count) tags"]
-    if fits > 0 {
-      parts.append(RouterLanguage.isSimplifiedChinese ? "\(fits) 个适配" : "\(fits) fit")
-    } else if cloud == family.models.count {
-      parts.append(routerLocalized("cloud only"))
-    } else {
-      parts.append(routerLocalized("none fit"))
-    }
-    if cloud > 0 && cloud < family.models.count {
-      parts.append(RouterLanguage.isSimplifiedChinese ? "\(cloud) 个云端" : "\(cloud) cloud")
-    }
-      return parts.joined(separator: " · ")
-    }
-
-    private func recommendedLocalVariant(in models: [AvailableLocalModel]) -> AvailableLocalModel? {
-      // A recommendation is useful only when it can actually run here. Do not
-      // relabel the smallest impossible download as a "best fit" choice.
-      return models.first(where: localModelFits)
-    }
 
     // Useful first: models that actually drive Codex, then the rest that can
     // chat, then image readers, then the ones that can do neither. A flat list
     // in this order groups by role without spending rows on group headers,
     // which the popover width cannot afford.
-    private var sortedLocalModels: [InstalledLocalModel] {
-      (localModels?.models ?? []).sorted {
-        if localRoleRank($0) != localRoleRank($1) {
-          return localRoleRank($0) < localRoleRank($1)
-        }
-        return $0.tag < $1.tag
-      }
-    }
 
-    private func localRoleRank(_ model: InstalledLocalModel) -> Int {
-      if model.chatRoleGood { return 0 }
-      if model.canBeChatModel { return 1 }
-      return model.vision ? 2 : 3
-    }
-
-    private func isVisionEngine(_ model: InstalledLocalModel) -> Bool {
-      vision?.engine == "local" && vision?.local?.model == model.tag
-    }
-
-    private var localLlmSummary: String {
-      if let download = store.localDownload, download.isRunning {
-        let tag = download.tag ?? routerLocalized("local model")
-        let percent = download.percent.map { " · \($0)%" } ?? ""
-        return "\(routerLocalized("Downloading")) \(tag)\(percent)"
-      }
-      if let download = store.localDownload, download.status == "error" {
-        return routerLocalized("Last download failed")
-      }
-      guard let localModels, localModels.installed > 0 else {
-        let available = localModels?.availableExplore?.count ?? 0
-        return available > 0
-          ? (RouterLanguage.isSimplifiedChinese ? "尚未安装 · 有 \(available) 个可用" : "none installed · \(available) available")
-          : routerLocalized("none installed")
-      }
-      let chat = localModels.usableAsChat ?? 0
-      let available = localModels.availableExplore?.count ?? 0
-      let suffix = available > 0 ? " · \(available) available" : ""
-      return RouterLanguage.isSimplifiedChinese
-        ? "已安装 \(localModels.installed) 个 · \(chat) 个可用于 Codex · \(String(format: "%.1f", localModels.totalGb)) GB\(suffix.replacingOccurrences(of: " available", with: " 个可用"))"
-        : "\(localModels.installed) installed · \(chat) for Codex · \(String(format: "%.1f", localModels.totalGb)) GB\(suffix)"
-    }
-
-    private var canInstall: Bool {
-      !busy && store.localDownload?.isRunning != true
-        && !installTag.trimmingCharacters(in: .whitespaces).isEmpty
-    }
-
-    private func submitInstall() {
-      let tag = installTag.trimmingCharacters(in: .whitespaces)
-      guard canInstall else { return }
-      installTag = ""
-      Task { await store.downloadLocalModel(tag) }
-    }
 
     // Lets a text-only model (DeepSeek, GLM, ...) answer about a pasted image by
     // having a vision model read it. The engine defaults to an enabled paid
@@ -5221,133 +3847,7 @@ private struct TrayView: View {
   // it, publishes into it, or republishes after the routable set changed. The
   // detail line says which of the three the click will do, so it is never a
   // surprise that it reached for the network.
-  private var harnessRow: some View {
-    let harness = store.snapshot.harness
-    let installed = harness?.installed == true
-    let published = harness?.published == true
-    let running = harness?.web?.running == true
-    let blocked = harness?.nodeSupported == false
-    return VStack(alignment: .leading, spacing: 6) {
-      HStack(spacing: 12) {
-        VStack(alignment: .leading, spacing: 3) {
-          Text(routerLocalized("DeepSeek Harness"))
-            .font(.system(size: 12, weight: .medium))
-          Text(harnessDetail(harness: harness, installed: installed, published: published))
-            .font(.system(size: 9))
-            .foregroundStyle(routerMuted)
-            .lineLimit(2)
-        }
-        Spacer(minLength: 8)
-        if store.harnessRunning {
-          ProgressView()
-            .controlSize(.small)
-            .tint(routerAccent)
-            .frame(width: 94)
-            .accessibilityLabel(routerLocalized("Setting up DeepSeek Harness"))
-        } else if running {
-          // Everything is in place, so the only thing left to want is the page.
-          Button {
-            store.openHarnessWeb()
-          } label: {
-            Label(routerLocalized("Open site"), systemImage: "arrow.up.forward.app")
-          }
-          .buttonStyle(AccentButtonStyle())
-          .help(routerLocalized("Open the DeepSeek Harness browser UI"))
-        } else if installed && published {
-          // Published but nothing serving: the state a machine reboots into.
-          // Starting is not republishing, so it does not rewrite the harness's
-          // documents to put a window back on screen.
-          Button {
-            Task { await store.startHarnessWeb() }
-          } label: {
-            Label(routerLocalized("Start"), systemImage: "play.circle")
-          }
-          .buttonStyle(AccentButtonStyle())
-          .disabled(store.providerOperation != nil || blocked)
-          .opacity(store.providerOperation == nil && !blocked ? 1 : 0.5)
-          .help(routerLocalized("Start the DeepSeek Harness browser UI"))
-        } else {
-          Button {
-            Task { await store.setupHarness() }
-          } label: {
-            Label(
-              installed ? routerLocalized("Connect") : routerLocalized("Install"),
-              systemImage: installed ? "link" : "arrow.down.circle"
-            )
-          }
-          .buttonStyle(AccentButtonStyle())
-          .disabled(store.providerOperation != nil || blocked)
-          .opacity(store.providerOperation == nil && !blocked ? 1 : 0.5)
-          .help(routerLocalized("Install DeepSeek Harness and publish this router's models into it"))
-        }
-        // The secondary action follows what is actually costing something.
-        // While the harness is resident that is memory and CPU, so the offer is
-        // to stop it; once it is stopped the only thing left to undo is the
-        // integration.
-        if !store.harnessRunning {
-          if running {
-            Button {
-              Task { await store.stopHarnessWeb() }
-            } label: {
-              Label(routerLocalized("Turn off"), systemImage: "stop.circle")
-            }
-            .buttonStyle(.borderless)
-            .font(.system(size: 10))
-            .foregroundStyle(routerMuted)
-            .disabled(store.providerOperation != nil)
-            .help(routerLocalized("Stop the harness process and free its memory and CPU"))
-          } else if published {
-            Button {
-              Task { await store.disconnectHarness() }
-            } label: {
-              Label(routerLocalized("Disconnect"), systemImage: "power")
-            }
-            .buttonStyle(.borderless)
-            .font(.system(size: 10))
-            .foregroundStyle(routerMuted)
-            .disabled(store.providerOperation != nil)
-            .help(routerLocalized("Remove this router's models from the harness, keeping the harness itself"))
-          }
-        }
-      }
-      if let message = store.harnessMessage {
-        Text(message)
-          .font(.system(size: 9))
-          .foregroundStyle(store.harnessSucceeded ? routerMint : routerRed.opacity(0.9))
-          .lineLimit(3)
-      }
-    }
-    .padding(10)
-    .background(
-      Color.primary.opacity(0.045),
-      in: RoundedRectangle(cornerRadius: 10, style: .continuous)
-    )
-  }
 
-  private func harnessDetail(
-    harness: RouterHarness?,
-    installed: Bool,
-    published: Bool
-  ) -> String {
-    guard let harness else { return routerLocalized("Checking…") }
-    if !harness.nodeSupported {
-      return routerFormat(
-        routerLocalized("Needs Node %@ or newer; this router runs Node %@"),
-        harness.minimumNode,
-        harness.nodeVersion
-      )
-    }
-    if !installed {
-      return routerLocalized("Not installed · installs the CLI, then publishes this router's models")
-    }
-    let version = harness.version.map { "v\($0)" } ?? routerLocalized("installed")
-    if let web = harness.web, web.running, let url = web.url {
-      return routerFormat(routerLocalized("%@ · running at %@"), version, url)
-    }
-    return published
-      ? routerFormat(routerLocalized("%@ · routed models published · not running"), version)
-      : routerFormat(routerLocalized("%@ · installed but not routed here yet"), version)
-  }
 
   private var maintenanceRow: some View {
     VStack(alignment: .leading, spacing: 6) {

@@ -100,3 +100,31 @@ func TestCommentedTemplateKeyIsNotConfigured(t *testing.T) {
 		t.Fatalf("commented key must not resolve, got %q %q", v, src)
 	}
 }
+
+// {VAR} 引用：读时展开 —— 同一文件随环境给出不同凭证，未设置的变量
+// 视为未配置（missing 会指出来），不认识的花括号是字面量。
+func TestConfigEnvReference(t *testing.T) {
+	st := openState(t)
+	r := New(st)
+	if err := st.WriteConfigCredential("zai-coding", "{ZAI_REF_TEST_KEY}"); err != nil {
+		t.Fatal(err)
+	}
+
+	// 变量未设置 → 未配置（不是字面量 "{ZAI_REF_TEST_KEY}"）。
+	if v, src := r.Resolve(testProvider()); v != "" || src != "" {
+		t.Fatalf("unset env ref must resolve to missing, got %q %q", v, src)
+	}
+
+	// 设置后 → 环境值经 config 来源进入。
+	t.Setenv("ZAI_REF_TEST_KEY", "sk-from-env")
+	if v, src := r.Resolve(testProvider()); v != "sk-from-env" || src != "config" {
+		t.Fatalf("env ref = %q %q", v, src)
+	}
+
+	// 混合形态：前缀 + 引用 + 字面量花括号（不合法名字不展开）。
+	t.Setenv("ZAI_REF_TEST_KEY", "mid")
+	st.WriteConfigCredential("zai-coding", "pre-{ZAI_REF_TEST_KEY}-{not-a-name}")
+	if v, _ := r.Resolve(testProvider()); v != "pre-mid-{not-a-name}" {
+		t.Fatalf("mixed ref = %q", v)
+	}
+}

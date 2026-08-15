@@ -14,6 +14,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/loyd/codex-router/internal/catalog"
+	"github.com/loyd/codex-router/internal/configfile"
 	"github.com/loyd/codex-router/internal/cred"
 	"github.com/loyd/codex-router/internal/registry"
 	"github.com/loyd/codex-router/internal/state"
@@ -111,6 +113,8 @@ func cmdControl(args []string) error {
 		return controlCredential(st, reg, rest[1:])
 	case len(rest) >= 1 && rest[0] == "config" && len(rest) >= 2:
 		return controlConfig(st, rest[1:])
+	case len(rest) >= 1 && rest[0] == "reload":
+		return controlReload(st, reg)
 	case len(rest) >= 1 && rest[0] == "account":
 		return controlAccount(*stateDir, reg)
 	case len(rest) >= 1 && rest[0] == "provider-usage":
@@ -151,6 +155,7 @@ func controlUsage() {
   control credential PROVIDER             write api_key to config.toml (stdin prompt)
   control credential PROVIDER --remove    remove the provider's config.toml table
   control config init                     write the commented config.toml template
+  control reload                          re-read config + refresh catalog, no restart
   control presence set always|follow-codex
   control account --json | control provider-usage --json
   control vision-bridge pull TAG | pull-status | benchmark [TAG] | catalog
@@ -495,6 +500,63 @@ func controlConfig(st *state.State, args []string) error {
 	default:
 		return fmt.Errorf("unknown config action %q", args[0])
 	}
+}
+
+// controlReload：不重启的"重新加载"。凭证本来逐请求解析（config.toml
+// 改了即生效），这里补齐另外两样会滞留的东西：模型 catalog（需要
+// codex 抓原生条目）与 config.toml 集成块。同时整文校验 config.toml
+// —— 坏文件在此给出带行号的错误，而不是在每个请求上静默变成
+// "missing"。服务进程全程不动。
+func controlReload(st *state.State, reg *registry.Registry) error {
+	if err := st.ConfigParseError(); err != nil {
+		return fmt.Errorf("config.toml: %w", err)
+	}
+	enabled := map[string]bool{}
+	for _, id := range st.EnabledProviders() {
+		enabled[id] = true
+	}
+
+	// catalog 刷新（原生抓取失败不阻塞 —— 与 install 同策略）。
+	mergedPath := filepath.Join(st.Dir, "merged-models.json")
+	count, err := catalog.Refresh("codex", mergedPath, reg, func(providerID string) bool {
+		return enabled[providerID] || enabled[reg.CanonicalProviderID(providerID)]
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[reload] native catalog capture failed: %v (catalog kept)\n", err)
+	}
+
+	// config.toml 集成块重发布（caller key 不变 → Codex 无感）。
+	callerKey, err := st.CallerKey()
+	if err != nil {
+		return err
+	}
+	absState, err := filepath.Abs(st.Dir)
+	if err != nil {
+		return err
+	}
+	if err := configfile.Install(codexConfigPath(), configfile.RouterConfig{
+		BaseURL:     fmt.Sprintf("http://127.0.0.1:%d/_codex-router/%s/v1", defaultPort(), callerKey),
+		CatalogPath: filepath.Join(absState, "merged-models.json"),
+	}); err != nil {
+		return err
+	}
+
+	fmt.Printf("reloaded: %d models published, config.toml integration refreshed\n", count)
+	resolver := cred.New(st)
+	for _, id := range st.EnabledProviders() {
+		p := reg.Providers[id]
+		if p == nil {
+			continue
+		}
+		value, source := resolver.Resolve(p)
+		if value == "" {
+			fmt.Printf("  credential %s: missing\n", id)
+		} else {
+			fmt.Printf("  credential %s: %s\n", id, source)
+		}
+	}
+	fmt.Println("service process untouched — credentials apply per request")
+	return nil
 }
 
 func stdinFile() *os.File { return os.Stdin }

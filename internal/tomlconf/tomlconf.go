@@ -15,6 +15,7 @@ package tomlconf
 
 import (
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 )
@@ -334,4 +335,54 @@ func tableSpan(lines []string, table string) (int, int) {
 		}
 	}
 	return start, end
+}
+
+// ExpandEnv 把值里的 {NAME} 引用替换为环境变量。解析时不动、解析后
+// 展开 —— 同一文件在不同环境下给出不同凭证，且永远不需要重启。
+// 未设置的环境变量展开为空串（配置引用了不存在的变量 = 未配置，
+// doctor 的 missing 报告会指出来）；不认识的形状（{a-b}、{}、{{}}）
+// 原样保留 —— 它们可能就是字面量的一部分。
+func ExpandEnv(value string) string {
+	var sb strings.Builder
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if c != '{' {
+			sb.WriteByte(c)
+			continue
+		}
+		end := strings.IndexByte(value[i:], '}')
+		if end < 0 {
+			sb.WriteByte(c)
+			continue
+		}
+		name := value[i+1 : i+end]
+		if !envName(name) {
+			sb.WriteByte(c)
+			continue
+		}
+		sb.WriteString(os.Getenv(name))
+		i += end
+	}
+	return sb.String()
+}
+
+// envName：环境变量名的形状（字母数字下划线，不以数字开头）。
+// 收窄是有意的 —— {some-prose} 是字面量，不是引用。
+func envName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c == '_':
+		case c >= '0' && c <= '9':
+			if i == 0 {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
 }

@@ -282,7 +282,12 @@ func (s *State) ReadConfigCredential(table string) (string, bool) {
 		return "", false
 	}
 	value, ok := doc.Get(table, "api_key")
-	if !ok || strings.TrimSpace(value) == "" {
+	if !ok {
+		return "", false
+	}
+	// {VAR} 引用在读取时展开 —— 换环境不改文件，改文件不重启。
+	value = tomlconf.ExpandEnv(value)
+	if strings.TrimSpace(value) == "" {
 		return "", false
 	}
 	return value, true
