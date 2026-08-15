@@ -40,6 +40,8 @@ func main() {
 		err = cmdInstall(os.Args[2:])
 	case "uninstall":
 		err = cmdUninstall(os.Args[2:])
+	case "discover":
+		err = cmdDiscover(os.Args[2:])
 	case "doctor":
 		err = cmdDoctor(os.Args[2:])
 	case "control":

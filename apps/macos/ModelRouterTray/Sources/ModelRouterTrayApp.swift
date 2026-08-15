@@ -66,7 +66,7 @@ struct ModelRouterTrayApp: App {
       TrayView(store: store, presentation: .menuBar)
         .frame(width: 352, height: 560)
     } label: {
-      StatusItemLabel(store: store)
+      RouterMenuBarIcon()
     }
     .menuBarExtraStyle(.window)
   }
@@ -2591,52 +2591,69 @@ struct ProviderSetupState: Decodable, Identifiable, Equatable {
   let anonymousNote: String?
 }
 
-private struct StatusItemLabel: View {
-  @ObservedObject var store: RouterStore
-  @State private var pulsing = false
-  private static let reservedWidth: CGFloat = 180
+/// 菜单栏必须使用无背景的单色 template mark；Dock 的 AppIcon 含深色底和
+/// 渐变，直接缩到 18 pt 会显得像一颗不协调的按钮。这里保留 AppIcon 的
+/// “一个请求分流到多个模型”语义，并让 `.primary` 在深色菜单栏呈白色、
+/// 在浅色菜单栏自动变深，始终保持可见。
+private struct RouterMenuBarIcon: View {
+  private let canvasSize: CGFloat = 20
 
   var body: some View {
-    HStack(spacing: 5) {
-      Circle()
-        .fill(store.activityState.tint)
-        .frame(width: 6, height: 6)
-        // Opening a menu bar app gives the user nothing to look at, so the
-        // status dot answers instead. SwiftUI offers no supported way to open a
-        // MenuBarExtra window programmatically -- the usual trick reaches into
-        // the private NSStatusItem behind it -- and a dot that visibly reacts is
-        // worth more than a private API that breaks on the next macOS release.
-        .scaleEffect(pulsing ? 2.1 : 1)
-        .opacity(pulsing ? 0.55 : 1)
-        .animation(.easeOut(duration: 0.45), value: pulsing)
-        .onChange(of: store.attentionPulse) { _ in
-          pulsing = true
-          Task {
-            try? await Task.sleep(for: .milliseconds(450))
-            pulsing = false
-          }
-        }
-      Text(store.hasConcurrentActivity ? store.activitySummaryLabel : store.selectedUsageProvider.shortName)
-        .font(.system(size: 11, weight: .medium, design: .rounded))
-        .lineLimit(1)
-        .truncationMode(.tail)
-      if store.hasConcurrentActivity {
-        Text(store.compactActivityProvidersLabel)
-          .font(.system(size: 10, weight: .medium, design: .rounded))
-          .foregroundStyle(routerMuted)
-          .lineLimit(1)
-          .truncationMode(.tail)
-      } else if let usage = store.selectedUsageText {
-        Text(usage)
-          .font(.system(size: 10, weight: .medium, design: .monospaced))
-          .foregroundStyle(routerMuted)
-          .lineLimit(1)
-          .truncationMode(.tail)
+    Canvas { context, size in
+      let scale = min(size.width, size.height) / canvasSize
+      let offsetX = (size.width - canvasSize * scale) / 2
+      let offsetY = (size.height - canvasSize * scale) / 2
+      func point(_ x: CGFloat, _ y: CGFloat) -> CGPoint {
+        CGPoint(x: offsetX + x * scale, y: offsetY + y * scale)
+      }
+
+      // 一个入站节点连接三个可选上游；曲线在小尺寸下比直角分叉更清晰。
+      var links = Path()
+      links.move(to: point(2.5, 10))
+      links.addLine(to: point(8, 10))
+      links.move(to: point(8, 10))
+      links.addCurve(
+        to: point(16.5, 4),
+        control1: point(10.5, 10),
+        control2: point(12.5, 4)
+      )
+      links.move(to: point(8, 10))
+      links.addLine(to: point(16.5, 10))
+      links.move(to: point(8, 10))
+      links.addCurve(
+        to: point(16.5, 16),
+        control1: point(10.5, 10),
+        control2: point(12.5, 16)
+      )
+      context.stroke(
+        links,
+        with: .color(.primary),
+        style: StrokeStyle(lineWidth: 1.8 * scale, lineCap: .round, lineJoin: .round)
+      )
+
+      let nodes: [(x: CGFloat, y: CGFloat, radius: CGFloat)] = [
+        (2.5, 10.0, 1.45),
+        (8.0, 10.0, 1.55),
+        (16.5, 4.0, 1.35),
+        (16.5, 10.0, 1.35),
+        (16.5, 16.0, 1.35),
+      ]
+      for (x, y, radius) in nodes {
+        let center = point(x, y)
+        let diameter = radius * 2 * scale
+        context.fill(
+          Path(ellipseIn: CGRect(
+            x: center.x - diameter / 2,
+            y: center.y - diameter / 2,
+            width: diameter,
+            height: diameter
+          )),
+          with: .color(.primary)
+        )
       }
     }
-    // Keep the NSStatusItem anchor stable while activity text changes.
-    .frame(width: Self.reservedWidth, alignment: .leading)
-    .clipped()
+    .frame(width: 18, height: 18)
+    .accessibilityLabel("Model Router")
   }
 }
 

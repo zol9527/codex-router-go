@@ -11,6 +11,8 @@ import (
 	"os"
 	"regexp"
 	"strings"
+
+	"github.com/loyd/codex-router/internal/state"
 	"time"
 
 	"github.com/loyd/codex-router/internal/httpx"
@@ -341,11 +343,22 @@ func (s *Server) serveRouted(w http.ResponseWriter, r *http.Request,
 	s.bridgeVision(w, r, payload, model)
 
 	// 请求方向 aging：老的大工具结果换回执，最新 frontier 逐字节保留。
+	// 开关读状态文件（与凭证同一模式：改文件即时生效，无需重启）；
+	// 统计只在"实际发生了老化"的回合累计落盘 —— 零老化回合不写盘。
 	aging := translate.AgingStats{}
-	if input, ok := payload["input"].([]any); ok {
-		aged, stats := translate.AgeToolResults(input)
-		payload["input"] = aged
-		aging = stats
+	if enabled, _ := state.ReadToolResultAging(s.opt.State.Dir); enabled {
+		if input, ok := payload["input"].([]any); ok {
+			aged, stats := translate.AgeToolResults(input)
+			payload["input"] = aged
+			aging = stats
+			if stats.ToolResultsAged > 0 {
+				state.RecordAgingStats(s.opt.State.Dir, state.AgingStats{
+					ResultsAged:          stats.ToolResultsAged,
+					BytesSaved:           stats.ToolResultBytesSaved,
+					EstimatedTokensSaved: stats.ToolResultBytesSaved / 4,
+				})
+			}
+		}
 	}
 	setAging(aging)
 

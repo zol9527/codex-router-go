@@ -117,6 +117,8 @@ func cmdControl(args []string) error {
 		return controlSubagents(st, reg, rest[1:])
 	case len(rest) >= 1 && rest[0] == "picker":
 		return controlPicker(st, reg, rest[1:])
+	case len(rest) >= 1 && rest[0] == "tool-result-aging":
+		return controlToolResultAging(st, rest[1:])
 	case len(rest) >= 1 && rest[0] == "reload":
 		return controlReload(st, reg)
 	case len(rest) >= 1 && rest[0] == "account":
@@ -162,6 +164,7 @@ func controlUsage() {
   control reload                          re-read config + refresh catalog, no restart
   control subagents status|mode <m>|select-all|unselect-all|set <slug> on|off|provider <id> on|off
   control picker set <slug> show|hide | provider <id> show|hide | all show|hide | status
+  control tool-result-aging status|on|off
   control presence set always|follow-codex
   control account --json | control provider-usage --json
   control vision-bridge pull TAG | pull-status | benchmark [TAG] | catalog
@@ -248,13 +251,14 @@ func controlJSON(st *state.State, reg *registry.Registry) error {
 		// App 设置页的「Subagent models / Model picker」区块数据源
 		//（tray 的 ModelSettingsSnapshot 解码器）。
 		"modelSettings": map[string]any{
-			"subagents": state.SubagentSettingsSnapshot(st.Dir),
-			"picker":    state.PickerSnapshot(st.Dir),
+			"subagents":       state.SubagentSettingsSnapshot(st.Dir),
+			"picker":          state.PickerSnapshot(st.Dir),
+			"toolResultAging": state.ToolResultAgingSnapshot(st.Dir),
 		},
 	}
 	payload := map[string]any{
-		"targets":  map[string]any{"codex": target},
-		"version":  version,
+		"targets": map[string]any{"codex": target},
+		"version": version,
 		// presence 块：tray 读 effectiveMode 而非自行推导
 		//（两边各自推导必然漂移）。
 		"presence": state.PresenceSnapshot(st.Dir),
@@ -740,4 +744,26 @@ func controlPicker(st *state.State, reg *registry.Registry, args []string) error
 		return err
 	}
 	return printSnapshot()
+}
+
+// controlToolResultAging：老化开关面（App 设置页的开关走这里）。
+// 开关读的是状态文件、服务端逐请求读取 —— 改完下一回合即生效，
+// 无需重启服务。
+func controlToolResultAging(st *state.State, args []string) error {
+	action := "status"
+	if len(args) > 0 {
+		action = args[0]
+	}
+	switch action {
+	case "status":
+	case "on", "off":
+		if err := state.SetToolResultAgingEnabled(st.Dir, action == "on"); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("usage: control tool-result-aging status|on|off")
+	}
+	raw, _ := json.MarshalIndent(state.ToolResultAgingSnapshot(st.Dir), "", "  ")
+	fmt.Println(string(raw))
+	return nil
 }
