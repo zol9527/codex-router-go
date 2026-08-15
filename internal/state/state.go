@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 
 	"github.com/loyd/codex-router/internal/tomlconf"
 )
@@ -286,11 +287,30 @@ func (s *State) ReadConfigCredential(table string) (string, bool) {
 		return "", false
 	}
 	// {VAR} 引用在读取时展开 —— 换环境不改文件，改文件不重启。
+	// 引用了未设置的变量时，除了返回"未配置"，还要把悬空的变量名
+	// 指出来（providers/doctor 报 "no-key" 却不说为什么，排查要翻
+	// 文件；这里记录最后一次悬空引用供诊断面读取）。
+	if strings.HasPrefix(value, "{") && strings.HasSuffix(value, "}") {
+		if name := tomlconf.EnvRefName(value); name != "" && os.Getenv(name) == "" {
+			lastDanglingEnvRef.Store([2]string{table, name})
+		}
+	}
 	value = tomlconf.ExpandEnv(value)
 	if strings.TrimSpace(value) == "" {
 		return "", false
 	}
 	return value, true
+}
+
+// lastDanglingEnvRef 记录最近一次悬空的 {VAR} 引用（provider, var）。
+var lastDanglingEnvRef atomic.Value
+
+// DanglingEnvRef 返回最近的悬空引用（没有则空）。
+func DanglingEnvRef() (provider, name string) {
+	if v, ok := lastDanglingEnvRef.Load().([2]string); ok {
+		return v[0], v[1]
+	}
+	return "", ""
 }
 
 // WriteConfigCredential 原子改写 config.toml 的 [table].api_key，

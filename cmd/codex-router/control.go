@@ -425,6 +425,8 @@ func controlProvidersList(st *state.State, reg *registry.Registry, asJSON bool) 
 		credState := "no-key"
 		if source != "" {
 			credState = "key:" + source
+		} else if provider, name := state.DanglingEnvRef(); provider == p.ID {
+			credState = "no-key (config.toml references unset variable " + name + ")"
 		}
 		fmt.Printf("%-16s %-24s %-8s %s\n", p.ID, p.DisplayName, status, credState)
 	}

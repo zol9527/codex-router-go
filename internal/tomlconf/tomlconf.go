@@ -386,3 +386,15 @@ func envName(name string) bool {
 	}
 	return true
 }
+
+// EnvRefName：值若恰为一个 {NAME} 引用则返回 NAME，否则空串。
+func EnvRefName(value string) string {
+	if len(value) < 3 || value[0] != '{' || value[len(value)-1] != '}' {
+		return ""
+	}
+	name := value[1 : len(value)-1]
+	if !envName(name) {
+		return ""
+	}
+	return name
+}

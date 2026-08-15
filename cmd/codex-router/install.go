@@ -265,7 +265,11 @@ func cmdDoctor(args []string) error {
 		value, source := resolver.Resolve(p)
 		label := fmt.Sprintf("credential %s", id)
 		if value == "" {
-			check(label, false, "missing (env/file/keychain)")
+			detail := "missing (env/file/keychain)"
+			if provider, name := state.DanglingEnvRef(); provider == id {
+				detail = fmt.Sprintf("config.toml references unset variable %s — export it or paste the key literally", name)
+			}
+			check(label, false, detail)
 		} else {
 			check(label, true, "source="+source)
 		}
