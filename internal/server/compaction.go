@@ -13,6 +13,9 @@ import (
 	"github.com/loyd/codex-router/internal/registry"
 	"github.com/loyd/codex-router/internal/translate"
 	"github.com/loyd/codex-router/internal/usage"
+	"github.com/loyd/codex-router/internal/wire"
+	_ "github.com/loyd/codex-router/internal/wire/chatcompletion"
+	_ "github.com/loyd/codex-router/internal/wire/responses"
 )
 
 // routed compaction，移植自 router.mjs 的 compaction 族函数。
@@ -93,14 +96,21 @@ func (s *Server) handleRoutedCompaction(w http.ResponseWriter, r *http.Request,
 	delete(compactionPayload, "previous_response_id")
 	delete(compactionPayload, "client_metadata")
 
-	chat, err := translate.TranslateToChat(compactionPayload)
+	// 压缩同样经协议抽象层：provider 声明的协议决定上游形态
+	//（chat 翻译或 Responses 直通；流强制非流式）。
+	proto, err := wire.ForProvider(provider)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, errBody("protocol_unavailable", err.Error()))
+		return
+	}
+	prepared, err := proto.Prepare(compactionPayload, model)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", err.Error()))
 		return
 	}
-	translate.ApplyRequestProfile(chat.Body, chat.RequestedEffort, model)
-	chat.Body["model"] = model.UpstreamModel
-	normalized, err := json.Marshal(chat.Body)
+	prepared.Stream = false
+	prepared.Accept = "application/json"
+	normalized, err := json.Marshal(prepared.Body)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", "Unable to encode request."))
 		return
@@ -108,8 +118,8 @@ func (s *Server) handleRoutedCompaction(w http.ResponseWriter, r *http.Request,
 
 	headers := translate.UpstreamHeadersFrom(headerMap(r.Header), credential, Version)
 	headers["Content-Type"] = "application/json"
-	headers["Accept"] = "application/json"
-	target := strings.TrimSuffix(providerBaseURL(provider), "/") + "/chat/completions"
+	headers["Accept"] = prepared.Accept
+	target := strings.TrimSuffix(providerBaseURL(provider), "/") + prepared.Path
 
 	resp, _, err := httpx.FetchWithRetry(r.Context(), http.MethodPost, target, headers, normalized, httpx.DefaultRetryOptions())
 	if err != nil {
@@ -150,7 +160,9 @@ func (s *Server) handleRoutedCompaction(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
-	summary := extractChatResponseText(chatBody)
+	// 统一翻译回 Responses 形态再提取（协议无关）。
+	responseJSON := proto.TranslateNonStream(chatBody, model, wire.StreamOptions{})
+	summary := extractResponsesSummaryText(responseJSON)
 	usageTokens := chatUsageTokens(chatBody)
 
 	if !v2 {
@@ -289,6 +301,26 @@ func extractChatResponseText(body map[string]any) string {
 				}
 			}
 			return buf.String()
+		}
+	}
+	return ""
+}
+
+// extractResponsesSummaryText 从 Responses 形态 JSON 提取 assistant 文本。
+func extractResponsesSummaryText(response map[string]any) string {
+	output, _ := response["output"].([]any)
+	for _, raw := range output {
+		item, ok := raw.(map[string]any)
+		if !ok || item["type"] != "message" {
+			continue
+		}
+		content, _ := item["content"].([]any)
+		for _, partRaw := range content {
+			if part, ok := partRaw.(map[string]any); ok {
+				if text, ok := part["text"].(string); ok && text != "" {
+					return text
+				}
+			}
 		}
 	}
 	return ""

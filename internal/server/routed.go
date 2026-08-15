@@ -17,6 +17,9 @@ import (
 	"github.com/loyd/codex-router/internal/registry"
 	"github.com/loyd/codex-router/internal/translate"
 	"github.com/loyd/codex-router/internal/usage"
+	"github.com/loyd/codex-router/internal/wire"
+	_ "github.com/loyd/codex-router/internal/wire/chatcompletion"
+	_ "github.com/loyd/codex-router/internal/wire/responses"
 )
 
 // handleResponses 是 /responses 主入口：按 model 分流。
@@ -84,8 +87,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request, route s
 	}
 
 	// compaction 分流：v1 是 /responses/compact 路径；v2 是 input 尾部
-	// 的 compaction_trigger。压缩重放整个会话，永远走 chat 翻译路径
-	//（opencode-go-responses 也一样——上游是同一个 provider）。
+	// 的 compaction_trigger。压缩经协议抽象层走 provider 声明的协议。
 	compactV1 := strings.HasSuffix(route, "/responses/compact")
 	compactV2 := isCompactionV2(payload)
 	if compactV1 || compactV2 {
@@ -93,11 +95,10 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request, route s
 		return
 	}
 
-	if provider.Protocol == "openai-responses" {
-		s.serveResponsesPassthrough(w, r, payload, routeModel, provider, credential, started)
-		return
-	}
-	s.serveChatTranslation(w, r, payload, routeModel, provider, credential, started)
+	// 全部路由流量经协议抽象层：provider 声明协议（chat 翻译 / Responses
+	// 直通 / 未来新增），server 管线（守卫、aging、namespace、计量）
+	// 协议无关。
+	s.serveRouted(w, r, payload, routeModel, provider, credential, started)
 }
 
 // handleNativeTurn：未命中注册表的模型按 native 流量直连。
@@ -141,58 +142,11 @@ func (s *Server) handleNativeTurn(w http.ResponseWriter, r *http.Request, route 
 
 // ---- Responses 直通（opencode-go-responses）----
 
-// serveResponsesPassthrough：上游原生说 Responses，只需替换 model、
-// 注入凭据、剥掉路由标记头，协议本身不动。
-func (s *Server) serveResponsesPassthrough(w http.ResponseWriter, r *http.Request,
-	payload map[string]any, model *registry.Model, provider *registry.Provider,
-	credential string, started time.Time) {
-
-	translated := cloneMap(payload)
-	translated["model"] = model.UpstreamModel
-	delete(translated, "client_metadata")
-	// Responses 端点形态：store/include 等 Codex 字段上游认得，保留。
-	normalized, err := json.Marshal(translated)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", "Unable to encode request."))
-		return
-	}
-	headers := translate.UpstreamHeadersFrom(headerMap(r.Header), credential, Version)
-	headers["Content-Type"] = "application/json"
-	if stream, ok := translated["stream"].(bool); ok && stream {
-		headers["Accept"] = "text/event-stream"
-	}
-	target := strings.TrimSuffix(providerBaseURL(provider), "/") + "/responses"
-	resp, _, err := httpx.FetchWithRetry(r.Context(), http.MethodPost, target, headers, normalized, httpx.DefaultRetryOptions())
-	if err != nil {
-		writeJSON(w, http.StatusBadGateway, errBody("provider_api_proxy_error",
-			"The API-provider forwarder could not complete the request."))
-		return
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		retryAfter := 0
-		if ra := resp.Header.Get("Retry-After"); ra != "" {
-			fmt.Sscanf(ra, "%d", &retryAfter)
-		}
-		s.writeUpstreamError(w, provider, model, &upstreamFailure{
-			status: resp.StatusCode, bodyText: string(raw), retryAfter: retryAfter,
-		})
-		return
-	}
-	s.relayResponse(w, resp)
-	s.recordTurn(usage.Event{Model: model.Slug,
-		Provider: s.opt.Registry.CanonicalProviderID(provider.ID),
-		Status:   resp.StatusCode, DurationMs: time.Since(started).Milliseconds()})
-	logf("model=%s provider=%s status=%d duration_ms=%d",
-		model.Slug, provider.ID, resp.StatusCode, time.Since(started).Milliseconds())
-}
-
 // ---- Responses → chat completions 翻译路径 ----
 
 // attemptOutcome 是一次上游流尝试的完整结果：翻译器 + 累积的事件字节。
 type attemptOutcome struct {
-	translator *translate.ChatToResponsesSSE
+	translator wire.StreamTranslator
 	events     *translate.OutputBuffer
 	status     int
 }
@@ -292,7 +246,7 @@ func (sr *streamRelay) finishFlushWith(payload []byte) error {
 // 守卫直写 client（liveness 起）；relay 为 nil 时全部累积在 events 缓冲
 // （隐形重试的第二次尝试用 —— 判定完再决定写不写）。
 func (s *Server) runChatAttempt(ctx context.Context, target string, headers map[string]string,
-	body []byte, model *registry.Model, estimate int, nsIndex *translate.NamespaceIndex,
+	body []byte, model *registry.Model, proto wire.Protocol, opts wire.StreamOptions,
 	relay *streamRelay) (*attemptOutcome, error) {
 
 	resp, _, err := httpx.FetchWithRetry(ctx, http.MethodPost, target, headers, body, httpx.DefaultRetryOptions())
@@ -315,9 +269,7 @@ func (s *Server) runChatAttempt(ctx context.Context, target string, headers map[
 			status: resp.StatusCode, bodyText: string(raw), retryAfter: retryAfter,
 		}
 	}
-	translator := translate.NewChatToResponsesSSE("", model.UpstreamModel).
-		WithEstimatedInputTokens(estimate).
-		WithNamespaceIndex(nsIndex, model.Slug)
+	translator := proto.NewStreamTranslator(model, opts)
 	events := &translate.OutputBuffer{}
 	created := translator.Created()
 	events.Write(created)
@@ -367,7 +319,7 @@ func (s *Server) runChatAttempt(ctx context.Context, target string, headers map[
 // 管线：tool-result aging（请求方向）→ 翻译 → 上游 → 空补全守卫
 // （整流判定 + 同字节隐形重试一次）→ prompt-token 补零替换
 // （completed 事件内，只落在显式零上）→ usage 计量。
-func (s *Server) serveChatTranslation(w http.ResponseWriter, r *http.Request,
+func (s *Server) serveRouted(w http.ResponseWriter, r *http.Request,
 	payload map[string]any, model *registry.Model, provider *registry.Provider,
 	credential string, started time.Time) {
 
@@ -415,15 +367,17 @@ func (s *Server) serveChatTranslation(w http.ResponseWriter, r *http.Request,
 		nsIndex = flattened.Index()
 	}
 
-	chat, err := translate.TranslateToChat(payload)
+	proto, err := wire.ForProvider(provider)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, errBody("protocol_unavailable", err.Error()))
+		return
+	}
+	prepared, err := proto.Prepare(payload, model)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", err.Error()))
 		return
 	}
-	translate.ApplyRequestProfile(chat.Body, chat.RequestedEffort, model)
-	chat.Body["model"] = model.UpstreamModel
-
-	normalized, err := json.Marshal(chat.Body)
+	normalized, err := json.Marshal(prepared.Body)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", "Unable to encode request."))
 		return
@@ -440,12 +394,43 @@ func (s *Server) serveChatTranslation(w http.ResponseWriter, r *http.Request,
 
 	headers := translate.UpstreamHeadersFrom(headerMap(r.Header), credential, Version)
 	headers["Content-Type"] = "application/json"
-	headers["Accept"] = "text/event-stream"
-	target := strings.TrimSuffix(providerBaseURL(provider), "/") + "/chat/completions"
+	headers["Accept"] = prepared.Accept
+	target := strings.TrimSuffix(providerBaseURL(provider), "/") + prepared.Path
 
-	stream, _ := chat.Body["stream"].(bool)
-	if !stream {
-		headers["Accept"] = "application/json"
+	// 直通协议：上游本来就是 Responses，字节原样转发
+	//（守卫/翻译管线只服务需要翻译的协议）。
+	if !proto.NeedsResponseTranslation() {
+		resp, _, err := httpx.FetchWithRetry(r.Context(), http.MethodPost, target, headers, normalized, httpx.DefaultRetryOptions())
+		if err != nil {
+			writeJSON(w, http.StatusBadGateway, errBody("provider_api_proxy_error",
+				"The API-provider forwarder could not complete the request."))
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode >= 400 {
+			raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			retryAfter := 0
+			if ra := resp.Header.Get("Retry-After"); ra != "" {
+				fmt.Sscanf(ra, "%d", &retryAfter)
+			}
+			s.writeUpstreamError(w, provider, model, &upstreamFailure{
+				status: resp.StatusCode, bodyText: string(raw), retryAfter: retryAfter,
+			})
+			s.recordTurn(usage.Event{Model: model.Slug,
+				Provider: s.opt.Registry.CanonicalProviderID(provider.ID),
+				Status:   resp.StatusCode, DurationMs: time.Since(started).Milliseconds()})
+			return
+		}
+		s.relayResponse(w, resp)
+		s.recordTurn(usage.Event{Model: model.Slug,
+			Provider: s.opt.Registry.CanonicalProviderID(provider.ID),
+			Status:   resp.StatusCode, DurationMs: time.Since(started).Milliseconds()})
+		logf("model=%s provider=%s protocol=responses status=%d duration_ms=%d",
+			model.Slug, provider.ID, resp.StatusCode, time.Since(started).Milliseconds())
+		return
+	}
+
+	if !prepared.Stream {
 		resp, _, err := httpx.FetchWithRetry(r.Context(), http.MethodPost, target, headers, normalized, httpx.DefaultRetryOptions())
 		if err != nil {
 			writeJSON(w, http.StatusBadGateway, errBody("provider_api_proxy_error",
@@ -478,17 +463,18 @@ func (s *Server) serveChatTranslation(w http.ResponseWriter, r *http.Request,
 				"The upstream response was not valid JSON."))
 			return
 		}
-		translator := translate.NewChatToResponsesSSE("", model.UpstreamModel).
-			WithEstimatedInputTokens(estimate).
-			WithNamespaceIndex(nsIndex, model.Slug)
-		response := translate.TranslateNonStreamChatWith(chatBody, translator)
+		response := proto.TranslateNonStream(chatBody, model, wire.StreamOptions{
+			SessionModel: model.Slug, EstimateInput: estimate, NamespaceIndex: nsIndex,
+		})
 		writeJSON(w, http.StatusOK, response)
+		// 计量从翻译后的 Responses usage 读取（协议无关形状）。
+		inputTokens, outputTokens, totalTokens, substituted := usageFromResponsesJSON(response)
 		s.recordTurn(usage.Event{
 			Model: model.Slug, Provider: providerID, Status: 200,
 			DurationMs:  time.Since(started).Milliseconds(),
-			InputTokens: translator.PromptTokens(), OutputTokens: translator.OutputTokens(),
-			TotalTokens:          translator.TotalTokens(),
-			EstimatedInputTokens: int64(translator.SubstitutedInputTokens()),
+			InputTokens: inputTokens, OutputTokens: outputTokens,
+			TotalTokens:          totalTokens,
+			EstimatedInputTokens: int64(substituted),
 			ToolResultsAged:      aging.ToolResultsAged, ToolResultBytesSaved: aging.ToolResultBytesSaved,
 		})
 		return
@@ -500,7 +486,10 @@ func (s *Server) serveChatTranslation(w http.ResponseWriter, r *http.Request,
 	if canFlush {
 		relay.flusher = flusher
 	}
-	first, firstErr := s.runChatAttempt(r.Context(), target, headers, normalized, model, estimate, nsIndex, relay)
+	streamOpts := wire.StreamOptions{
+		SessionModel: model.Slug, EstimateInput: estimate, NamespaceIndex: nsIndex,
+	}
+	first, firstErr := s.runChatAttempt(r.Context(), target, headers, normalized, model, proto, streamOpts, relay)
 	if firstErr != nil {
 		var failure *upstreamFailure
 		if errors.As(firstErr, &failure) {
@@ -531,7 +520,7 @@ func (s *Server) serveChatTranslation(w http.ResponseWriter, r *http.Request,
 		} else {
 			// 静默空流：同字节同头隐形重试一次（client 一无所见）。
 			emptyRetried = true
-			second, secondErr := s.runChatAttempt(r.Context(), target, headers, normalized, model, estimate, nsIndex, nil)
+			second, secondErr := s.runChatAttempt(r.Context(), target, headers, normalized, model, proto, streamOpts, nil)
 			switch {
 			case secondErr != nil:
 				var failure *upstreamFailure
@@ -589,6 +578,22 @@ func (s *Server) serveChatTranslation(w http.ResponseWriter, r *http.Request,
 		chosen.translator.PromptTokens(), chosen.translator.OutputTokens(),
 		boolText(chosen.translator.SubstitutedInputTokens() > 0, " estimated-input=true"),
 		boolText(emptyCompletion, " empty-completion=true"))
+}
+
+// usageFromResponsesJSON 从 Responses 形态的响应体提取计量
+// （input/output/total tokens 与补零替换是否发生 —— 替换后的 input
+// 与 provider 原值无法在此区分，estimated 以 usage.total -
+// (input+output) 之差近似不可靠，改由翻译器在流路径精确报告；
+// 非流式路径按 Responses usage 原值记录）。
+func usageFromResponsesJSON(response map[string]any) (int64, int64, int64, int) {
+	usageField, _ := response["usage"].(map[string]any)
+	read := func(key string) int64 {
+		if v, ok := usageField[key].(float64); ok {
+			return int64(v)
+		}
+		return 0
+	}
+	return read("input_tokens"), read("output_tokens"), read("total_tokens"), 0
 }
 
 func boolText(cond bool, text string) string {
