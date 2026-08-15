@@ -273,6 +273,8 @@ func (s *State) ConfigPath() string {
 // 文件缺失或不含该表都返回无；解析失败同样返回无 —— 凭证解析在请求
 // 路径上，fail-closed 的"无凭证"比带病猜测安全（坏文件的可见性由
 // doctor/control 负责，那里会给出带行号的错误）。
+// {VAR} 引用先查进程环境，再查 config.toml [env].file 指向的环境文件
+// （GUI App 拉起的服务没有登录 shell 的环境，需要这条兜底路径）。
 func (s *State) ReadConfigCredential(table string) (string, bool) {
 	raw, err := os.ReadFile(s.ConfigPath())
 	if err != nil {
@@ -286,20 +288,39 @@ func (s *State) ReadConfigCredential(table string) (string, bool) {
 	if !ok {
 		return "", false
 	}
+	fallback := s.envFileFallback(doc)
 	// {VAR} 引用在读取时展开 —— 换环境不改文件，改文件不重启。
 	// 引用了未设置的变量时，除了返回"未配置"，还要把悬空的变量名
 	// 指出来（providers/doctor 报 "no-key" 却不说为什么，排查要翻
 	// 文件；这里记录最后一次悬空引用供诊断面读取）。
 	if strings.HasPrefix(value, "{") && strings.HasSuffix(value, "}") {
-		if name := tomlconf.EnvRefName(value); name != "" && os.Getenv(name) == "" {
+		if name := tomlconf.EnvRefName(value); name != "" && tomlconf.LookupEnvWith(name, fallback) == "" {
 			lastDanglingEnvRef.Store([2]string{table, name})
 		}
 	}
-	value = tomlconf.ExpandEnv(value)
+	value = tomlconf.ExpandEnvWith(value, fallback)
 	if strings.TrimSpace(value) == "" {
 		return "", false
 	}
 	return value, true
+}
+
+// envFileFallback 读取 config.toml [env].file 指向的 dotenv 环境文件。
+// 未配置、文件缺失或没有可认识的行都返回 nil —— 兜底只是增强，
+// 绝不能让主解析路径失败。支持 ~ 开头路径。
+func (s *State) envFileFallback(doc *tomlconf.Document) map[string]string {
+	path, ok := doc.Get("env", "file")
+	if !ok || strings.TrimSpace(path) == "" {
+		return nil
+	}
+	if path == "~" || strings.HasPrefix(path, "~/") {
+		path = filepath.Join(os.Getenv("HOME"), strings.TrimPrefix(path, "~"))
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	return tomlconf.ParseEnvFile(string(raw))
 }
 
 // lastDanglingEnvRef 记录最近一次悬空的 {VAR} 引用（provider, var）。

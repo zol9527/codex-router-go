@@ -62,6 +62,12 @@ api_key = "sk-..."
 api_key = "..."
 # 也支持环境变量引用：api_key = "{ZAI_API_KEY}"
 # 未设置的变量展开为空（=未配置）；{非变量形状} 按字面量保留
+
+[env]
+# 可选：dotenv 兜底文件。GUI App 拉起的服务继承 launchd 环境，
+# 看不到登录 shell 里的变量；{VAR} 查不到进程环境时从这里兜底。
+# 支持 ~ 路径；只取 KEY=VALUE / export KEY=VALUE 行，其余语法跳过。
+file = "~/.secrets/env"
 ```
 
 - 生成带注释模板：`./codex-router control config init`

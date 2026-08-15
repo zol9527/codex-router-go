@@ -161,3 +161,51 @@ func TestRemoveTableLeavesOthers(t *testing.T) {
 		t.Errorf("others damaged:\n%s", out)
 	}
 }
+
+// TestParseEnvFile 钉死 dotenv 兜底解析：export 前缀、成对引号、值里
+// 带 =、注释/空行/任意 shell 语法跳过。
+func TestParseEnvFile(t *testing.T) {
+	got := ParseEnvFile(strings.Join([]string{
+		"# comment",
+		"",
+		"export A_TOKEN=plain",
+		"B_TOKEN=\"quoted value\"",
+		"C_TOKEN='single'",
+		"D_URL=https://x.test/a?b=c=d",
+		"garbage line without equals",
+		"if [ -f ~/.secrets/env ]; then source it; fi",
+		"=no-name",
+	}, "\n"))
+	want := map[string]string{
+		"A_TOKEN": "plain",
+		"B_TOKEN": "quoted value",
+		"C_TOKEN": "single",
+		"D_URL":   "https://x.test/a?b=c=d",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("parsed %v, want %v", got, want)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("%s = %q, want %q", k, got[k], v)
+		}
+	}
+}
+
+// TestExpandEnvWithFallbackOrder 钉死展开优先级：进程环境 > 兜底表。
+func TestExpandEnvWithFallbackOrder(t *testing.T) {
+	t.Setenv("MR_TEST_OVERRIDE", "from-env")
+	fb := map[string]string{"MR_TEST_OVERRIDE": "from-file", "MR_TEST_ONLYFILE": "file-value"}
+	if got := ExpandEnvWith("{MR_TEST_OVERRIDE}", fb); got != "from-env" {
+		t.Errorf("env should win, got %q", got)
+	}
+	if got := ExpandEnvWith("{MR_TEST_ONLYFILE}", fb); got != "file-value" {
+		t.Errorf("fallback missing, got %q", got)
+	}
+	if got := ExpandEnvWith("{MR_TEST_MISSING}", fb); got != "" {
+		t.Errorf("missing should expand empty, got %q", got)
+	}
+	if got := ExpandEnvWith("literal-{not-a-ref}", fb); got != "literal-{not-a-ref}" {
+		t.Errorf("non-ref shape must stay verbatim, got %q", got)
+	}
+}

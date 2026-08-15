@@ -343,6 +343,14 @@ func tableSpan(lines []string, table string) (int, int) {
 // doctor 的 missing 报告会指出来）；不认识的形状（{a-b}、{}、{{}}）
 // 原样保留 —— 它们可能就是字面量的一部分。
 func ExpandEnv(value string) string {
+	return ExpandEnvWith(value, nil)
+}
+
+// ExpandEnvWith 展开 {NAME} 引用：进程环境优先，dotenv 兜底表次之。
+// 兜底表来自 config.toml [env].file 指向的环境文件 —— GUI App 拉起的
+// 服务看不到用户登录 shell 的环境（launchd 环境），{VAR} 引用在那里
+// 全部悬空；环境文件兜底让服务独立于启动环境解析凭证。
+func ExpandEnvWith(value string, fallback map[string]string) string {
 	var sb strings.Builder
 	for i := 0; i < len(value); i++ {
 		c := value[i]
@@ -360,10 +368,50 @@ func ExpandEnv(value string) string {
 			sb.WriteByte(c)
 			continue
 		}
-		sb.WriteString(os.Getenv(name))
+		sb.WriteString(LookupEnvWith(name, fallback))
 		i += end
 	}
 	return sb.String()
+}
+
+// LookupEnvWith 查一个变量名：进程环境优先，兜底表次之，都没有返回空。
+func LookupEnvWith(name string, fallback map[string]string) string {
+	if v := os.Getenv(name); v != "" {
+		return v
+	}
+	return fallback[name]
+}
+
+// ParseEnvFile 解析 dotenv 风格的环境文件（兼容 "export KEY=VALUE"）。
+// 只取认识的 KEY=VALUE 行；注释、空行与任意其他 shell 语法原样跳过 ——
+// 环境文件由用户的 shell 链维护，路由器只做兜底读取，绝不因为一行
+// 不认识的语法打断凭证解析。值可以带成对的单/双引号（剥掉）。
+func ParseEnvFile(source string) map[string]string {
+	out := map[string]string{}
+	for _, raw := range strings.Split(source, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		line = strings.TrimPrefix(line, "export ")
+		eq := strings.IndexByte(line, '=')
+		if eq <= 0 {
+			continue
+		}
+		name := strings.TrimSpace(line[:eq])
+		if !envName(name) {
+			continue
+		}
+		value := strings.TrimSpace(line[eq+1:])
+		if len(value) >= 2 {
+			if (value[0] == '"' && value[len(value)-1] == '"') ||
+				(value[0] == '\'' && value[len(value)-1] == '\'') {
+				value = value[1 : len(value)-1]
+			}
+		}
+		out[name] = value
+	}
+	return out
 }
 
 // envName：环境变量名的形状（字母数字下划线，不以数字开头）。

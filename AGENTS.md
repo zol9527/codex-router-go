@@ -33,7 +33,10 @@ for those, say they were removed with the rewrite.
    `[provider] api_key = "..."`, editable by hand, by the app's settings
    page, or via `./codex-router control credential PROVIDER` (hidden stdin
    prompt — pipe the value, never take it through chat). `{VAR}` values
-   expand environment variables at read time.
+   expand environment variables at read time; an optional
+   `[env] file = "~/.secrets/env"` table adds a dotenv fallback so the
+   GUI-spawned service can resolve vars the login shell defines
+   (process env still wins; the file is only read, never printed).
 5. Verify: `./codex-router doctor`. Core config, catalog, credentials
    config, and service reachability must be OK.
 6. Tell the user to fully quit and reopen Codex, then pick a routed model.
