@@ -1,6 +1,7 @@
 package state
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -61,5 +62,27 @@ func TestEffectivePresenceOverride(t *testing.T) {
 	}
 	if ServiceFollowsHostApps(dir) {
 		t.Error("always mode never follows host apps")
+	}
+}
+
+// tray 的 RouterPresence 四个字段全部非可选；harnessPublished 随 dsh
+// 目标砍掉后仍须发显式 false —— 缺键让 tray 整个快照解码失败。
+func TestPresenceSnapshotCarriesAllTrayKeys(t *testing.T) {
+	dir := t.TempDir()
+	raw, err := json.Marshal(PresenceSnapshot(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var snapshot map[string]any
+	if err := json.Unmarshal(raw, &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"mode", "effectiveMode", "terminalCodex", "harnessPublished"} {
+		if _, ok := snapshot[key]; !ok {
+			t.Errorf("presence snapshot missing key %q: %s", key, raw)
+		}
+	}
+	if snapshot["harnessPublished"] != false {
+		t.Errorf("harnessPublished = %v, want false", snapshot["harnessPublished"])
 	}
 }

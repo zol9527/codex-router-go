@@ -24,7 +24,9 @@ type Metric struct {
 	Limit            float64  `json:"limit"`
 	Remaining        float64  `json:"remaining"`
 	Unit             string   `json:"unit"`
-	ResetAt          *float64 `json:"resetAt,omitempty"` // epoch ms
+	// ResetAt 是 epoch 秒 —— tray 用 Date(timeIntervalSince1970:) 建
+	// Date，发毫秒会渲染成 1970 年（与 Node 版 end/1000 对齐）。
+	ResetAt *float64 `json:"resetAt,omitempty"`
 }
 
 // AccountSnapshot 是一个 provider 的账号用量快照。
@@ -282,12 +284,23 @@ func fetchOpencode(ctx context.Context, client *http.Client, credential string) 
 
 // CodexAccountUsage 是原生订阅的用量快照。
 type CodexAccountUsage struct {
-	FetchedAt string           `json:"fetchedAt"`
-	PlanType  string           `json:"planType,omitempty"`
-	LimitID   string           `json:"limitId,omitempty"`
-	Primary   *CodexWindow     `json:"primary,omitempty"`
-	Secondary *CodexWindow     `json:"secondary,omitempty"`
-	Buckets   []CodexDayBucket `json:"dailyUsageBuckets"`
+	FetchedAt string             `json:"fetchedAt"`
+	PlanType  string             `json:"planType,omitempty"`
+	LimitID   string             `json:"limitId,omitempty"`
+	Primary   *CodexWindow       `json:"primary,omitempty"`
+	Secondary *CodexWindow       `json:"secondary,omitempty"`
+	Buckets   []CodexDayBucket   `json:"dailyUsageBuckets"`
+	// Summary 键本身非可选（tray 的 CodexUsageSummary）：哪怕字段全
+	// 空也要发一个对象，缺键会让整个快照解码失败。
+	Summary CodexUsageSummaryJSON `json:"summary"`
+}
+
+// CodexUsageSummaryJSON 的字段以 null 表达缺失（Node 版语义），tray
+// 侧全部按可选解码。
+type CodexUsageSummaryJSON struct {
+	LifetimeTokens   *int64 `json:"lifetimeTokens"`
+	PeakDailyTokens  *int64 `json:"peakDailyTokens"`
+	CurrentStreakDays *int  `json:"currentStreakDays"`
 }
 
 // CodexWindow 是一个 5h/周窗口。
@@ -398,7 +411,9 @@ func normalizeCodexUsage(rateLimitsRaw, usageRaw json.RawMessage) *CodexAccountU
 	json.Unmarshal(rateLimitsRaw, &rateLimits)
 	var usagePayload struct {
 		Summary struct {
-			LifetimeTokens float64 `json:"lifetimeTokens"`
+			LifetimeTokens    *float64 `json:"lifetimeTokens"`
+			PeakDailyTokens   *float64 `json:"peakDailyTokens"`
+			CurrentStreakDays *float64 `json:"currentStreakDays"`
 		} `json:"summary"`
 		DailyUsageBuckets []struct {
 			StartDate string  `json:"startDate"`
@@ -421,6 +436,19 @@ func normalizeCodexUsage(rateLimitsRaw, usageRaw json.RawMessage) *CodexAccountU
 				StartDate: bucket.StartDate, Tokens: bucket.Tokens,
 			})
 		}
+	}
+	// summary 的字段以 null 表达「上游没给」，数值非法同样归 null。
+	if usagePayload.Summary.LifetimeTokens != nil && *usagePayload.Summary.LifetimeTokens >= 0 {
+		v := int64(*usagePayload.Summary.LifetimeTokens)
+		usage.Summary.LifetimeTokens = &v
+	}
+	if usagePayload.Summary.PeakDailyTokens != nil && *usagePayload.Summary.PeakDailyTokens >= 0 {
+		v := int64(*usagePayload.Summary.PeakDailyTokens)
+		usage.Summary.PeakDailyTokens = &v
+	}
+	if usagePayload.Summary.CurrentStreakDays != nil && *usagePayload.Summary.CurrentStreakDays >= 0 {
+		v := int(*usagePayload.Summary.CurrentStreakDays)
+		usage.Summary.CurrentStreakDays = &v
 	}
 	return &usage
 }

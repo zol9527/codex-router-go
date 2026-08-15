@@ -3,7 +3,6 @@
 package usage
 
 import (
-	"bufio"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -69,75 +68,6 @@ func (r *Recorder) Record(event Event) {
 	}
 	defer file.Close()
 	file.Write(append(raw, '\n'))
-}
-
-// ProviderUsage 是聚合视图（tray 的用量卡片）。
-type ProviderUsage struct {
-	Provider string  `json:"provider"`
-	Model    string  `json:"model"`
-	Turns    int     `json:"turns"`
-	Errors   int     `json:"errors"`
-	Tokens   int64   `json:"totalTokens"`
-	TTFTMs   float64 `json:"medianFirstTokenMs,omitempty"`
-}
-
-// Aggregate 聚合近 90 天的用量（每 provider+model 一行）。
-func Aggregate(stateDir string) []ProviderUsage {
-	path := filepath.Join(stateDir, "usage-events.jsonl")
-	file, err := os.Open(path)
-	if err != nil {
-		return nil
-	}
-	defer file.Close()
-	type key struct{ provider, model string }
-	type agg struct {
-		turns, errors int
-		tokens        int64
-		ttfts         []int64
-	}
-	aggregates := map[key]*agg{}
-	cutoff := time.Now().AddDate(0, 0, -90).Format(time.RFC3339)
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 1<<20), 1<<20)
-	for scanner.Scan() {
-		var event Event
-		if err := json.Unmarshal(scanner.Bytes(), &event); err != nil {
-			continue
-		}
-		if event.At < cutoff {
-			continue
-		}
-		k := key{event.Provider, event.Model}
-		entry := aggregates[k]
-		if entry == nil {
-			entry = &agg{}
-			aggregates[k] = entry
-		}
-		entry.turns++
-		if event.Status >= 400 || event.Status == 0 {
-			entry.errors++
-		}
-		entry.tokens += event.TotalTokens
-		if event.FirstTokenMs > 0 {
-			entry.ttfts = append(entry.ttfts, event.FirstTokenMs)
-		}
-	}
-	var out []ProviderUsage
-	for k, entry := range aggregates {
-		row := ProviderUsage{
-			Provider: k.provider, Model: k.model,
-			Turns: entry.turns, Errors: entry.errors, Tokens: entry.tokens,
-		}
-		if len(entry.ttfts) > 0 {
-			var sum int64
-			for _, v := range entry.ttfts {
-				sum += v
-			}
-			row.TTFTMs = float64(sum) / float64(len(entry.ttfts))
-		}
-		out = append(out, row)
-	}
-	return out
 }
 
 var _ = strings.TrimSpace

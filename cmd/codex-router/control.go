@@ -94,10 +94,14 @@ func cmdControl(args []string) error {
 		return controlJSON(st, reg)
 	case len(rest) >= 1 && rest[0] == "service":
 		return controlService(rest[1:])
-	case len(rest) >= 1 && rest[0] == "providers" && len(rest) >= 2 && rest[1] == "list":
-		return controlProvidersList(st, reg, hasJSONFlag(rest))
 	case len(rest) >= 1 && rest[0] == "providers" && len(rest) >= 3 && rest[1] == "enable":
 		return controlProvidersEnable(st, reg, rest[2:])
+	// tray 调的是 `providers --json`（无 list）；enable 之外的任何
+	// providers 形式都按 list 处理。
+	case len(rest) >= 1 && rest[0] == "providers":
+		return controlProvidersList(st, reg, hasJSONFlag(rest))
+	case cutControlCommand(rest) != "":
+		return fmt.Errorf("%s was removed in the go rewrite; this build serves codex routing only", cutControlCommand(rest))
 	case len(rest) >= 1 && rest[0] == "credential" && len(rest) >= 2:
 		return controlCredential(st, reg, rest[1:])
 	case len(rest) >= 1 && rest[0] == "account":
@@ -146,8 +150,32 @@ func controlUsage() {
 `)
 }
 
-// controlJSON 是 tray 五分钟轮询的主快照。字段集合对齐旧 emitProbe
-// 的核心（targets/presence/harness 等 dsh 时代的字段已随目标砍掉）。
+// cutControlCommand 报告 tray 可能发出、但 go 重写已裁剪的子命令名。
+// 它们的 UI 入口还在（维护卡、登录模式开关等），命中时给一行人话
+// 而非整屏 usage —— 那段 stderr 会被 tray 原样显示在面板页脚。
+func cutControlCommand(rest []string) string {
+	if len(rest) == 0 {
+		return ""
+	}
+	cut := map[string]bool{
+		"apply": true, "doctor": true, "maintenance": true,
+		"auth-mode": true, "signed-routing": true,
+		"login": true, "install-cli": true,
+		"harness": true, "local-models": true,
+	}
+	if cut[rest[0]] {
+		return rest[0]
+	}
+	return ""
+}
+
+// controlJSON 是 tray 五分钟轮询的主快照。形状必须对齐 tray 的
+// RouterSnapshot 解码器（ModelRouterTrayApp.swift）：
+//
+//	targets: {codex: {target, configured, active, enabledProviders,
+//	                  providers[], models[]}} —— 字典而非扁平字段；
+//	presence 四个字段全部非可选，缺 harnessPublished 会让整个快照
+//	解码失败，面板落到「路由不可用」。
 func controlJSON(st *state.State, reg *registry.Registry) error {
 	enabled := st.EnabledProviders()
 	enabledSet := map[string]bool{}
@@ -177,18 +205,23 @@ func controlJSON(st *state.State, reg *registry.Registry) error {
 		}
 		models = append(models, map[string]any{
 			"slug": m.Slug, "displayName": m.DisplayName,
-			"provider":      reg.CanonicalProviderID(m.Provider),
-			"contextWindow": m.ContextWindow,
+			"provider": reg.CanonicalProviderID(m.Provider),
+			// RouterModel.enabled 非可选：能进这张表的模型都是
+			// 已启用 provider 下的已发布模型，恒为 true。
+			"enabled": st.ProviderEnabled(m.Provider, reg.CanonicalProviderID),
 		})
 	}
-	payload := map[string]any{
+	target := map[string]any{
 		"target":           "codex",
 		"configured":       true,
 		"active":           probeURL(fmt.Sprintf("http://127.0.0.1:%d/health", defaultPort())),
 		"enabledProviders": enabled,
 		"providers":        providers,
 		"models":           models,
-		"version":          version,
+	}
+	payload := map[string]any{
+		"targets":  map[string]any{"codex": target},
+		"version":  version,
 		// presence 块：tray 读 effectiveMode 而非自行推导
 		//（两边各自推导必然漂移）。
 		"presence": state.PresenceSnapshot(st.Dir),
@@ -242,40 +275,50 @@ func launchdUID() string {
 	return strings.TrimSpace(string(out))
 }
 
+// controlProvidersList 的 JSON 输出形状对齐 tray 的
+// ProviderSetupSnapshot 解码器：providers 数组，小写字段，configured
+// 与 action 非可选。本 fork 的 provider 全是 API-key 型，action 恒为
+// "add-key"（已配置时状态行走 configured 分支；action 决定的是未配置
+// 时按钮的行为——展开隐藏输入框）。
 func controlProvidersList(st *state.State, reg *registry.Registry, asJSON bool) error {
 	resolver := cred.New(st)
 	enabled := map[string]bool{}
 	for _, id := range st.EnabledProviders() {
 		enabled[id] = true
 	}
-	type row struct {
-		ID, DisplayName, Credential string
-		Enabled                     bool
+	if asJSON {
+		entries := []map[string]any{}
+		for _, id := range orderedProviderIDs(reg) {
+			p := reg.Providers[id]
+			if p == nil || p.VariantOf != "" {
+				continue
+			}
+			_, source := resolver.Resolve(p)
+			entries = append(entries, map[string]any{
+				"id": p.ID, "displayName": p.DisplayName, "kind": p.Kind,
+				"configured": source != "",
+				"action":     "add-key",
+			})
+		}
+		raw, _ := json.MarshalIndent(map[string]any{"providers": entries}, "", "  ")
+		fmt.Println(string(raw))
+		return nil
 	}
-	var rows []row
 	for _, id := range orderedProviderIDs(reg) {
 		p := reg.Providers[id]
 		if p == nil {
 			continue
 		}
 		_, source := resolver.Resolve(p)
-		rows = append(rows, row{p.ID, p.DisplayName, source, enabled[p.ID]})
-	}
-	if asJSON {
-		raw, _ := json.MarshalIndent(rows, "", "  ")
-		fmt.Println(string(raw))
-		return nil
-	}
-	for _, r := range rows {
 		status := "disabled"
-		if r.Enabled {
+		if enabled[p.ID] {
 			status = "enabled"
 		}
 		credState := "no-key"
-		if r.Credential != "" {
-			credState = "key:" + r.Credential
+		if source != "" {
+			credState = "key:" + source
 		}
-		fmt.Printf("%-16s %-24s %-8s %s\n", r.ID, r.DisplayName, status, credState)
+		fmt.Printf("%-16s %-24s %-8s %s\n", p.ID, p.DisplayName, status, credState)
 	}
 	return nil
 }

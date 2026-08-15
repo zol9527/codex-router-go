@@ -5,9 +5,20 @@
 > usage-events.jsonl 计量在位、doctor 核心全绿。
 > 切换中修掉两个仅真实流量能暴露的 bug：input_modalities 必须是序列
 >（Codex 拒载 catalog）、native 路径漏记 usage。
+> **tray 面板已实测并修复对接层**（真实截图暴露）：Go 侧四个 tray 面向
+> 命令的形状已对齐 Swift 解码器 —— `control --json` 发 `targets` 字典
+>（旧扁平结构让面板整页「路由不可用」）、presence 补 `harnessPublished`
+> 显式 false（缺键令整个快照解码失败）、`providers --json` 改发
+> ProviderSetupSnapshot、`account --json` 去掉 status 包装直发
+> CodexAccountUsage（补非可选 summary 键）、`provider-usage --json` 重写为
+> 按 provider 合并的 ProviderUsageSnapshot（移植 Node 的中位速率/不可信
+> 样本剔除/日桶语义，`internal/usage/providerusage.go`）。裁剪掉的命令
+>（maintenance/apply/harness 等）给一行人话错误而非 usage 倾倒。
+> 回归测试钉住全部形状（providerusage_test / presence_test）。
 > **操作者待办**：`./bin/control credential zai-coding`（stdin 输入 key）
-> 与 `credential opencode-go` 启用路由模型；可选安装 tray app 做按钮
-> 面板 GUI 实测。uninstall 零痕迹（plist/二进制目录/config 块全清，state
+> 与 `credential opencode-go` 启用路由模型；tray 已构建安装于
+> ~/Applications/Model Router.app 并在菜单栏运行，面板点「刷新」即得
+> 全量数据。uninstall 零痕迹（plist/二进制目录/config 块全清，state
 > 默认保留、--purge 显式销毁）——已做真实往返验证；`git checkout -- bin/control`
 > 恢复旧入口。部署替换运行中二进制必须原子 mv（原地 cp 会被 macOS 代码
 > 签名 SIGKILL）。

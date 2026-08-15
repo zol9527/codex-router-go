@@ -60,8 +60,6 @@ func TestEmptyCompletionSilentRetry(t *testing.T) {
 		t.Errorf("retry result missing:\n%s", body)
 	}
 	// usage 记录空补全重试事实。
-	rows := usage.Aggregate(t.TempDir()) // agg 路径不匹配无妨，读原始文件验证
-	_ = rows
 	raw := readUsageRaw(t, recorder)
 	if !strings.Contains(raw, `"emptyCompletionRetried":true`) {
 		t.Errorf("usage event must record emptyCompletionRetried: %s", raw)
