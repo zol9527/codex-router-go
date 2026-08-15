@@ -1,5 +1,15 @@
 # Changelog
 
+## Fork: the Go rewrite (2026-08-15)
+
+This fork rewrote the router as a single self-contained Go binary plus a
+native macOS app: the Node.js runtime, the LiteLLM Python gateway, the
+Homebrew/installer flows, the dsh integration, and every provider except
+`zai-coding`, `opencode-go`, and native Codex passthrough were removed.
+Credentials moved to `~/.codex-router/config.toml`. See `README.md` and
+`GO-REWRITE-PLAN.md`. Entries below this note document the original
+Node-based project and apply to it, not to this fork.
+
 ## Unreleased
 
 - **GLM-5.3, on every route that actually serves it.** Z.ai shipped GLM-5.3 on

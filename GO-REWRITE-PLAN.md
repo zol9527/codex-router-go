@@ -43,8 +43,11 @@
 > launchd 已移除（旧 plist 已清），开机自启 = 设置页「登录时启动」
 > （SMAppService）。凭证的家是 ~/.codex-router/config.toml（Claude Code
 > 式，[provider] api_key，注释保留的行级手术改写，env > config >
-> .secret > keychain）；设置页「打开配置」直达。~/bin/codex-router 保留
-> 为终端 CLI（更新命令见待办）。
+> .secret > keychain；值支持 {VAR} 环境变量引用，读取时展开、未设置
+> 即未配置）；设置页「打开配置」直达。~/bin/codex-router 保留
+> 为终端 CLI（更新命令见待办）。`control reload` 不重启地重读配置、
+> 刷新 catalog 并重发布集成块（含 config.toml 整文校验，坏文件带行号
+> 报错）。
 > **操作者待办**：`./bin/control credential zai-coding`（stdin 输入 key）
 > 与 `credential opencode-go` 启用路由模型；tray 已构建安装于
 > ~/Applications/Model Router.app 并在菜单栏运行，面板点「刷新」即得
