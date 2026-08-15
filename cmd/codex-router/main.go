@@ -169,15 +169,17 @@ func defaultPort() int {
 	return 4202
 }
 
-// defaultConfigDir 定位仓库内的 config/ 目录：可执行文件旁，或源码树。
+// defaultConfigDir 定位注册表 config/ 目录：优先自包含安装位（二进制
+// 旁边的 config/，install 时拷入），其次源码树（go run / go test 从
+// 当前目录向上找）。serve/control/doctor 都走这里 —— 仓库移走后
+// 部署仍完整。
 func defaultConfigDir() string {
 	if exe, err := os.Executable(); err == nil {
-		candidate := filepath.Join(filepath.Dir(exe), "..", "config")
+		candidate := filepath.Join(filepath.Dir(exe), "config")
 		if st, err := os.Stat(candidate); err == nil && st.IsDir() {
 			return candidate
 		}
 	}
-	// 源码树运行（go run / go test）：从当前目录向上找 config/。
 	dir, err := os.Getwd()
 	if err != nil {
 		return "config"

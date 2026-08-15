@@ -21,6 +21,13 @@
 > 已发布的 URL 保持有效；新目录已存在则不迁移，旧目录永不改动）。
 > launchd plist 内嵌 --state 绝对路径，迁移后已重装刷新；迁移边界由
 > migrate_test.go 钉住。
+> **安装已自包含**：install 把注册表 config/ 拷进安装目录（先清后拷，
+> 重装带上注册表增删）并放置 bin/control 启动器（解析同目录二进制，
+> 保留 CODEX_ROUTER_GO_BINARY 调试覆盖）；defaultConfigDir 优先取
+> 二进制旁的 config/。launchd 的 --config 与 tray 的
+> ModelRouterSourceRoot（构建脚本 MODEL_ROUTER_TRAY_ROOT 覆盖烧录）
+> 都指向 ~/.local/share/codex-router-go —— 仓库 checkout 从此只是
+> 开发用途，移动/删除不影响部署；uninstall 删整个安装目录，拷贝随清。
 > **操作者待办**：`./bin/control credential zai-coding`（stdin 输入 key）
 > 与 `credential opencode-go` 启用路由模型；tray 已构建安装于
 > ~/Applications/Model Router.app 并在菜单栏运行，面板点「刷新」即得

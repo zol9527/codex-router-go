@@ -36,7 +36,11 @@ fi
 # invalid inside a strict macOS code-signed bundle; a loose text resource would
 # be executable-path input. This value is covered by the final signature, so
 # changing the selected checkout also invalidates verification.
-/usr/libexec/PlistBuddy -c "Add :ModelRouterSourceRoot string $repo_dir" \
+# MODEL_ROUTER_TRAY_ROOT overrides the baked root for the self-contained
+# install (the Go router's install dir carries its own bin/control); default
+# stays the checkout for source-tree use.
+tray_root=${MODEL_ROUTER_TRAY_ROOT:-$repo_dir}
+/usr/libexec/PlistBuddy -c "Add :ModelRouterSourceRoot string $tray_root" \
   "$bundle_dir/Contents/Info.plist"
 
 # The copied SwiftPM executable carries an ad-hoc signature. Sign only after

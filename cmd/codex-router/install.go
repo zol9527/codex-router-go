@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,12 +15,16 @@ import (
 	"github.com/loyd/codex-router/internal/state"
 )
 
-// cmdInstall：secret 生成 → catalog 发布 → config.toml 集成 → launchd 注册。
-// 幂等：重复执行等于刷新。
+// cmdInstall：secret 生成 → 注册表自包含拷贝 → catalog 发布 →
+// config.toml 集成 → launchd 注册。幂等：重复执行等于刷新。
+//
+// 自包含：install 把源 config/ 注册表拷进安装目录（二进制旁）并放置
+// bin/control 启动器，之后 serve（plist 内嵌 --config）与 tray
+//（ModelRouterSourceRoot 指安装目录）都不再依赖仓库 checkout。
 func cmdInstall(args []string) error {
 	fs := flag.NewFlagSet("install", flag.ContinueOnError)
 	stateDir := fs.String("state", state.DefaultDir(), "state directory")
-	configDir := fs.String("config", "", "registry config directory")
+	configDir := fs.String("config", "", "source registry config directory to install from")
 	port := fs.Int("port", defaultPort(), "listen port")
 	providers := fs.String("providers", "zai-coding,opencode-go", "comma-separated provider ids to enable")
 	codexBinary := fs.String("codex", "codex", "codex CLI binary (for native catalog capture)")
@@ -40,7 +45,34 @@ func cmdInstall(args []string) error {
 		return err
 	}
 
-	reg, err := registry.Load(orDefault(*configDir, defaultConfigDir()))
+	// 源注册表：--config 显式给出 > 从 cwd 向上找（在仓库里跑）>
+	// 已安装的拷贝（无仓库修复场景）。源优先于已装拷贝，重装才能
+	// 带上注册表的变更。
+	sourceConfig := sourceConfigDir(*configDir)
+	installConfig := ""
+	if exe, err := selfBinaryPath(); err == nil {
+		installConfig = filepath.Join(filepath.Dir(exe), "config")
+	}
+	if *dryRun {
+		fmt.Printf("would copy registry config: %s -> %s\n", sourceConfig, installConfig)
+	} else {
+		if installConfig == "" {
+			return fmt.Errorf("cannot resolve install directory for self-contained config")
+		}
+		if err := copyConfigTree(sourceConfig, installConfig); err != nil {
+			return fmt.Errorf("copy registry config: %w", err)
+		}
+		if err := writeControlLauncher(filepath.Dir(installConfig)); err != nil {
+			return fmt.Errorf("write control launcher: %w", err)
+		}
+	}
+
+	// 从拷贝加载注册表 —— 这一步同时证明拷贝是完整的。
+	loadDir := sourceConfig
+	if !*dryRun && installConfig != "" {
+		loadDir = installConfig
+	}
+	reg, err := registry.Load(loadDir)
 	if err != nil {
 		return err
 	}
@@ -103,7 +135,94 @@ func cmdInstall(args []string) error {
 
 	fmt.Printf("installed: %d models published, config.toml integrated, service registered\n", count)
 	fmt.Printf("state: %s\n", st.Dir)
+	if installConfig != "" {
+		fmt.Printf("self-contained: %s (registry config + bin/control copied)\n", filepath.Dir(installConfig))
+	}
 	return nil
+}
+
+// sourceConfigDir 解析安装的注册表来源：--config 显式给出 > 从 cwd
+// 向上找（在仓库里跑 install 的正常路径）> 已安装拷贝（无仓库的
+// 修复场景，重装等于刷新当前已装的注册表）。
+func sourceConfigDir(flagValue string) string {
+	if flagValue != "" {
+		return flagValue
+	}
+	if dir, found := walkUpConfigDir(); found {
+		return dir
+	}
+	return defaultConfigDir()
+}
+
+// walkUpConfigDir 从当前目录向上找 config/（源码树运行形态）。
+func walkUpConfigDir() (string, bool) {
+	dir, err := os.Getwd()
+	if err != nil {
+		return "", false
+	}
+	for i := 0; i < 6; i++ {
+		candidate := filepath.Join(dir, "config")
+		if st, err := os.Stat(candidate); err == nil && st.IsDir() {
+			return candidate, true
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return "", false
+}
+
+// copyConfigTree 递归拷贝注册表目录。先清空目标再拷 —— 注册表文件
+// 会增删（provider 下线、模型移除），叠加拷贝会把已删的留在安装里。
+func copyConfigTree(src, dst string) error {
+	if err := os.RemoveAll(dst); err != nil {
+		return err
+	}
+	return filepath.WalkDir(src, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+		if d.IsDir() {
+			return os.MkdirAll(target, 0o755)
+		}
+		info, err := d.Info()
+		if err != nil || !info.Mode().IsRegular() {
+			return nil // 契约里只有目录与 json 文件
+		}
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(target, raw, 0o644)
+	})
+}
+
+// writeControlLauncher 在安装目录放置 bin/control。tray 校验并 exec
+// 的就是这个路径（ModelRouterSourceRoot 指向安装目录），内容与仓库
+// 里的 bin/control 等价，但解析的是同目录的二进制。
+func writeControlLauncher(installDir string) error {
+	script := `#!/bin/sh
+set -eu
+
+# 自包含安装里的 control 入口。tray 的 ModelRouterSourceRoot 指向本目录。
+exec "${CODEX_ROUTER_GO_BINARY:-$(dirname "$0")/../codex-router}" control "$@"
+`
+	dir := filepath.Join(installDir, "bin")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	path := filepath.Join(dir, "control")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0o755)
 }
 
 func splitCSV(value string) []string {
