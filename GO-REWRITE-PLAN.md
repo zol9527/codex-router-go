@@ -7,7 +7,10 @@
 >（Codex 拒载 catalog）、native 路径漏记 usage。
 > **操作者待办**：`./bin/control credential zai-coding`（stdin 输入 key）
 > 与 `credential opencode-go` 启用路由模型；可选安装 tray app 做按钮
-> 面板 GUI 实测。回滚：`codex-router uninstall` + `git checkout -- bin/control`。
+> 面板 GUI 实测。uninstall 零痕迹（plist/二进制目录/config 块全清，state
+> 默认保留、--purge 显式销毁）——已做真实往返验证；`git checkout -- bin/control`
+> 恢复旧入口。部署替换运行中二进制必须原子 mv（原地 cp 会被 macOS 代码
+> 签名 SIGKILL）。
 > 已落地（12 个功能提交，~9.4k 行 Go，9 包测试全绿，各里程碑有假上游端到端测试）：
 > - M1 协议核心：认证 / native 直通 / Responses↔chat 双向翻译 / Responses 直通 / zstd / retry
 > - M2 集成面：catalog（codex debug models）/ config.toml 标记块 / install·uninstall·doctor / launchd / control
