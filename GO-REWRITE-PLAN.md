@@ -21,13 +21,21 @@
 > 已发布的 URL 保持有效；新目录已存在则不迁移，旧目录永不改动）。
 > launchd plist 内嵌 --state 绝对路径，迁移后已重装刷新；迁移边界由
 > migrate_test.go 钉住。
-> **安装已自包含**：install 把注册表 config/ 拷进安装目录（先清后拷，
-> 重装带上注册表增删）并放置 bin/control 启动器（解析同目录二进制，
-> 保留 CODEX_ROUTER_GO_BINARY 调试覆盖）；defaultConfigDir 优先取
-> 二进制旁的 config/。launchd 的 --config 与 tray 的
-> ModelRouterSourceRoot（构建脚本 MODEL_ROUTER_TRAY_ROOT 覆盖烧录）
-> 都指向 ~/.local/share/codex-router-go —— 仓库 checkout 从此只是
-> 开发用途，移动/删除不影响部署；uninstall 删整个安装目录，拷贝随清。
+> **安装已自包含，且住在操作者的环境目录 /Users/loyd/bin**（操作者
+> 明确要求：二进制放自己的 bin 目录，勿自动部署到别处）：install 把
+> 注册表 config/ 拷到二进制旁（先清后拷，重装带上注册表增删）并放置
+> bin/control 启动器（~/bin/bin/control，解析同目录二进制，保留
+> CODEX_ROUTER_GO_BINARY 调试覆盖）；defaultConfigDir 优先取二进制旁
+> 的 config/。launchd 的 --config 与 tray 的 ModelRouterSourceRoot 都
+> 指向 /Users/loyd/bin；仓库 checkout 只是开发用途。**uninstall 在共享
+> 目录里只删自己的三样工件**（二进制、config/、bin/control，bin/ 空
+> 才顺手删）——绝不 RemoveAll 操作者的 ~/bin；旧自包含布局
+> ~/.local/share/codex-router-go 整体删除。
+> **tray 即开关**（操作者规定）：tray 退出（applicationWillTerminate）
+> 分离进程执行 service stop；tray 启动时先探活 /health，未运行才
+> service start（kickstart 会重启运行中的服务，无探活会误伤在途
+> 请求）。已实测：quit → 服务停，reopen → 服务自动回（全链路约
+> 9 秒）。
 > **操作者待办**：`./bin/control credential zai-coding`（stdin 输入 key）
 > 与 `credential opencode-go` 启用路由模型；tray 已构建安装于
 > ~/Applications/Model Router.app 并在菜单栏运行，面板点「刷新」即得

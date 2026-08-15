@@ -101,6 +101,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     Task { await store.startAccountUsagePolling() }
     Task { await store.startProviderPolling() }
     if Self.launchedByUser { store.revealForUserLaunch() }
+    // Tray 即开关：tray 启动时若路由器没在跑则拉起（对称于退出时的
+    // 停止）。探活先行 —— service start 对运行中的服务是重启，绝不
+    // 能在每次 tray 启动时误伤正在服务的进程。
+    Task { await store.ensureServiceRunningAtLaunch() }
   }
 
   // Double-clicking an app that is already running sends this instead of a
@@ -121,7 +125,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   }
 
   func applicationWillTerminate(_ notification: Notification) {
-    store.restoreServiceOnQuit()
+    store.stopServiceOnQuit()
   }
 }
 
@@ -620,14 +624,33 @@ final class RouterStore: ObservableObject {
     await refresh()
   }
 
-  // The tray is the only watcher in follow mode. If it goes away with the router
-  // stopped, nothing is left to notice the next Codex launch, so hand the router
-  // back to launchd on the way out. Detached so quitting never blocks on the
-  // gateway's health wait.
-  func restoreServiceOnQuit() {
+  // 操作者规定：tray 退出即关闭路由器（quit = off）。分离进程执行，
+  // 退出绝不等待服务应答。下次登录 launchd 会照常把服务拉起；tray
+  // 重新打开时由 ensureServiceRunningAtLaunch 拉起。
+  func stopServiceOnQuit() {
     pendingServiceStop?.cancel()
     hostAppRecheck?.cancel()
-    guard effectivePresenceMode == .followCodex, serviceIntent == .stopped else { return }
+    guard let root = try? sourceRoot() else { return }
+    let task = Process()
+    task.executableURL = root.appendingPathComponent("bin/control")
+    task.arguments = ["service", "stop"]
+    task.currentDirectoryURL = root
+    try? task.run()
+  }
+
+  // Tray 即开关的另一半：tray 启动时若路由器未运行则拉起。必须先探活
+  // —— service start 对已运行的服务执行 kickstart 重启，无探活的
+  // 每次启动都会打断在途请求。
+  func ensureServiceRunningAtLaunch() async {
+    let configuredPort = ProcessInfo.processInfo.environment["MODEL_ROUTER_PORT"] ?? "4202"
+    guard let url = URL(string: "http://127.0.0.1:\(configuredPort)/health") else { return }
+    var request = URLRequest(url: url)
+    request.cachePolicy = .reloadIgnoringLocalCacheData
+    request.timeoutInterval = 2
+    if let (_, response) = try? await URLSession.shared.data(for: request),
+      (response as? HTTPURLResponse)?.statusCode == 200 {
+      return
+    }
     guard let root = try? sourceRoot() else { return }
     let task = Process()
     task.executableURL = root.appendingPathComponent("bin/control")

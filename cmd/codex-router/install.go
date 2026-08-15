@@ -279,21 +279,42 @@ func cmdUninstall(args []string) error {
 	return nil
 }
 
-// removeBinaryInstall 删除标准安装位置的二进制目录。
-// 返回用于状态行的人类可读片段。
+// removeBinaryInstall 清掉安装的工件。二进制可以住在操作者的共享目录
+//（如 ~/bin）里，那里还有人家自己的东西 —— 只删自己放下的三样：二进制
+// 本体、旁边的 config/ 注册表拷贝、bin/control 启动器（bin/ 目录空了
+// 才顺手删）。旧自包含布局（~/.local/share/codex-router-go）整个目录
+// 都是路由器的，整体删除。返回用于状态行的人类可读片段。
 func removeBinaryInstall() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ""
+	removed := false
+	if exe, err := selfBinaryPath(); err == nil {
+		dir := filepath.Dir(exe)
+		artifacts := []string{
+			exe,
+			filepath.Join(dir, "config"),
+			filepath.Join(dir, "bin", "control"),
+		}
+		for _, artifact := range artifacts {
+			if _, err := os.Stat(artifact); err == nil {
+				if err := os.RemoveAll(artifact); err == nil {
+					removed = true
+				}
+			}
+		}
+		// bin/ 目录只有在空的时候才移除 —— 非空说明里面有别人的东西。
+		os.Remove(filepath.Join(dir, "bin"))
 	}
-	dir := filepath.Join(home, ".local", "share", "codex-router-go")
-	if _, err := os.Stat(dir); err != nil {
-		return ""
+	if home, err := os.UserHomeDir(); err == nil {
+		legacy := filepath.Join(home, ".local", "share", "codex-router-go")
+		if _, err := os.Stat(legacy); err == nil {
+			if err := os.RemoveAll(legacy); err == nil {
+				removed = true
+			}
+		}
 	}
-	if err := os.RemoveAll(dir); err != nil {
-		return fmt.Sprintf(" (binary directory removal failed: %v — delete %s manually)", err, dir)
+	if removed {
+		return ", binary deleted"
 	}
-	return ", binary deleted"
+	return ""
 }
 
 // cmdDoctor：残血体检 —— 服务活、key 在、catalog 新鲜、config 集成、凭据可解析。

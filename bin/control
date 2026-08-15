@@ -2,4 +2,5 @@
 set -eu
 
 # Go 重写版的 control 面。旧 Node 入口在 git 历史里（git checkout -- bin/control）。
-exec "${CODEX_ROUTER_GO_BINARY:-$HOME/.local/share/codex-router-go/codex-router}" control "$@"
+# 操作者的二进制环境目录是 ~/bin；CODEX_ROUTER_GO_BINARY 可临时指向别处调试。
+exec "${CODEX_ROUTER_GO_BINARY:-$HOME/bin/codex-router}" control "$@"
