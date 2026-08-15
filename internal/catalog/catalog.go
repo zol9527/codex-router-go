@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"github.com/loyd/codex-router/internal/registry"
 	"github.com/loyd/codex-router/internal/state"
@@ -127,18 +128,37 @@ func runDebugModels(codexBinary string, bundled bool) ([]NativeModel, error) {
 // 它们渲染原生 GPT 选择）。
 func Build(native []NativeModel, regModels []*registry.Model, enabled func(providerID string) bool, includeNative bool, hidden map[string]bool) map[string]any {
 	models := []NativeModel{}
-	if includeNative {
-		for _, entry := range native {
-			if slug, _ := entry["slug"].(string); !hidden[slug] {
-				models = append(models, entry)
-			}
+	// 反馈环切断：路由器把自己的 catalog 发布进 Codex（model_catalog_json），
+	// `codex debug models` 随后会把路由模型当成"原生"条目抓回来。不过滤
+	// 的话，同一个模型在本目录里出现两份（反馈份 + 注册表份），picker
+	// 随之翻倍 —— 连已从注册表删除的模型都会从 Codex 的记忆里还魂。
+	// 规则：带 "/" 的 slug 一律是路由条目；再按 gateway_model 双保险。
+	routedKeys := map[string]bool{}
+	for _, m := range regModels {
+		routedKeys[m.Slug] = true
+		if m.GatewayModel != "" {
+			routedKeys[m.GatewayModel] = true
+		}
+		if m.UpstreamModel != "" {
+			routedKeys[m.UpstreamModel] = true
 		}
 	}
-	// 模板：取账号目录第一个条目（字段形状参考）；没有原生目录时
-	// 用最小模板。
+	filteredNative := make([]NativeModel, 0, len(native))
+	for _, entry := range native {
+		slug, _ := entry["slug"].(string)
+		gateway, _ := entry["gateway_model"].(string)
+		if hidden[slug] || strings.Contains(slug, "/") || routedKeys[slug] || routedKeys[gateway] {
+			continue
+		}
+		filteredNative = append(filteredNative, entry)
+	}
+	if includeNative {
+		models = append(models, filteredNative...)
+	}
+	// 模板：取账号目录第一个真原生条目（字段形状参考）；没有时用最小模板。
 	template := NativeModel{}
-	if len(native) > 0 {
-		for k, v := range native[0] {
+	if len(filteredNative) > 0 {
+		for k, v := range filteredNative[0] {
 			template[k] = v
 		}
 	}
