@@ -62,13 +62,22 @@ struct ModelRouterTrayApp: App {
   @ObservedObject private var store = RouterStore.shared
 
   var body: some Scene {
+    // 完整 App：主窗口承载全部功能（红叉只关窗，App 与服务继续），
+    // 菜单栏图标保留为速览/速控。
+    WindowGroup {
+      TrayView(store: store, presentation: .window)
+        .preferredColorScheme(.dark)
+    }
+    .windowResizability(.contentSize)
+    .defaultSize(width: 430, height: 640)
+
     // The insertion binding is read-only from our side: visibility is decided
     // by the presence mode, not by the system writing back.
     MenuBarExtra(isInserted: Binding(
       get: { store.surfacesVisible },
       set: { _ in }
     )) {
-      TrayView(store: store)
+      TrayView(store: store, presentation: .menuBar)
         .frame(width: 352, height: 560)
     } label: {
       StatusItemLabel(store: store)
@@ -85,7 +94,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   private var surfaceVisibility: AnyCancellable?
 
   func applicationDidFinishLaunching(_ notification: Notification) {
-    NSApp.setActivationPolicy(.accessory)
+    // 完整 App 形态：Dock 图标 + 主窗口。菜单栏速览保留（MenuBarExtra
+    // 在 regular 应用里照常工作）。LSUIElement 已从 Info.plist 移除，
+    // 这里的代码值与 plist 保持一致，双保险。
+    NSApp.setActivationPolicy(.regular)
     islandController = IslandWindowController(store: store)
     desktopPanelController = DesktopPanelWindowController(store: store)
     surfaceVisibility = store.$surfacesVisible
@@ -136,6 +148,12 @@ final class RouterStore: ObservableObject {
   @Published private(set) var snapshot = RouterSnapshot.empty
   @Published private(set) var isRefreshing = false
   @Published private(set) var message: String?
+
+  /// 非用户操作的异步通知（服务崩溃放弃重拉等）。清空逻辑沿用
+  /// message 的既有生命周期（下一次操作覆盖）。
+  func publishNotice(_ text: String) {
+    message = text
+  }
   @Published private(set) var lastUpdated: Date?
   @Published private(set) var selectedUsageProviderID: String
   @Published private(set) var activityState: RouterActivityState = .idle
@@ -624,39 +642,21 @@ final class RouterStore: ObservableObject {
     await refresh()
   }
 
-  // 操作者规定：tray 退出即关闭路由器（quit = off）。分离进程执行，
-  // 退出绝不等待服务应答。下次登录 launchd 会照常把服务拉起；tray
-  // 重新打开时由 ensureServiceRunningAtLaunch 拉起。
+  // 操作者规定：App 退出即服务退出（quit = off）。托管路径交给
+  // ServiceSupervisor（它直接 SIGTERM 自己的子进程）；若服务是外部
+  // 拉起的（~/bin CLI），以分离进程走 control service stop（pidfile
+  // SIGTERM），退出不等待应答。
   func stopServiceOnQuit() {
     pendingServiceStop?.cancel()
     hostAppRecheck?.cancel()
-    guard let root = try? sourceRoot() else { return }
-    let task = Process()
-    task.executableURL = root.appendingPathComponent("bin/control")
-    task.arguments = ["service", "stop"]
-    task.currentDirectoryURL = root
-    try? task.run()
+    ServiceSupervisor.shared.stopForAppQuit()
   }
 
-  // Tray 即开关的另一半：tray 启动时若路由器未运行则拉起。必须先探活
-  // —— service start 对已运行的服务执行 kickstart 重启，无探活的
-  // 每次启动都会打断在途请求。
+  // App 即开关的另一半：App 启动时若路由器未运行则拉起（以托管子进程
+  // 形态，崩溃自动重拉）。探活先行 —— 端口已被外部实例服务时绝不
+  // 再拉一个（bind 冲突 + 抢主）。
   func ensureServiceRunningAtLaunch() async {
-    let configuredPort = ProcessInfo.processInfo.environment["MODEL_ROUTER_PORT"] ?? "4202"
-    guard let url = URL(string: "http://127.0.0.1:\(configuredPort)/health") else { return }
-    var request = URLRequest(url: url)
-    request.cachePolicy = .reloadIgnoringLocalCacheData
-    request.timeoutInterval = 2
-    if let (_, response) = try? await URLSession.shared.data(for: request),
-      (response as? HTTPURLResponse)?.statusCode == 200 {
-      return
-    }
-    guard let root = try? sourceRoot() else { return }
-    let task = Process()
-    task.executableURL = root.appendingPathComponent("bin/control")
-    task.arguments = ["service", "start"]
-    task.currentDirectoryURL = root
-    try? task.run()
+    await ServiceSupervisor.shared.startIfNotRunning()
   }
 
   private static let providerShortNames: [String: String] = [
@@ -2023,13 +2023,20 @@ final class RouterStore: ObservableObject {
     }
   }
 
+  // 设置行的窄口：runControl 是 store 的私有工作面，TrayView 的
+  // 「打开配置文件」只需要一次性 fire-and-forget 命令。
+  func runControlPublic(arguments: [String]) async throws -> Data {
+    try await runControl(arguments: arguments)
+  }
+
   private func runControl(arguments: [String], stdin: Data? = nil) async throws -> Data {
-    let root = try sourceRoot()
+    let router = try RouterProcessLocator.shared.resolve()
     return try await Task.detached {
       let task = Process()
-      task.executableURL = root.appendingPathComponent("bin/control")
-      task.arguments = arguments
-      task.currentDirectoryURL = root
+      task.executableURL = router.url
+      // 直接二进制需要 "control" 前缀；bin/control 包装器已含它。
+      task.arguments = router.needsControlPrefix ? ["control"] + arguments : arguments
+      task.currentDirectoryURL = router.url.deletingLastPathComponent()
       var environment = ProcessInfo.processInfo.environment
       let home = FileManager.default.homeDirectoryForCurrentUser.path
       let preferredPaths = [
@@ -2067,25 +2074,214 @@ final class RouterStore: ObservableObject {
       return stdout
     }.value
   }
+}
 
-  private func sourceRoot() throws -> URL {
-    guard let configured = Bundle.main.object(forInfoDictionaryKey: "ModelRouterSourceRoot") as? String,
-      !configured.isEmpty
-    else {
-      throw RouterError("Cannot find this Model Router checkout. Rebuild the tray app from the router repository.")
-    }
-    return try validatedSourceRoot(URL(fileURLWithPath: configured, isDirectory: true))
+// 路由器可执行文件的解析。发行形态：二进制内嵌在 App bundle 的
+// MacOS/ 里（App 化的核心 —— .app 即部署单元）。回退链：
+// ModelRouterSourceRoot/bin/control（开发 checkout）、~/bin/codex-router
+//（操作者布局）。任选其一可用即走。
+final class RouterProcessLocator {
+  static let shared = RouterProcessLocator()
+
+  struct Resolved {
+    let url: URL
+    let needsControlPrefix: Bool
   }
 
-  private func validatedSourceRoot(_ root: URL) throws -> URL {
-    let resolvedRoot = root.standardizedFileURL.resolvingSymlinksInPath()
-    let control = resolvedRoot.appendingPathComponent("bin/control")
-    guard FileManager.default.isExecutableFile(atPath: control.path) else {
-      throw RouterError("Cannot find this Model Router checkout. Rebuild the tray app from the router repository.")
+  private enum Candidate {
+    case direct(URL)      // codex-router 二进制
+    case wrapper(URL)     // bin/control 脚本
+  }
+
+  func resolve() throws -> Resolved {
+    switch firstCandidate() {
+    case .direct(let url): return Resolved(url: url, needsControlPrefix: true)
+    case .wrapper(let url): return Resolved(url: url, needsControlPrefix: false)
+    case nil:
+      throw RouterError("Cannot find the codex-router binary. Rebuild the app from the router repository.")
     }
-    return resolvedRoot
+  }
+
+  private func firstCandidate() -> Candidate? {
+    let fm = FileManager.default
+    // 1. bundle 内嵌二进制（发行形态）。
+    if let bundleURL = Bundle.main.executableURL?.deletingLastPathComponent()
+      .appendingPathComponent("codex-router"),
+      fm.isExecutableFile(atPath: bundleURL.path) {
+      return .direct(bundleURL)
+    }
+    // 2. ModelRouterSourceRoot 的 bin/control（开发 checkout 构建）。
+    if let configured = Bundle.main.object(forInfoDictionaryKey: "ModelRouterSourceRoot") as? String,
+      !configured.isEmpty {
+      let control = URL(fileURLWithPath: configured, isDirectory: true)
+        .standardizedFileURL.resolvingSymlinksInPath()
+        .appendingPathComponent("bin/control")
+      if fm.isExecutableFile(atPath: control.path) {
+        return .wrapper(control)
+      }
+    }
+    // 3. 操作者布局 ~/bin/codex-router。
+    let homeBinary = FileManager.default.homeDirectoryForCurrentUser
+      .appendingPathComponent("bin/codex-router")
+    if fm.isExecutableFile(atPath: homeBinary.path) {
+      return .direct(homeBinary)
+    }
+    return nil
   }
 }
+
+// ServiceSupervisor：App 化后的服务生命周期所有者。
+//
+// 契约（操作者拍板）：
+//   - App 打开 → 探活 /health，没跑才 spawn serve 子进程（托管形态）
+//   - 子进程意外退出 → 探活：端口仍健康说明外部实例接管（bind 冲突
+//     是我们输掉了），不再重拉；不健康则退避重拉（上限后放弃并上报）
+//   - App 退出 → SIGTERM 子进程等优雅排空（最长 3s），仍活着 SIGKILL
+//     —— 服务随 App 走是硬约束，孤儿进程比硬杀更违背契约
+//   - 外部实例（~/bin CLI 拉起）不归我们托管，退出时通过 control
+//     service stop（pidfile SIGTERM）请它退场
+final class ServiceSupervisor {
+  static let shared = ServiceSupervisor()
+
+  private let queue = DispatchQueue(label: "router.service-supervisor")
+  private var child: Process?
+  private var quitting = false
+  private var restartAttempts = 0
+  private var onUnrecoverable: ((String) -> Void)?
+
+  private var healthURL: URL {
+    let port = ProcessInfo.processInfo.environment["MODEL_ROUTER_PORT"] ?? "4202"
+    return URL(string: "http://127.0.0.1:\(port)/health")!
+  }
+
+  private var stateDir: String {
+    ProcessInfo.processInfo.environment["CODEX_ROUTER_STATE_DIR"]
+      ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex-router").path
+  }
+
+  func startIfNotRunning() async {
+    guard !quitting else { return }
+    if await probeHealthy() { return } // 外部实例在服务，别抢
+    queue.sync {
+      guard self.child == nil || !self.child!.isRunning else { return }
+      self.spawnChild()
+    }
+  }
+
+  func stopForAppQuit() {
+    queue.sync {
+      quitting = true
+      guard let child, child.isRunning else { return }
+      child.terminate() // SIGTERM → Go 侧 10s 优雅排空
+      // App 退出是硬边界：给 3 秒优雅，之后强杀 —— 子进程绝不许
+      // 活过 App（孤儿服务违背 "App 退出即服务退出" 的契约）。
+      let deadline = Date().addingTimeInterval(3)
+      while child.isRunning && Date() < deadline {
+        Thread.sleep(forTimeInterval: 0.05)
+      }
+      if child.isRunning {
+        kill(child.processIdentifier, SIGKILL)
+      }
+    }
+    // 服务不是我们拉起的（外部 ~/bin CLI）：请 pidfile 里的进程退场。
+    // 分离执行，退出不等待。
+    if !queue.sync(execute: { child?.isRunning ?? false }) {
+      let task = Process()
+      do {
+        let router = try RouterProcessLocator.shared.resolve()
+        task.executableURL = router.url
+        task.arguments = router.needsControlPrefix
+          ? ["control", "service", "stop"] : ["service", "stop"]
+        try? task.run()
+      } catch {
+        // 找不到二进制时无事可做 —— 我们本就没拉起过服务。
+      }
+    }
+  }
+
+  private func spawnChild() {
+    guard let router = try? RouterProcessLocator.shared.resolve() else {
+      reportUnrecoverable("Cannot find the codex-router binary inside the app.")
+      return
+    }
+    let task = Process()
+    task.executableURL = router.url
+    task.arguments = ["serve", "--state", stateDir]
+    task.standardOutput = appLogFile()
+    task.standardError = appLogFile()
+    task.terminationHandler = { [weak self] exited in
+      self?.queue.async { self?.childExited(exited) }
+    }
+    do {
+      try task.run()
+      child = task
+    } catch {
+      reportUnrecoverable("Failed to start the router service: \(error.localizedDescription)")
+    }
+  }
+
+  // 子进程退出。quitting 是我们主动停（App 退出）；其余按健康度分诊。
+  private func childExited(_ process: Process) {
+    if process !== child { return }
+    child = nil
+    guard !quitting else { return }
+    queue.asyncAfter(deadline: .now() + .milliseconds(300)) { [weak self] in
+      // 端口仍健康 = 外部实例在服务（我们 bind 输了或被顶替）：
+      // 不重拉，避免双实例互踩。
+      Task { [weak self] in
+        guard let self else { return }
+        if await self.probeHealthy() { return }
+        self.queue.async { self.scheduleRestart() }
+      }
+    }
+  }
+
+  private func scheduleRestart() {
+    guard !quitting else { return }
+    restartAttempts += 1
+    guard restartAttempts <= 5 else {
+      reportUnrecoverable("Router service crashed \(restartAttempts - 1) times; giving up. Check router.log.")
+      return
+    }
+    // 1s → 2s → 4s → 8s → 16s：崩溃风暴不该把 CPU 点着。
+    let delay = Double(1 << (restartAttempts - 1))
+    queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+      guard let self, !self.quitting, self.child == nil else { return }
+      Task { await self.startIfNotRunning() }
+    }
+  }
+
+  private func probeHealthy() async -> Bool {
+    var request = URLRequest(url: healthURL)
+    request.cachePolicy = .reloadIgnoringLocalCacheData
+    request.timeoutInterval = 2
+    guard let (_, response) = try? await URLSession.shared.data(for: request) else { return false }
+    return (response as? HTTPURLResponse)?.statusCode == 200
+  }
+
+  // router.log 追加句柄。serve 自身的日志（listen/错误）落这里，与
+  // 旧 launchd StandardErrorPath 行为一致。
+  private var logHandle: FileHandle?
+  private func appLogFile() -> FileHandle {
+    if let logHandle { return logHandle }
+    let path = (stateDir as NSString).appendingPathComponent("router.log")
+    let fm = FileManager.default
+    if !fm.fileExists(atPath: path) {
+      fm.createFile(atPath: path, contents: nil, attributes: [.posixPermissions: 0o600])
+    }
+    let handle = FileHandle(forWritingAtPath: path)
+    _ = try? handle?.seekToEnd()
+    logHandle = handle
+    return handle ?? FileHandle.nullDevice
+  }
+
+  private func reportUnrecoverable(_ message: String) {
+    Task { @MainActor in
+      RouterStore.shared.publishNotice(message)
+    }
+  }
+}
+
 
 private struct RouterHealth: Decodable {
   let activity: RouterActivity
@@ -2824,11 +3020,57 @@ enum TrayTab: String, CaseIterable, Identifiable {
   }
 }
 
+// 呈现场景：主窗口（完整 App 形态）与菜单栏弹出（速览形态）。
+// 同一套内容，两处渲染 —— 窗口模式加一点呼吸空间与 App 头像。
+enum TrayPresentation { case window, menuBar }
+
 private struct TrayView: View {
   @ObservedObject var store: RouterStore
+  var presentation: TrayPresentation = .menuBar
   @AppStorage("trayTab") private var tab: TrayTab = .usage
   @State private var providersExpanded = true
   @State private var savingsRange: SavingsRange = .day
+  // 登录项状态：App 化后服务只随 App 运行，开机自启 = 把 App 注册为
+  // 登录项（SMAppService）。nil = 状态不可用（非 bundle 运行）。
+  @State private var loginItemEnabled: Bool?
+  @State private var loginItemError: String?
+
+  private var isWindow: Bool { presentation == .window }
+
+  private func refreshLoginItemStatus() {
+    guard Bundle.main.bundleIdentifier != nil else {
+      loginItemEnabled = nil
+      return
+    }
+    loginItemEnabled = SMAppService.mainApp.status == .enabled
+  }
+
+  private func setLoginItem(_ enabled: Bool) {
+    do {
+      if enabled {
+        try SMAppService.mainApp.register()
+      } else {
+        try SMAppService.mainApp.unregister()
+      }
+      loginItemError = nil
+    } catch {
+      loginItemError = error.localizedDescription
+    }
+    refreshLoginItemStatus()
+  }
+
+  // 打开凭证配置：不存在则先生成带注释的模板（control config init），
+  // 再交给系统默认文本编辑器 —— Claude Code 式的 config.toml 是操作
+  // 者填 key 的家。
+  private func openCredentialsConfig() {
+    Task {
+      _ = try? await store.runControlPublic(arguments: ["config", "init"])
+      let dir = ProcessInfo.processInfo.environment["CODEX_ROUTER_STATE_DIR"]
+        ?? FileManager.default.homeDirectoryForCurrentUser
+          .appendingPathComponent(".codex-router").path
+      NSWorkspace.shared.open(URL(fileURLWithPath: dir + "/config.toml"))
+    }
+  }
 
   private var target: RouterTarget? { store.snapshot.targets["codex"] }
   // Rows come from the registry snapshot, not from the models in the picker.
@@ -2879,6 +3121,14 @@ private struct TrayView: View {
 
   private var header: some View {
     HStack(alignment: .center, spacing: 12) {
+      // 窗口形态给 App 头像（App icon 的同源渲染）；菜单栏弹出
+      // 寸土寸金，保持纯文字。
+      if isWindow {
+        Image(nsImage: NSApp.applicationIconImage)
+          .resizable()
+          .frame(width: 34, height: 34)
+          .accessibilityLabel(routerLocalized("Model Router"))
+      }
       VStack(alignment: .leading, spacing: 3) {
         Text(routerLocalized("Model Router"))
           .font(.system(size: 15, weight: .semibold))
@@ -3246,6 +3496,57 @@ private struct TrayView: View {
       .pickerStyle(.menu)
       .labelsHidden()
       .frame(width: 168)
+    }
+    .padding(.vertical, 2)
+    // App 化：服务只随 App 运行，开机自启的形态是「登录时启动 App」。
+    HStack(spacing: 12) {
+      VStack(alignment: .leading, spacing: 3) {
+        Text(routerLocalized("Launch at Login"))
+          .font(.system(size: 12, weight: .medium))
+        Text(routerLocalized(
+          "Start Model Router automatically when you log in. The router service runs only while the app is open."
+        ))
+        .font(.system(size: 10))
+        .foregroundStyle(routerMuted)
+        if let loginItemError {
+          Text(loginItemError)
+            .font(.system(size: 9))
+            .foregroundStyle(routerRed.opacity(0.9))
+            .lineLimit(2)
+        }
+      }
+      Spacer()
+      if let enabled = loginItemEnabled {
+        Toggle("", isOn: Binding(
+          get: { enabled },
+          set: { setLoginItem($0) }
+        ))
+        .toggleStyle(.switch)
+        .labelsHidden()
+      } else {
+        Text(routerLocalized("Login item status unavailable (app not in a bundle)."))
+          .font(.system(size: 9))
+          .foregroundStyle(routerMuted)
+      }
+    }
+    .padding(.vertical, 2)
+    .onAppear { refreshLoginItemStatus() }
+    // 凭证配置文件：Claude Code 式 config.toml，一按钮直达。
+    HStack(spacing: 12) {
+      VStack(alignment: .leading, spacing: 3) {
+        Text(routerLocalized("Credentials config"))
+          .font(.system(size: 12, weight: .medium))
+        Text(routerLocalized(
+          "Open ~/.codex-router/config.toml — paste API keys under each provider; takes effect on the next request."
+        ))
+        .font(.system(size: 10))
+        .foregroundStyle(routerMuted)
+      }
+      Spacer()
+      Button(routerLocalized("Open Config")) {
+        openCredentialsConfig()
+      }
+      .buttonStyle(AccentButtonStyle())
     }
     .padding(.vertical, 2)
     HStack(spacing: 12) {

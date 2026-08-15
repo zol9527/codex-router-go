@@ -18,6 +18,9 @@ swift build -c "$configuration" --package-path "$tray_dir" 1>&2
 mkdir -p "$bundle_dir/Contents/MacOS" "$bundle_dir/Contents/Resources"
 cp "$binary_dir/ModelRouterTray" "$bundle_dir/Contents/MacOS/ModelRouterTray"
 cp "$tray_dir/Resources/Info.plist" "$bundle_dir/Contents/Info.plist"
+# App 化的核心一步：Go 服务二进制内嵌进 bundle（注册表已 go:embed，
+# 二进制自包含）。App 即部署单元 —— 打开 App 服务起，退出 App 服务停。
+go build -o "$bundle_dir/Contents/MacOS/codex-router" "$repo_dir/cmd/codex-router" 1>&2
 # The icon is committed as a built .icns, not rasterized here: scripts/build-app-icon.sh
 # needs sips and iconutil, and a tray build must not start depending on them.
 # Without this file the bundle falls back to the generic macOS app icon, which
@@ -36,9 +39,8 @@ fi
 # invalid inside a strict macOS code-signed bundle; a loose text resource would
 # be executable-path input. This value is covered by the final signature, so
 # changing the selected checkout also invalidates verification.
-# MODEL_ROUTER_TRAY_ROOT overrides the baked root for the self-contained
-# install (the Go router's install dir carries its own bin/control); default
-# stays the checkout for source-tree use.
+# 发行形态下 App 优先用内嵌二进制（Contents/MacOS/codex-router），
+# ModelRouterSourceRoot 只是开发回退 —— bin/control 所在的 checkout。
 tray_root=${MODEL_ROUTER_TRAY_ROOT:-$repo_dir}
 /usr/libexec/PlistBuddy -c "Add :ModelRouterSourceRoot string $tray_root" \
   "$bundle_dir/Contents/Info.plist"

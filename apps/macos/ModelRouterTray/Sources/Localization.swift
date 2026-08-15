@@ -78,6 +78,12 @@ func routerFormat(_ english: String, _ arguments: CVarArg...) -> String {
 
 enum RouterChineseText {
   static let values: [String: String] = [
+    "Launch at Login": "登录时启动",
+    "Start Model Router automatically when you log in. The router service runs only while the app is open.": "登录后自动打开 Model Router。路由服务只在 App 打开时运行。",
+    "Login item status unavailable (app not in a bundle).": "登录项状态不可用（App 不在 bundle 内）。",
+    "Credentials config": "凭证配置",
+    "Open ~/.codex-router/config.toml — paste API keys under each provider; takes effect on the next request.": "打开 ~/.codex-router/config.toml —— 在各 provider 下粘贴 API key，下一回合请求即生效。",
+    "Open Config": "打开配置",
     "Uninstalling": "正在卸载",
     "Compact old tool results (experimental)": "压缩旧工具结果（实验性）",
     "Off by default · replaces consumed tool results on external models": "默认关闭 · 在外部模型上替换已使用的工具结果",
