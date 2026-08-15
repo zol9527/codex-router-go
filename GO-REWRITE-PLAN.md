@@ -48,7 +48,11 @@
 > 为终端 CLI（更新命令见待办）。`control reload` 不重启地重读配置、
 > 刷新 catalog 并重发布集成块（含 config.toml 整文校验，坏文件带行号
 > 报错）。
-> **操作者待办**：`./bin/control credential zai-coding`（stdin 输入 key）
+> **协作子代理面已移植**（multiAgentVersion 证明标记 → catalog 发布 →
+> agents 目录按名 spawn 定义 → control subagents 三模式），注册表里
+> 原项目证明过的 grok v2 声明随 fork 保留（provider 未启用故不产出
+> 定义）；zai/opencode 模型尚无 v2 —— 按铁律待真实探针（需先填 key）。
+> **操作者待办：`./bin/control credential zai-coding`（stdin 输入 key）
 > 与 `credential opencode-go` 启用路由模型；tray 已构建安装于
 > ~/Applications/Model Router.app 并在菜单栏运行，面板点「刷新」即得
 > 全量数据。uninstall 零痕迹（plist/二进制目录/config 块全清，state
