@@ -153,41 +153,6 @@ func TestRunDetachedPull(t *testing.T) {
 	}
 }
 
-// 基准打分：全命中 100%；归一化（$、逗号、大小写）；文本准确率独立。
-func TestScoreTranscript(t *testing.T) {
-	transcript := strings.Join([]string{
-		"Invoice INV-7734-QX and RC-2291-BB77",
-		"Items: Widget A-12, Cable K-9",
-		"Totals: $3,417.62  1,155.00  162.60  2,100.02  82.50  27.10",
-		"Dates: 2026-03-14 to 2026-04-13",
-		"A purple pentagon and a green circle.",
-	}, "\n")
-	score := ScoreTranscript(transcript)
-	if score.Percent != 100 || score.TextPercent != 100 {
-		t.Errorf("full read should score 100: %+v", score)
-	}
-	if AccuracyTier(score) != "accurate" {
-		t.Errorf("tier = %s", AccuracyTier(score))
-	}
-
-	// 只读形状颜色、编造数字：overall 部分分但 text 为零 → captions-only。
-	captioner := "A purple pentagon and a green circle. Invoice number INV-0000."
-	score = ScoreTranscript(captioner)
-	if score.TextPercent >= 40 {
-		t.Errorf("fabricated numbers must tank text score: %+v", score)
-	}
-	if AccuracyTier(score) != "captions-only" {
-		t.Errorf("tier = %s, want captions-only", AccuracyTier(score))
-	}
-
-	// 数字漂移容差：千分位/货币格式不惩罚。
-	drifted := "3 417.62 and $1,155.00 and 2100.02 and 82.50 27.10 162.60"
-	score = ScoreTranscript(drifted)
-	if entry := score.Groups["numbers"]; entry.Found != entry.Total {
-		t.Errorf("currency drift must not be punished: %+v", entry)
-	}
-}
-
 // 目录排序：measured-accurate 优先、untested 中间、captions-only 垫底，
 // 同档小下载优先 —— picker 永不把自信-读错放最上。
 func TestRankedLocalVision(t *testing.T) {

@@ -5,13 +5,11 @@ package main
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/loyd/codex-router/internal/registry"
@@ -47,11 +45,11 @@ func cmdVisionPullWorker(args []string) error {
 // controlVisionBridge 处理 control vision-bridge <action>。
 // stateDir 由 cmdControl 解析传入（--state 的剥离在那里统一完成）。
 // on/off/engine/effort/local 是 tray 设置页视觉卡的写路径；
-// pull/pull-status/benchmark/catalog 管本地模型与测量。
+// pull/pull-status/catalog 管本地模型目录。
 // reg 供 engine 动作校验 pin 的 slug（registry 视觉模型 + native 目录）。
 func controlVisionBridge(stateDir string, reg *registry.Registry, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("vision-bridge requires on|off|engine|effort|local|status|pull|pull-status|benchmark|catalog")
+		return fmt.Errorf("vision-bridge requires on|off|engine|effort|local|status|pull|pull-status|catalog")
 	}
 	st, err := state.Open(stateDir)
 	if err != nil {
@@ -246,116 +244,6 @@ func printVisionStatus(st *state.State, reg *registry.Registry) error {
 		return err
 	}
 	fmt.Println(string(raw))
-	return nil
-}
-
-// runBenchmark 对已安装的本地视觉模型测量文本读准率。
-// 只测已在盘上的模型 —— 测量绝不能顺手触发多 GB 下载。
-func runBenchmark(stateDir string, args []string) error {
-	asJSON := false
-	var only []string
-	for _, arg := range args {
-		if arg == "--json" {
-			asJSON = true
-			continue
-		}
-		only = append(only, arg)
-	}
-	baseURL := vision.DefaultLocalVisionBaseURL
-	probe := vision.ProbeLocalServer(context.Background(), nil, baseURL)
-	if !probe.Reachable {
-		if _, err := vision.EnsureHeadless(context.Background(), stateDir, baseURL); err != nil {
-			return fmt.Errorf("no local runtime at %s: %v", baseURL, err)
-		}
-		probe = vision.ProbeLocalServer(context.Background(), nil, baseURL)
-	}
-	installed := map[string]bool{}
-	for _, model := range probe.Models {
-		installed[model] = true
-	}
-	var candidates []string
-	if len(only) > 0 {
-		candidates = only
-	} else {
-		for _, model := range vision.RankedLocalVision() {
-			candidates = append(candidates, model.Tag)
-		}
-	}
-	var runnable []string
-	for _, tag := range candidates {
-		if installed[tag] || installed[tag+":latest"] {
-			runnable = append(runnable, tag)
-		}
-	}
-	if len(runnable) == 0 {
-		return fmt.Errorf("none of the catalog models are installed; pull one first, e.g. `vision-bridge pull qwen2.5vl:3b`")
-	}
-
-	raw := vision.BenchmarkFixture()
-	dataURL := "data:image/png;base64," + base64.StdEncoding.EncodeToString(raw)
-
-	var results []vision.BenchmarkResult
-	for _, tag := range runnable {
-		if !asJSON {
-			fmt.Fprintf(os.Stderr, "benchmarking %s…\n", tag)
-		}
-		started := time.Now()
-		result := vision.BenchmarkResult{Tag: tag}
-		settings := vision.Settings{LocalModel: tag, LocalBaseURL: baseURL}
-		reader := vision.NewReader(func(ctx context.Context, e vision.Engine, effort, question, image string) (string, error) {
-			_ = e
-			_ = effort
-			body := vision.ChatDescribeRequest(settings.LocalModel, question, image)
-			status, raw, err := vision.PostJSON(ctx, nil, vision.OllamaRootOf(baseURL)+"/chat/completions",
-				map[string]string{"Accept": "application/json"}, body)
-			if err != nil {
-				return "", err
-			}
-			if status != 200 {
-				return "", fmt.Errorf("HTTP %d", status)
-			}
-			return vision.ParseChatDescribeResponse(raw)
-		})
-		transcript, err := reader.Read(context.Background(), []vision.Engine{{Slug: tag, Local: true, ImageCapable: true}},
-			vision.ImagePart{DataURL: dataURL})
-		result.Seconds = float64(time.Since(started).Milliseconds()) / 1000.0
-		if err != nil {
-			result.OK = false
-			result.Error = err.Error()
-		} else {
-			result.OK = true
-			result.Transcript = transcript.Transcript
-			score := vision.ScoreTranscript(transcript.Transcript)
-			result.Percent = score.Percent
-			result.TextPercent = score.TextPercent
-			result.Tier = vision.AccuracyTier(score)
-		}
-		vision.SaveBenchmarkResult(stateDir, tag, result)
-		results = append(results, result)
-	}
-	if asJSON {
-		raw, _ := json.MarshalIndent(map[string]any{"results": results}, "", "  ")
-		fmt.Println(string(raw))
-		return nil
-	}
-	fmt.Printf("\n%-24s%-8s%-16stime\n", "model", "score", "tier")
-	for _, result := range results {
-		if !result.OK {
-			fmt.Printf("%-24s%-8s%s\n", result.Tag, "error", result.Error)
-			continue
-		}
-		fmt.Printf("%-24s%-8s%-16s%.1fs\n", result.Tag,
-			fmt.Sprintf("%d%%", result.Percent), result.Tier, result.Seconds)
-		score := vision.ScoreTranscript(result.Transcript)
-		for _, group := range []string{"codes", "numbers", "dates", "shapes", "colors"} {
-			entry := score.Groups[group]
-			if entry.Found == entry.Total {
-				continue
-			}
-			fmt.Printf("  %s: %d/%d — missed %s\n", group, entry.Found, entry.Total,
-				strings.Join(entry.Missed, ", "))
-		}
-	}
 	return nil
 }
 
