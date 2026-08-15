@@ -1987,7 +1987,9 @@ final class ServiceSupervisor {
     do {
       try task.run()
       child = task
+      supervisorLog("spawned serve pid \(task.processIdentifier)")
     } catch {
+      supervisorLog("spawn failed: \(error.localizedDescription)")
       reportUnrecoverable("Failed to start the router service: \(error.localizedDescription)")
     }
   }
@@ -2002,7 +2004,10 @@ final class ServiceSupervisor {
       // 不重拉，避免双实例互踩。
       Task { [weak self] in
         guard let self else { return }
-        if await self.probeHealthy() { return }
+        if await self.probeHealthy() {
+          self.supervisorLog("child exited but port healthy — external instance took over")
+          return
+        }
         self.queue.async { self.scheduleRestart() }
       }
     }
@@ -2012,11 +2017,14 @@ final class ServiceSupervisor {
     guard !quitting else { return }
     restartAttempts += 1
     guard restartAttempts <= 5 else {
+      supervisorLog("crashed \(restartAttempts - 1) times; giving up")
       reportUnrecoverable("Router service crashed \(restartAttempts - 1) times; giving up. Check router.log.")
       return
     }
     // 1s → 2s → 4s → 8s → 16s：崩溃风暴不该把 CPU 点着。
     let delay = Double(1 << (restartAttempts - 1))
+    supervisorLog("crash restart attempt \(restartAttempts) in \(delay)s")
+
     queue.asyncAfter(deadline: .now() + delay) { [weak self] in
       guard let self, !self.quitting, self.child == nil else { return }
       Task { await self.startIfNotRunning() }
@@ -2033,6 +2041,16 @@ final class ServiceSupervisor {
 
   // router.log 追加句柄。serve 自身的日志（listen/错误）落这里，与
   // 旧 launchd StandardErrorPath 行为一致。
+  /// Supervisor 事件落 router.log —— 下次"没拉起服务"不再是无证据
+  /// 悬案（2026-08-15 14:52 那次就查不到原因）。
+  private func supervisorLog(_ message: String) {
+    let line = "[supervisor] \(message)\n"
+    let handle = appLogFile()
+    if handle != FileHandle.nullDevice {
+      _ = try? handle.write(contentsOf: Data(line.utf8))
+    }
+  }
+
   private var logHandle: FileHandle?
   private func appLogFile() -> FileHandle {
     if let logHandle { return logHandle }
@@ -2591,70 +2609,66 @@ struct ProviderSetupState: Decodable, Identifiable, Equatable {
   let anonymousNote: String?
 }
 
-/// 菜单栏必须使用无背景的单色 template mark；Dock 的 AppIcon 含深色底和
-/// 渐变，直接缩到 18 pt 会显得像一颗不协调的按钮。这里保留 AppIcon 的
-/// “一个请求分流到多个模型”语义，并让 `.primary` 在深色菜单栏呈白色、
-/// 在浅色菜单栏自动变深，始终保持可见。
+/// 菜单栏必须使用真正的 NSImage template mark；Dock 的 AppIcon 含深色底和
+/// 渐变，直接缩到 18 pt 会显得像一颗不协调的按钮。`isTemplate` 把下方的
+/// 黑色几何当作 alpha 蒙版交给状态栏着色：深色菜单栏是白色，浅色菜单栏则
+/// 自动变深，不能再因 SwiftUI `Color.primary` 的环境解析而隐形。
 private struct RouterMenuBarIcon: View {
-  private let canvasSize: CGFloat = 20
-
   var body: some View {
-    Canvas { context, size in
-      let scale = min(size.width, size.height) / canvasSize
-      let offsetX = (size.width - canvasSize * scale) / 2
-      let offsetY = (size.height - canvasSize * scale) / 2
-      func point(_ x: CGFloat, _ y: CGFloat) -> CGPoint {
-        CGPoint(x: offsetX + x * scale, y: offsetY + y * scale)
-      }
-
-      // 一个入站节点连接三个可选上游；曲线在小尺寸下比直角分叉更清晰。
-      var links = Path()
-      links.move(to: point(2.5, 10))
-      links.addLine(to: point(8, 10))
-      links.move(to: point(8, 10))
-      links.addCurve(
-        to: point(16.5, 4),
-        control1: point(10.5, 10),
-        control2: point(12.5, 4)
-      )
-      links.move(to: point(8, 10))
-      links.addLine(to: point(16.5, 10))
-      links.move(to: point(8, 10))
-      links.addCurve(
-        to: point(16.5, 16),
-        control1: point(10.5, 10),
-        control2: point(12.5, 16)
-      )
-      context.stroke(
-        links,
-        with: .color(.primary),
-        style: StrokeStyle(lineWidth: 1.8 * scale, lineCap: .round, lineJoin: .round)
-      )
-
-      let nodes: [(x: CGFloat, y: CGFloat, radius: CGFloat)] = [
-        (2.5, 10.0, 1.45),
-        (8.0, 10.0, 1.55),
-        (16.5, 4.0, 1.35),
-        (16.5, 10.0, 1.35),
-        (16.5, 16.0, 1.35),
-      ]
-      for (x, y, radius) in nodes {
-        let center = point(x, y)
-        let diameter = radius * 2 * scale
-        context.fill(
-          Path(ellipseIn: CGRect(
-            x: center.x - diameter / 2,
-            y: center.y - diameter / 2,
-            width: diameter,
-            height: diameter
-          )),
-          with: .color(.primary)
-        )
-      }
-    }
-    .frame(width: 18, height: 18)
+    Image(nsImage: RouterMenuBarTemplate.image)
+      .renderingMode(.template)
     .accessibilityLabel("Model Router")
   }
+}
+
+/// 小号菜单栏图标独立于 Dock 的大图标。所有几何均为实心黑色，`isTemplate`
+/// 让 AppKit 只取其 alpha 作为蒙版；这正是系统状态栏图标的渲染契约。
+enum RouterMenuBarTemplate {
+  static let image: NSImage = {
+    let size = NSSize(width: 18, height: 18)
+    let image = NSImage(size: size, flipped: false) { _ in
+      NSColor.black.setFill()
+
+      // 一个入站节点连接三个可选上游；曲线在小尺寸下比直角分叉更清晰。
+      let links = NSBezierPath()
+      links.lineWidth = 1.7
+      links.lineCapStyle = .round
+      links.lineJoinStyle = .round
+      links.move(to: NSPoint(x: 2.3, y: 9))
+      links.line(to: NSPoint(x: 7.2, y: 9))
+      links.move(to: NSPoint(x: 7.2, y: 9))
+      links.curve(
+        to: NSPoint(x: 15.4, y: 14.7),
+        controlPoint1: NSPoint(x: 9.6, y: 9),
+        controlPoint2: NSPoint(x: 11.8, y: 14.7)
+      )
+      links.move(to: NSPoint(x: 7.2, y: 9))
+      links.line(to: NSPoint(x: 15.4, y: 9))
+      links.move(to: NSPoint(x: 7.2, y: 9))
+      links.curve(
+        to: NSPoint(x: 15.4, y: 3.3),
+        controlPoint1: NSPoint(x: 9.6, y: 9),
+        controlPoint2: NSPoint(x: 11.8, y: 3.3)
+      )
+      links.stroke()
+
+      let nodes: [(x: CGFloat, y: CGFloat, radius: CGFloat)] = [
+        (2.3, 9.0, 1.25),
+        (7.2, 9.0, 1.4),
+        (15.4, 14.7, 1.2),
+        (15.4, 9.0, 1.2),
+        (15.4, 3.3, 1.2),
+      ]
+      for (x, y, radius) in nodes {
+        NSBezierPath(
+          ovalIn: NSRect(x: x - radius, y: y - radius, width: radius * 2, height: radius * 2)
+        ).fill()
+      }
+      return true
+    }
+    image.isTemplate = true
+    return image
+  }()
 }
 
 enum TrayTab: String, CaseIterable, Identifiable {
