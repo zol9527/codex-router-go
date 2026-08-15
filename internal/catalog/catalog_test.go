@@ -41,3 +41,35 @@ func TestBuildFiltersFedBackRoutedEntries(t *testing.T) {
 		t.Error("real native entry must survive")
 	}
 }
+
+// 克隆 upstream 撞原生 slug（2026-08-15 实发事故）：models.dev 把原生
+// 模型挂到网关下，动态发现生成克隆条目，其 upstream_model 就是原生
+// slug。upstream 不得当反馈键，否则真原生 gpt-5.6-luna 被误杀、picker
+// 里凭空消失。克隆自身的反馈份（带 "/"）仍须过滤。
+func TestBuildKeepsNativeWhenCloneUpstreamCollides(t *testing.T) {
+	routed := []*registry.Model{{
+		Slug: "opencode-go-responses/gpt-5.6-luna", GatewayModel: "opencode-go-gpt-5-6-luna",
+		UpstreamModel: "gpt-5.6-luna", Provider: "opencode-go", Listed: true,
+	}}
+	native := []NativeModel{
+		{"slug": "gpt-5.6-luna", "visibility": "list"},
+		{"slug": "gpt-5.6-sol", "visibility": "list"},
+		// 克隆的反馈份（路由 slug 原样出现在"原生"列表里）。
+		{"slug": "opencode-go-responses/gpt-5.6-luna", "visibility": "list"},
+	}
+	catalog := Build(native, routed, func(string) bool { return true }, true, nil)
+	slugs := map[string]int{}
+	for _, m := range catalog["models"].([]NativeModel) {
+		slug, _ := m["slug"].(string)
+		slugs[slug]++
+	}
+	if slugs["gpt-5.6-luna"] != 1 {
+		t.Errorf("native entry whose slug collides with a clone upstream must survive, got %d", slugs["gpt-5.6-luna"])
+	}
+	if slugs["gpt-5.6-sol"] != 1 {
+		t.Error("untouched native entry must survive")
+	}
+	if slugs["opencode-go-responses/gpt-5.6-luna"] != 1 {
+		t.Errorf("clone must appear exactly once (registry copy only), got %d", slugs["opencode-go-responses/gpt-5.6-luna"])
+	}
+}

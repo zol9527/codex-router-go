@@ -133,14 +133,18 @@ func Build(native []NativeModel, regModels []*registry.Model, enabled func(provi
 	// 的话，同一个模型在本目录里出现两份（反馈份 + 注册表份），picker
 	// 随之翻倍 —— 连已从注册表删除的模型都会从 Codex 的记忆里还魂。
 	// 规则：带 "/" 的 slug 一律是路由条目；再按 gateway_model 双保险。
+	//
+	// 注意 upstream_model 绝不能进反馈键：路由器所有发布面（merged 目录、
+	// /v1/models）都只输出完整路由 slug，反馈环不可能产生裸 upstream 名；
+	// 反倒是一场实发事故（2026-08-15 gpt-5.6-luna）——models.dev 把原生
+	// 模型挂到网关下生成克隆（opencode-go-responses/gpt-5.6-luna，其
+	// upstream_model 恰是原生 slug），upstream 进反馈键会把真原生条目
+	// 一起误杀，picker 里 luna 凭空消失。
 	routedKeys := map[string]bool{}
 	for _, m := range regModels {
 		routedKeys[m.Slug] = true
 		if m.GatewayModel != "" {
 			routedKeys[m.GatewayModel] = true
-		}
-		if m.UpstreamModel != "" {
-			routedKeys[m.UpstreamModel] = true
 		}
 	}
 	filteredNative := make([]NativeModel, 0, len(native))
