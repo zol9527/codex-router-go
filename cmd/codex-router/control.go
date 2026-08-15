@@ -113,6 +113,8 @@ func cmdControl(args []string) error {
 		return controlCredential(st, reg, rest[1:])
 	case len(rest) >= 1 && rest[0] == "config" && len(rest) >= 2:
 		return controlConfig(st, rest[1:])
+	case len(rest) >= 1 && rest[0] == "subagents":
+		return controlSubagents(st, reg, rest[1:])
 	case len(rest) >= 1 && rest[0] == "reload":
 		return controlReload(st, reg)
 	case len(rest) >= 1 && rest[0] == "account":
@@ -156,6 +158,7 @@ func controlUsage() {
   control credential PROVIDER --remove    remove the provider's config.toml table
   control config init                     write the commented config.toml template
   control reload                          re-read config + refresh catalog, no restart
+  control subagents status|mode <m>|select-all|unselect-all|set <slug> on|off|provider <id> on|off
   control presence set always|follow-codex
   control account --json | control provider-usage --json
   control vision-bridge pull TAG | pull-status | benchmark [TAG] | catalog
@@ -238,6 +241,8 @@ func controlJSON(st *state.State, reg *registry.Registry) error {
 		// presence 块：tray 读 effectiveMode 而非自行推导
 		//（两边各自推导必然漂移）。
 		"presence": state.PresenceSnapshot(st.Dir),
+		// subagents 块：Codex 协作分身的设置快照。
+		"subagents": state.SubagentSettingsSnapshot(st.Dir),
 	}
 	raw, err := json.MarshalIndent(payload, "", "  ")
 	if err != nil {
@@ -560,3 +565,88 @@ func controlReload(st *state.State, reg *registry.Registry) error {
 }
 
 func stdinFile() *os.File { return os.Stdin }
+
+// controlSubagents：Codex 协作分身设置面。语义对照 Node 版 control.mjs：
+// select-all 整体替换为全开；unselect-all 显式全关（selected 模式 +
+// 全部可见路由模型进 disabled）；其余按模式/单模型/provider 操作。
+// 每次变更后刷新 catalog（multi_agent_version 变化只有重发布才被
+// Codex 看到）并回印快照。
+func controlSubagents(st *state.State, reg *registry.Registry, args []string) error {
+	action := "status"
+	if len(args) > 0 {
+		action = args[0]
+	}
+	printSnapshot := func() error {
+		raw, _ := json.MarshalIndent(state.SubagentSettingsSnapshot(st.Dir), "", "  ")
+		fmt.Println(string(raw))
+		return nil
+	}
+	refresh := func() error { return controlReload(st, reg) }
+
+	switch action {
+	case "status":
+		return printSnapshot()
+	case "select-all":
+		if _, err := state.ReplaceSubagentSettings(st.Dir, state.SubagentSettings{
+			Mode: state.SubagentModeAll,
+		}); err != nil {
+			return err
+		}
+	case "unselect-all":
+		// 显式全关：selected 模式 + 空 enabled + 全部可见路由模型进
+		// disabled —— 一个不剩，而不是回到"只开证明过的"。
+		disabled := []string{}
+		for _, m := range reg.Models {
+			if m.Listed && st.ProviderEnabled(m.Provider, reg.CanonicalProviderID) {
+				disabled = append(disabled, m.Slug)
+			}
+		}
+		if _, err := state.ReplaceSubagentSettings(st.Dir, state.SubagentSettings{
+			Mode:     state.SubagentModeSelected,
+			Disabled: disabled,
+		}); err != nil {
+			return err
+		}
+	case "mode":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: control subagents mode <all|selected|proven>")
+		}
+		if _, err := state.SetSubagentMode(st.Dir, args[1]); err != nil {
+			return fmt.Errorf("unknown mode %q (choose: all, selected, proven)", args[1])
+		}
+	case "set":
+		if len(args) < 3 || (args[2] != "on" && args[2] != "off") {
+			return fmt.Errorf("usage: control subagents set <model-slug> <on|off>")
+		}
+		if reg.BySlug(args[1]) == nil {
+			return fmt.Errorf("unknown model slug: %s", args[1])
+		}
+		if _, err := state.SetSubagentModels(st.Dir, []string{args[1]}, args[2] == "on"); err != nil {
+			return err
+		}
+	case "provider":
+		if len(args) < 3 || (args[2] != "on" && args[2] != "off") {
+			return fmt.Errorf("usage: control subagents provider <provider-id> <on|off>")
+		}
+		provider := reg.CanonicalProviderID(args[1])
+		slugs := []string{}
+		for _, m := range reg.Models {
+			if m.Listed && reg.CanonicalProviderID(m.Provider) == provider &&
+				st.ProviderEnabled(m.Provider, reg.CanonicalProviderID) {
+				slugs = append(slugs, m.Slug)
+			}
+		}
+		if len(slugs) == 0 {
+			return fmt.Errorf("no enabled models found for provider: %s", args[1])
+		}
+		if _, err := state.SetSubagentModels(st.Dir, slugs, args[2] == "on"); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("usage: control subagents status|mode <all|selected|proven>|select-all|unselect-all|set <slug> on|off|provider <id> on|off")
+	}
+	if err := refresh(); err != nil {
+		return err
+	}
+	return printSnapshot()
+}

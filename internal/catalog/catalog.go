@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 
 	"github.com/loyd/codex-router/internal/registry"
+	"github.com/loyd/codex-router/internal/state"
 )
 
 // NativeModel 是 Codex 原生目录里的一个条目（只声明本 fork 读取的字段，
@@ -71,7 +72,13 @@ func RoutedModel(template NativeModel, m *registry.Model) NativeModel {
 	next["default_verbosity"] = nil
 	next["use_responses_lite"] = false
 	next["apply_patch_tool_type"] = "freeform"
-	next["multi_agent_version"] = "v1"
+	// Codex v2 协作只把 catalog 里同标 v2 的模型暴露为 spawn 候选；
+	// 未证明的模型保持 v1（不出现在分身选择里）。
+	multiAgent := m.MultiAgentVersion
+	if multiAgent == "" {
+		multiAgent = "v1"
+	}
+	next["multi_agent_version"] = multiAgent
 	return next
 }
 
@@ -118,7 +125,7 @@ func runDebugModels(codexBinary string, bundled bool) ([]NativeModel, error) {
 // Build 合并原生目录与注册表条目。includeNative=false 用于
 // "只发布路由模型" 的场景（本 fork 默认包含原生条目，Codex 需要
 // 它们渲染原生 GPT 选择）。
-func Build(native []NativeModel, reg *registry.Registry, enabled func(providerID string) bool, includeNative bool) map[string]any {
+func Build(native []NativeModel, regModels []*registry.Model, enabled func(providerID string) bool, includeNative bool) map[string]any {
 	models := []NativeModel{}
 	if includeNative {
 		models = append(models, native...)
@@ -131,7 +138,7 @@ func Build(native []NativeModel, reg *registry.Registry, enabled func(providerID
 			template[k] = v
 		}
 	}
-	for _, model := range reg.Models {
+	for _, model := range regModels {
 		if !model.Listed {
 			continue
 		}
@@ -158,16 +165,47 @@ func Write(path string, catalog map[string]any) error {
 	return os.Chmod(path, 0o600)
 }
 
-// Refresh 一把梭：抓取 + 合并 + 写盘。返回模型数。
+// Refresh 一把梭：抓取 + 子代理设置应用 + 合并 + 写盘 + agents 目录
+// 同步。返回模型数。
 func Refresh(codexBinary, outputPath string, reg *registry.Registry, enabled func(providerID string) bool) (int, error) {
 	native, err := FetchNative(codexBinary)
 	if err != nil {
 		return 0, err
 	}
-	catalog := Build(native, reg, enabled, true)
+	// 子代理设置住在 state 目录（与 merged-models.json 同目录）。
+	settings := state.ReadSubagentSettings(filepath.Dir(outputPath))
+	native = PromoteNativeMultiAgent(native, settings)
+	routedModels := ApplySubagentDemotions(reg.Models, settings)
+	catalog := Build(native, routedModels, enabled, true)
 	if err := Write(outputPath, catalog); err != nil {
 		return 0, err
 	}
+	// agents 目录同步：合格模型得到按名可 spawn 的定义；不再合格的
+	// 定义必须删掉。合格集合只从"已启用 provider 的已列模型"里挑 ——
+	// 给未启用 provider 的模型留定义，spawn 出来只会是一个注定失败的
+	// 选项。失败不吞 —— 半同步比失败糟（但 Sync 自己会回滚）。
+	enabledModels := []*registry.Model{}
+	for _, m := range routedModels {
+		if m.Listed && enabled(m.Provider) {
+			enabledModels = append(enabledModels, m)
+		}
+	}
+	if _, err := SyncRoutedCodexAgents(SubagentEligibleModels(enabledModels, settings), codexAgentsDir()); err != nil {
+		return 0, fmt.Errorf("sync codex agents: %w", err)
+	}
 	models, _ := catalog["models"].([]NativeModel)
 	return len(models), nil
+}
+
+// codexAgentsDir 是 Codex 的 agents 目录（CODEX_HOME/agents）。
+func codexAgentsDir() string {
+	home := os.Getenv("CODEX_HOME")
+	if home == "" {
+		userHome, err := os.UserHomeDir()
+		if err != nil {
+			return filepath.Join(".codex", "agents")
+		}
+		home = filepath.Join(userHome, ".codex")
+	}
+	return filepath.Join(home, "agents")
 }

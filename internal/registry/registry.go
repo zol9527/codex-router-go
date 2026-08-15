@@ -58,6 +58,12 @@ type Model struct {
 	InputModalities []string         `json:"inputModalities"`
 	RequestProfile  string           `json:"requestProfile"`
 	CompHash        string           `json:"compHash"`
+	// MultiAgentVersion 是 Codex 协作子代理的能力证明标记（"v2" = 可
+	// 被 v2 父代理选为分身）。这不是功能开关而是"测试合格章"：只有
+	// 真实协作探针（工具调用、密文中继、marker-return spawn、同线程
+	// 追问）全部通过的模型才允许在注册表标 v2 —— 声明随仓库发给所有
+	// 安装者。本地设置只能收窄（降回 v1），永远不能放大。
+	MultiAgentVersion string `json:"multiAgentVersion,omitempty"`
 }
 
 // Registry 是加载后的索引视图。
@@ -240,4 +246,9 @@ func (r *Registry) CanonicalProviderID(id string) string {
 		return p.VariantOf
 	}
 	return id
+}
+
+// BySlug 按 slug 查模型（未注册返回 nil）。
+func (r *Registry) BySlug(slug string) *Model {
+	return r.bySlug[slug]
 }
