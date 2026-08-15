@@ -379,3 +379,56 @@ func TestProviderNotEnabled(t *testing.T) {
 		t.Errorf("hidden provider should 409, got %d", resp.StatusCode)
 	}
 }
+
+// WS 升级握手必须回 426 Upgrade Required —— 这是 Codex 客户端设计的
+// "干净回退"信号（拿到 426 不重试、当轮直接切 HTTP 并会话级粘住）。
+// 回 404 会被当普通流错误烧满 5 次重试（实测新线程首轮 ~7 秒 +
+// "正在重新连接 5/5" 横幅）。
+func TestWebSocketUpgradeReturnsUpgradeRequired(t *testing.T) {
+	srv, ts := newTestServer(t)
+	callerKey, _ := srv.opt.State.CallerKey()
+	path := CallerPathPrefix + "/" + callerKey + "/v1/responses"
+
+	// ① 标准 RFC 6455 握手 → 426，带 Upgrade 头（RFC 要求 426 携带）。
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+path, nil)
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set("Sec-WebSocket-Version", "13")
+	req.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUpgradeRequired {
+		t.Errorf("websocket upgrade handshake = %d, want 426", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Upgrade"); got != "websocket" {
+		t.Errorf("426 response Upgrade header = %q, want websocket", got)
+	}
+
+	// ② 无升级头的普通 GET → 维持原 404（不误吞其他 GET 探测）。
+	req, _ = http.NewRequest(http.MethodGet, ts.URL+path, nil)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("plain GET = %d, want 404", resp.StatusCode)
+	}
+
+	// ③ 错误 caller key 的握手 → 认证先行，401。
+	req, _ = http.NewRequest(http.MethodGet,
+		ts.URL+CallerPathPrefix+"/wrong-key-wrong-key-wrong-key/v1/responses", nil)
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("websocket upgrade with bad key = %d, want 401", resp.StatusCode)
+	}
+}

@@ -137,13 +137,10 @@ func (s *Server) relayResponse(w http.ResponseWriter, resp *http.Response) {
 	}
 }
 
-// nativeHeaders 从调用方请求里提取白名单头并补充兜底凭据。
-func (s *Server) nativeHeaders(r *http.Request) map[string]string {
-	headers := map[string]string{
-		"Content-Type":    "application/json",
-		"Accept":          "text/event-stream",
-		"Accept-Encoding": "identity",
-	}
+// callerForwardHeaders 提取白名单调用方头，并补齐上游凭据兜底。
+// HTTP native 透传与 WS 管道（wsproxy.go）共用。
+func (s *Server) callerForwardHeaders(r *http.Request) map[string]string {
+	headers := map[string]string{}
 	for _, name := range forwardHeaders {
 		if value := r.Header.Get(name); value != "" {
 			headers[name] = value
@@ -161,6 +158,15 @@ func (s *Server) nativeHeaders(r *http.Request) map[string]string {
 			delete(headers, "Authorization")
 		}
 	}
+	return headers
+}
+
+// nativeHeaders 从调用方请求里提取白名单头并补充兜底凭据。
+func (s *Server) nativeHeaders(r *http.Request) map[string]string {
+	headers := s.callerForwardHeaders(r)
+	headers["Content-Type"] = "application/json"
+	headers["Accept"] = "text/event-stream"
+	headers["Accept-Encoding"] = "identity"
 	return headers
 }
 

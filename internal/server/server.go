@@ -35,6 +35,9 @@ type Options struct {
 	NativeBase  string                // 默认 https://chatgpt.com/backend-api/codex
 	Usage       *usage.Recorder       // usage-events.jsonl 管道（可空）
 	RateLimits  *usage.RateLimitStore // rate-limits.json 收割（可空）
+	// DisableWebSocketPassthrough 关闭 WS 透传（回滚开关）：/responses
+	// 上的升级握手一律 426，调用方全部走 HTTP。默认开启透传。
+	DisableWebSocketPassthrough bool
 }
 
 // Server 持有全部共享状态。
@@ -143,6 +146,10 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		s.handleModels(w)
 	case r.Method == http.MethodOptions:
 		w.WriteHeader(http.StatusNoContent)
+	case r.Method == http.MethodGet && isResponsesRoute(route) && isWebSocketUpgrade(r):
+		// WS 升级请求进专用处理器分流：路由模型 → 426 干净回退；
+		// 原生模型 → 上游 WSS 双向管道。状态码契约见 wsproxy.go。
+		s.handleResponsesWebSocket(w, r, route)
 	case r.Method == http.MethodPost && isResponsesRoute(route):
 		s.handleResponses(w, r, route)
 	case r.Method == http.MethodPost && isNativeImagePath(route):
@@ -161,6 +168,22 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 func isResponsesRoute(route string) bool {
 	return route == "/responses" || route == "/v1/responses" ||
 		route == "/responses/compact" || route == "/v1/responses/compact"
+}
+
+// isWebSocketUpgrade 判断是否为 RFC 6455 升级握手
+// （GET + Connection: Upgrade + Upgrade: websocket）。
+func isWebSocketUpgrade(r *http.Request) bool {
+	if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+		return false
+	}
+	for _, value := range r.Header.Values("Connection") {
+		for _, token := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(token), "upgrade") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 var nativeImagePaths = map[string]bool{

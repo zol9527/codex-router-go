@@ -121,9 +121,11 @@ func cmdServe(args []string) error {
 		Registry:    reg,
 		Credentials: cred.New(st),
 		ListenAddr:  fmt.Sprintf("127.0.0.1:%d", *port),
-		NativeBase:  envOr("CODEX_NATIVE_BASE_URL", "https://chatgpt.com/backend-api/codex"),
-		Usage:       usage.NewRecorder(st.Dir),
-		RateLimits:  usage.NewRateLimitStore(st.Dir),
+		NativeBase: envOr("CODEX_NATIVE_BASE_URL", "https://chatgpt.com/backend-api/codex"),
+		// WS 透传回滚开关：设 0 退回"升级握手一律 426、全部走 HTTP"。
+		DisableWebSocketPassthrough: os.Getenv("CODEX_WS_PASSTHROUGH") == "0",
+		Usage:                       usage.NewRecorder(st.Dir),
+		RateLimits:                  usage.NewRateLimitStore(st.Dir),
 	})
 	if err != nil {
 		return err
