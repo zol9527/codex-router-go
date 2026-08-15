@@ -36,6 +36,15 @@
 > service start（kickstart 会重启运行中的服务，无探活会误伤在途
 > 请求）。已实测：quit → 服务停，reopen → 服务自动回（全链路约
 > 9 秒）。
+> **完整 App 化已完成并实测**（见下方 App 化章节）：.app 即部署单元
+>（Contents/MacOS/ 内嵌 Go 二进制 + 注册表 go:embed），服务是 App 的
+> 托管子进程 —— 开 App 即服务起、退出 App 服务死（3s 优雅排空后
+> SIGKILL，无孤儿）、红叉只关窗、菜单栏速览保留、Dock 图标 + 主窗口。
+> launchd 已移除（旧 plist 已清），开机自启 = 设置页「登录时启动」
+> （SMAppService）。凭证的家是 ~/.codex-router/config.toml（Claude Code
+> 式，[provider] api_key，注释保留的行级手术改写，env > config >
+> .secret > keychain）；设置页「打开配置」直达。~/bin/codex-router 保留
+> 为终端 CLI（更新命令见待办）。
 > **操作者待办**：`./bin/control credential zai-coding`（stdin 输入 key）
 > 与 `credential opencode-go` 启用路由模型；tray 已构建安装于
 > ~/Applications/Model Router.app 并在菜单栏运行，面板点「刷新」即得
