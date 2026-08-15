@@ -125,10 +125,14 @@ func runDebugModels(codexBinary string, bundled bool) ([]NativeModel, error) {
 // Build 合并原生目录与注册表条目。includeNative=false 用于
 // "只发布路由模型" 的场景（本 fork 默认包含原生条目，Codex 需要
 // 它们渲染原生 GPT 选择）。
-func Build(native []NativeModel, regModels []*registry.Model, enabled func(providerID string) bool, includeNative bool) map[string]any {
+func Build(native []NativeModel, regModels []*registry.Model, enabled func(providerID string) bool, includeNative bool, hidden map[string]bool) map[string]any {
 	models := []NativeModel{}
 	if includeNative {
-		models = append(models, native...)
+		for _, entry := range native {
+			if slug, _ := entry["slug"].(string); !hidden[slug] {
+				models = append(models, entry)
+			}
+		}
 	}
 	// 模板：取账号目录第一个条目（字段形状参考）；没有原生目录时
 	// 用最小模板。
@@ -143,6 +147,10 @@ func Build(native []NativeModel, regModels []*registry.Model, enabled func(provi
 			continue
 		}
 		if !enabled(model.Provider) {
+			continue
+		}
+		// 隐藏 = 不进 picker 目录；按名路由不受影响。
+		if hidden[model.Slug] {
 			continue
 		}
 		models = append(models, RoutedModel(template, model))
@@ -174,9 +182,10 @@ func Refresh(codexBinary, outputPath string, reg *registry.Registry, enabled fun
 	}
 	// 子代理设置住在 state 目录（与 merged-models.json 同目录）。
 	settings := state.ReadSubagentSettings(filepath.Dir(outputPath))
+	hidden := state.ReadPickerHidden(filepath.Dir(outputPath))
 	native = PromoteNativeMultiAgent(native, settings)
-	routedModels := ApplySubagentDemotions(reg.Models, settings)
-	catalog := Build(native, routedModels, enabled, true)
+	routedModels := ApplySubagentDemotions(reg.Models, settings, hidden)
+	catalog := Build(native, routedModels, enabled, true, hidden)
 	if err := Write(outputPath, catalog); err != nil {
 		return 0, err
 	}

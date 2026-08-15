@@ -3414,6 +3414,15 @@ private struct TrayView: View {
                 ("Subagents off", { Task { await store.unselectAllSubagents() } }),
               ]
             )
+            // 空态要说清楚"为什么空"：候选列表只收 v2 证明过的模型，
+            // 一时空 = 还没有模型通过协作探针，不是面板坏了。
+            if enabledExternalModels.isEmpty {
+              Text(routerLocalized(
+                "No subagent candidates yet — a model appears here only after its collaboration probes pass (registry multiAgentVersion v2)."
+              ))
+              .font(.system(size: 9))
+              .foregroundStyle(routerMuted)
+            }
             ForEach(providerGroups(enabledExternalModels)) { group in
               AccordionPanel(
                 title: providerName(group.provider),

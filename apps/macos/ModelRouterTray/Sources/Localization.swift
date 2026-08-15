@@ -78,6 +78,7 @@ func routerFormat(_ english: String, _ arguments: CVarArg...) -> String {
 
 enum RouterChineseText {
   static let values: [String: String] = [
+    "No subagent candidates yet — a model appears here only after its collaboration probes pass (registry multiAgentVersion v2).": "暂无可选分身模型 —— 模型只有通过协作探针（注册表 multiAgentVersion v2）后才会出现在这里。",
     "Launch at Login": "登录时启动",
     "Start Model Router automatically when you log in. The router service runs only while the app is open.": "登录后自动打开 Model Router。路由服务只在 App 打开时运行。",
     "Login item status unavailable (app not in a bundle).": "登录项状态不可用（App 不在 bundle 内）。",

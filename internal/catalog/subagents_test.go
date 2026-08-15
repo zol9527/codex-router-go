@@ -21,7 +21,7 @@ func TestApplySubagentDemotions(t *testing.T) {
 	settings := state.SubagentSettings{Version: 2, Mode: state.SubagentModeProven,
 		Disabled: []string{"zai-coding/glm-5.3"}}
 
-	out := ApplySubagentDemotions([]*registry.Model{proven, plain}, settings)
+	out := ApplySubagentDemotions([]*registry.Model{proven, plain}, settings, nil)
 	if out[0].MultiAgentVersion != "v1" {
 		t.Errorf("disabled model must demote to v1, got %q", out[0].MultiAgentVersion)
 	}
@@ -30,6 +30,12 @@ func TestApplySubagentDemotions(t *testing.T) {
 	}
 	if out[1].MultiAgentVersion != "" {
 		t.Errorf("unmarked model must stay unmarked, got %q", out[1].MultiAgentVersion)
+	}
+	// picker 隐藏同样降权 —— 从 picker 拿掉的模型不该是分身候选。
+	hidden := map[string]bool{"zai-coding/glm-5.3": true}
+	out = ApplySubagentDemotions([]*registry.Model{proven}, state.SubagentSettings{Version: 2, Mode: state.SubagentModeProven}, hidden)
+	if out[0].MultiAgentVersion != "v1" {
+		t.Error("picker-hidden model must demote to v1")
 	}
 }
 

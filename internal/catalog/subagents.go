@@ -31,15 +31,17 @@ import (
 // 无条件提升 —— 不经模式开关，不经设置页。
 var nativeV2BackendSlugs = map[string]bool{"gpt-5.6-luna": true}
 
-// ApplySubagentDemotions 把 disabled 的路由模型降回 v1（复制不改原）。
-func ApplySubagentDemotions(models []*registry.Model, settings state.SubagentSettings) []*registry.Model {
+// ApplySubagentDemotions 把 disabled / picker 隐藏的路由模型降回 v1
+// （复制不改原）。隐藏即降权与 Node 版一致：从 picker 拿掉的模型
+// 不该再作为分身候选出现。
+func ApplySubagentDemotions(models []*registry.Model, settings state.SubagentSettings, hidden map[string]bool) []*registry.Model {
 	disabled := map[string]bool{}
 	for _, slug := range settings.Disabled {
 		disabled[slug] = true
 	}
 	out := make([]*registry.Model, 0, len(models))
 	for _, m := range models {
-		if disabled[m.Slug] {
+		if disabled[m.Slug] || hidden[m.Slug] {
 			demoted := *m
 			demoted.MultiAgentVersion = "v1"
 			out = append(out, &demoted)

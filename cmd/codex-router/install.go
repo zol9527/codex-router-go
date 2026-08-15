@@ -68,7 +68,7 @@ func cmdInstall(args []string) error {
 		// 原生目录抓取失败不阻塞安装：Codex 未装/未登录时 picker
 		// 只缺原生条目，路由模型仍然可用。
 		fmt.Fprintf(os.Stderr, "[install] native catalog capture failed: %v (continuing)\n", err)
-		fallback := catalog.Build(nil, reg.Models, func(providerID string) bool { return true }, false)
+		fallback := catalog.Build(nil, reg.Models, func(providerID string) bool { return true }, false, nil)
 		if err := catalog.Write(mergedPath, fallback); err != nil {
 			return err
 		}

@@ -115,6 +115,8 @@ func cmdControl(args []string) error {
 		return controlConfig(st, rest[1:])
 	case len(rest) >= 1 && rest[0] == "subagents":
 		return controlSubagents(st, reg, rest[1:])
+	case len(rest) >= 1 && rest[0] == "picker":
+		return controlPicker(st, reg, rest[1:])
 	case len(rest) >= 1 && rest[0] == "reload":
 		return controlReload(st, reg)
 	case len(rest) >= 1 && rest[0] == "account":
@@ -159,6 +161,7 @@ func controlUsage() {
   control config init                     write the commented config.toml template
   control reload                          re-read config + refresh catalog, no restart
   control subagents status|mode <m>|select-all|unselect-all|set <slug> on|off|provider <id> on|off
+  control picker set <slug> show|hide | provider <id> show|hide | all show|hide | status
   control presence set always|follow-codex
   control account --json | control provider-usage --json
   control vision-bridge pull TAG | pull-status | benchmark [TAG] | catalog
@@ -215,17 +218,25 @@ func controlJSON(st *state.State, reg *registry.Registry) error {
 			"credentialSource":     source,
 		})
 	}
+	hidden := state.ReadPickerHidden(st.Dir)
 	for _, m := range reg.Models {
 		if !m.Listed || !st.ProviderEnabled(m.Provider, reg.CanonicalProviderID) {
 			continue
 		}
-		models = append(models, map[string]any{
+		entry := map[string]any{
 			"slug": m.Slug, "displayName": m.DisplayName,
 			"provider": reg.CanonicalProviderID(m.Provider),
 			// RouterModel.enabled 非可选：能进这张表的模型都是
 			// 已启用 provider 下的已发布模型，恒为 true。
 			"enabled": st.ProviderEnabled(m.Provider, reg.CanonicalProviderID),
-		})
+			// visible = 未被 picker 隐藏；multiAgentVersion 供分身
+			// UI 判断候选资格（nil = v1）。
+			"visible": !hidden[m.Slug],
+		}
+		if m.MultiAgentVersion != "" {
+			entry["multiAgentVersion"] = m.MultiAgentVersion
+		}
+		models = append(models, entry)
 	}
 	target := map[string]any{
 		"target":           "codex",
@@ -234,6 +245,12 @@ func controlJSON(st *state.State, reg *registry.Registry) error {
 		"enabledProviders": enabled,
 		"providers":        providers,
 		"models":           models,
+		// App 设置页的「Subagent models / Model picker」区块数据源
+		//（tray 的 ModelSettingsSnapshot 解码器）。
+		"modelSettings": map[string]any{
+			"subagents": state.SubagentSettingsSnapshot(st.Dir),
+			"picker":    state.PickerSnapshot(st.Dir),
+		},
 	}
 	payload := map[string]any{
 		"targets":  map[string]any{"codex": target},
@@ -241,8 +258,6 @@ func controlJSON(st *state.State, reg *registry.Registry) error {
 		// presence 块：tray 读 effectiveMode 而非自行推导
 		//（两边各自推导必然漂移）。
 		"presence": state.PresenceSnapshot(st.Dir),
-		// subagents 块：Codex 协作分身的设置快照。
-		"subagents": state.SubagentSettingsSnapshot(st.Dir),
 	}
 	raw, err := json.MarshalIndent(payload, "", "  ")
 	if err != nil {
@@ -644,6 +659,82 @@ func controlSubagents(st *state.State, reg *registry.Registry, args []string) er
 		}
 	default:
 		return fmt.Errorf("usage: control subagents status|mode <all|selected|proven>|select-all|unselect-all|set <slug> on|off|provider <id> on|off")
+	}
+	if err := refresh(); err != nil {
+		return err
+	}
+	return printSnapshot()
+}
+
+// controlPicker：模型选择器可见性面。隐藏 = 从 picker 目录拿掉、
+// 按名路由不受影响；每次变更刷新 catalog 后回印快照。
+func controlPicker(st *state.State, reg *registry.Registry, args []string) error {
+	action := "status"
+	if len(args) > 0 {
+		action = args[0]
+	}
+	printSnapshot := func() error {
+		raw, _ := json.MarshalIndent(state.PickerSnapshot(st.Dir), "", "  ")
+		fmt.Println(string(raw))
+		return nil
+	}
+	enabledSlugs := func() []string {
+		slugs := []string{}
+		for _, m := range reg.Models {
+			if m.Listed && st.ProviderEnabled(m.Provider, reg.CanonicalProviderID) {
+				slugs = append(slugs, m.Slug)
+			}
+		}
+		return slugs
+	}
+	refresh := func() error { return controlReload(st, reg) }
+
+	switch action {
+	case "status":
+		return printSnapshot()
+	case "set":
+		if len(args) < 3 || (args[2] != "show" && args[2] != "hide") {
+			return fmt.Errorf("usage: control picker set <model-slug> <show|hide>")
+		}
+		if reg.BySlug(args[1]) == nil {
+			return fmt.Errorf("unknown model slug: %s", args[1])
+		}
+		if err := state.SetPickerModels(st.Dir, []string{args[1]}, args[2] == "show"); err != nil {
+			return err
+		}
+	case "provider":
+		if len(args) < 3 || (args[2] != "show" && args[2] != "hide") {
+			return fmt.Errorf("usage: control picker provider <provider-id> <show|hide>")
+		}
+		provider := reg.CanonicalProviderID(args[1])
+		slugs := []string{}
+		for _, m := range reg.Models {
+			if m.Listed && reg.CanonicalProviderID(m.Provider) == provider &&
+				st.ProviderEnabled(m.Provider, reg.CanonicalProviderID) {
+				slugs = append(slugs, m.Slug)
+			}
+		}
+		if len(slugs) == 0 {
+			return fmt.Errorf("no enabled models found for provider: %s", args[1])
+		}
+		if err := state.SetPickerModels(st.Dir, slugs, args[2] == "show"); err != nil {
+			return err
+		}
+	case "all":
+		if len(args) < 2 || (args[1] != "show" && args[1] != "hide") {
+			return fmt.Errorf("usage: control picker all <show|hide>")
+		}
+		if args[1] == "show" {
+			if err := state.ClearPickerHidden(st.Dir); err != nil {
+				return err
+			}
+		} else {
+			if err := state.SetPickerModels(st.Dir, enabledSlugs(), false); err != nil {
+				return err
+			}
+		}
+	default:
+		return fmt.Errorf("usage: control picker status|set <slug> show|hide|provider <id> show|hide|all show|hide")
 	}
 	if err := refresh(); err != nil {
 		return err
