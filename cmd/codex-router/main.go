@@ -81,7 +81,8 @@ func printUsage() {
 Usage:
   codex-router serve [--port N] [--state DIR] [--config DIR]
   codex-router install [--providers ID,ID] [--dry-run]
-  codex-router uninstall
+  codex-router uninstall [--purge]   (removes plist, binary, config blocks;
+                                     --purge also destroys state)
   codex-router doctor
   codex-router control --json | control SERVICE ACTION | ...
   codex-router shim install|uninstall|status

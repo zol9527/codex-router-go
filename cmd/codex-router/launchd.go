@@ -115,6 +115,9 @@ func uninstallLaunchd() error {
 	if _, err := os.Stat(launchdPlistPath()); err != nil {
 		return nil
 	}
+	// bootout 是现代形态（按 label 定位、连依赖服务一起终止）；
+	// unload 兜底覆盖老版本 launchd。
+	exec.Command("/bin/launchctl", "bootout", "gui/"+launchdUID()+"/"+launchdLabel).Run()
 	exec.Command("/bin/launchctl", "unload", launchdPlistPath()).Run()
 	return os.Remove(launchdPlistPath())
 }

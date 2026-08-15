@@ -123,10 +123,14 @@ func orDefault(value, fallback string) string {
 	return fallback
 }
 
-// cmdUninstall：抠掉 config 块、卸 launchd；state 与凭据保留
-// （操作者的 key 是自己的数据，卸载不是销毁）。
+// cmdUninstall： uninstall's job is to leave no trace of itself —
+// launchd plist unloaded and removed, the installed binary directory
+// deleted, config.toml blocks restored. State (credentials, usage history,
+// settings) is operator data and survives by default; --purge destroys it
+// too, as an explicit opt-in.
 func cmdUninstall(args []string) error {
 	fs := flag.NewFlagSet("uninstall", flag.ContinueOnError)
+	purge := fs.Bool("purge", false, "also delete the state directory (credentials, usage history) — destructive")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -136,8 +140,41 @@ func cmdUninstall(args []string) error {
 	if err := uninstallLaunchd(); err != nil {
 		return err
 	}
-	fmt.Println("uninstalled: config.toml blocks removed, launchd agent unloaded (state preserved)")
+	// 安装时放置的二进制目录一并删除 —— uninstall 的职责是不留痕迹。
+	// 正在运行的进程不受影响（macOS 下 unlink 已加载的二进制是合法的，
+	// inode 保留到进程退出），但本命令通常就是那个进程在删自己：
+	// 删除成功、退出后 launchd 不会再把它拉起来（plist 已先卸）。
+	removedBinary := removeBinaryInstall()
+	if *purge {
+		stateDir := state.DefaultDir()
+		if err := os.RemoveAll(stateDir); err != nil {
+			return fmt.Errorf("purge state %s: %w", stateDir, err)
+		}
+		fmt.Printf("uninstalled: config.toml restored, launchd agent removed, binary deleted, state PURGED at %s\n", stateDir)
+		return nil
+	}
+	fmt.Println("uninstalled: config.toml restored, launchd agent removed" + removedBinary + " (state preserved)")
+	if _, err := os.Stat(state.DefaultDir()); err == nil {
+		fmt.Printf("state preserved at %s (credentials, usage history); pass --purge to destroy it\n", state.DefaultDir())
+	}
 	return nil
+}
+
+// removeBinaryInstall 删除标准安装位置的二进制目录。
+// 返回用于状态行的人类可读片段。
+func removeBinaryInstall() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	dir := filepath.Join(home, ".local", "share", "codex-router-go")
+	if _, err := os.Stat(dir); err != nil {
+		return ""
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		return fmt.Sprintf(" (binary directory removal failed: %v — delete %s manually)", err, dir)
+	}
+	return ", binary deleted"
 }
 
 // cmdDoctor：残血体检 —— 服务活、key 在、catalog 新鲜、config 集成、凭据可解析。
