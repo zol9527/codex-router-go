@@ -222,10 +222,30 @@ func (s *Server) nativeTarget(route string) string {
 
 // ---- 本机 Codex 登录会话兜底 ----
 
+// codexAuthTokens 是 ChatGPT 登录模式（tokens 段）的凭据。
+type codexAuthTokens struct {
+	AccessToken string `json:"access_token"`
+	AccountID   string `json:"account_id"`
+}
+
+// codexAuthFile 对齐 $CODEX_HOME/auth.json 的两种形态：
+// API key 模式（顶层 OPENAI_API_KEY 字符串）与 ChatGPT 登录模式
+// （tokens.access_token / tokens.account_id；顶层 OPENAI_API_KEY 为 null）。
+// last_refresh 已是 ISO 时间字符串，不参与判定、不强解析。
 type codexAuthFile struct {
-	AccessToken string  `json:"OPENAI_API_KEY"`
-	AccountID   string  `json:"chatgpt_account_id"`
-	LastRefresh float64 `json:"last_refresh"`
+	AccessToken string          `json:"OPENAI_API_KEY"`
+	AccountID   string          `json:"chatgpt_account_id"`
+	Tokens      codexAuthTokens `json:"tokens"`
+}
+
+// normalize 统一两种形态：登录模式优先，API key 模式回落顶层字段。
+func (f *codexAuthFile) normalize() {
+	if f.AccessToken == "" {
+		f.AccessToken = f.Tokens.AccessToken
+	}
+	if f.AccountID == "" {
+		f.AccountID = f.Tokens.AccountID
+	}
 }
 
 var (
@@ -303,6 +323,7 @@ func readCodexAuth() (*codexAuthFile, error) {
 	if err := json.Unmarshal(raw, &data); err != nil {
 		return nil, err
 	}
+	data.normalize()
 	return &data, nil
 }
 
