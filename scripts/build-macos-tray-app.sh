@@ -20,7 +20,11 @@ cp "$binary_dir/ModelRouterTray" "$bundle_dir/Contents/MacOS/ModelRouterTray"
 cp "$tray_dir/Resources/Info.plist" "$bundle_dir/Contents/Info.plist"
 # App 化的核心一步：Go 服务二进制内嵌进 bundle（注册表已 go:embed，
 # 二进制自包含）。App 即部署单元 —— 打开 App 服务起，退出 App 服务停。
-go build -o "$bundle_dir/Contents/MacOS/codex-router" "$repo_dir/cmd/codex-router" 1>&2
+# 版本号经 MODEL_ROUTER_VERSION 注入（Makefile 传 git describe；直跑
+# 脚本时为 dev），与 Makefile 的 CLI 构建共用同一套 -ldflags 形状。
+go_version=${MODEL_ROUTER_VERSION:-dev}
+go build -trimpath -ldflags "-s -w -X main.version=$go_version" \
+  -o "$bundle_dir/Contents/MacOS/codex-router" "$repo_dir/cmd/codex-router" 1>&2
 # The icon is committed as a built .icns, not rasterized here: scripts/build-app-icon.sh
 # needs sips and iconutil, and a tray build must not start depending on them.
 # Without this file the bundle falls back to the generic macOS app icon, which

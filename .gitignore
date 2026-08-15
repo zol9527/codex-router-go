@@ -14,3 +14,4 @@ apps/desktop/src-tauri/icons/icon.icns
 *.log
 *.tmp
 generated/
+/codex-router
