@@ -1,15 +1,7 @@
 # Model Router —— 构建入口。所有产物统一落 dist/，仓库根不再放二进制。
+# 裸 make 只打印本清单（不猜你想干什么）；版本号默认取 git describe，
+# 可用 VERSION=xxx 覆盖。
 #
-#   make / make build    编译 CLI → dist/codex-router（版本号注入 + 裁剪）
-#   make app             构建完整 App → dist/Model Router.app（内嵌同版本 Go 二进制）
-#   make install-cli     原子替换 ~/bin/codex-router（终端 CLI 部署，你来执行）
-#   make install-app     把 dist 里的 App 换到 ~/Applications（部署，你来执行）
-#   make test            Go 全量测试
-#   make test-app        Swift 包测试
-#   make doctor          用刚构建的二进制跑体检
-#   make clean           清空 dist/
-#
-# 版本号默认取 git describe（如 v3-42-g1a2b3c4-dirty）；可用 VERSION=xxx 覆盖。
 # 替换运行中的二进制必须原子 mv（原地 cp 会被 macOS 代码签名 SIGKILL），
 # install-cli / install-app 都遵守这条。
 
@@ -24,14 +16,25 @@ APP_INSTALL := $(HOME)/Applications/Model Router.app
 GOFLAGS_RELEASE := -trimpath
 LDFLAGS_RELEASE := -s -w -X main.version=$(VERSION)
 
-.PHONY: all version build app install-cli install-app test test-app doctor clean
+.PHONY: help version cli app install-cli install-app test test-app doctor clean
 
-all: build
+# 默认目标：裸 make = 帮助。每个目标必须显式说出它做什么。
+help:
+	@echo "Model Router make 目标（产物统一在 dist/，版本 $(VERSION)）："
+	@echo "  make cli          编译 CLI → dist/codex-router（版本注入 + 裁剪）"
+	@echo "  make app          构建完整 App → dist/Model Router.app（内嵌同版本 Go 二进制）"
+	@echo "  make install-cli  原子替换 ~/bin/codex-router（部署，你来执行）"
+	@echo "  make install-app  App 换到 ~/Applications（部署；App 在跑会拒绝）"
+	@echo "  make test         Go 全量测试"
+	@echo "  make test-app     Swift 包测试"
+	@echo "  make doctor       用 dist 里的二进制跑体检"
+	@echo "  make version      打印版本号"
+	@echo "  make clean        清空 dist/"
 
 version:
 	@echo $(VERSION)
 
-build: $(BINARY)
+cli: $(BINARY)
 
 $(BINARY):
 	@mkdir -p $(DIST)
@@ -45,7 +48,7 @@ app:
 	@echo "built: $(APP_DIR)"
 
 # 部署类目标是操作者的动作（约定：构建归 make，部署由你亲手执行）。
-install-cli: build
+install-cli: cli
 	@mkdir -p $(dir $(CLI_INSTALL))
 	mv "$(BINARY)" "$(CLI_INSTALL)"
 	@echo "installed CLI: $(CLI_INSTALL) (version $(VERSION))"
@@ -64,7 +67,7 @@ test:
 test-app:
 	cd apps/macos/ModelRouterTray && swift test
 
-doctor: build
+doctor: cli
 	$(BINARY) doctor
 
 clean:
