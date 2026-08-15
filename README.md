@@ -87,6 +87,8 @@ control credential PROVIDER --remove    删除对应表
 control config init                     生成注释模板
 control reload                          重读配置+刷新 catalog，不重启
 control subagents status|mode|select-all|unselect-all|set|provider
+control picker set <slug> show|hide | provider <id> | all | status
+control tool-result-aging status|on|off
 control presence set always|follow-codex
 control account --json | provider-usage --json    配额与用量
 control vision-bridge pull TAG | pull-status | benchmark | catalog
@@ -127,6 +129,15 @@ provider 在注册表里声明协议（`internal/registry/config/`），
 - 任何凭证不进日志、catalog、健康检查输出；托管 base URL 视为本地机密，
   输出一律打码
 - 详见 [SECURITY.md](SECURITY.md)
+
+## 发现新模型
+
+```sh
+./codex-router discover zai-coding     # 实时拉 provider /v1/models 全量列表
+```
+
+`=` 已在注册表路由，`+` 是上游新上架、可加进注册表的模型（改
+`internal/registry/config/` 后 `make app` 重新分发）。
 
 ## 卸载
 
