@@ -15,6 +15,12 @@
 > 样本剔除/日桶语义，`internal/usage/providerusage.go`）。裁剪掉的命令
 >（maintenance/apply/harness 等）给一行人话错误而非 usage 倾倒。
 > 回归测试钉住全部形状（providerusage_test / presence_test）。
+> **状态目录已迁至 ~/.codex-router**（不再复用原版嵌在 Codex 家目录的
+> ~/.codex/codex-router）：state.Open 首次解析到新默认目录且旧目录存在时
+> 一次性只读迁移（文件级 tmp+rename，caller-secret 随迁故 config.toml
+> 已发布的 URL 保持有效；新目录已存在则不迁移，旧目录永不改动）。
+> launchd plist 内嵌 --state 绝对路径，迁移后已重装刷新；迁移边界由
+> migrate_test.go 钉住。
 > **操作者待办**：`./bin/control credential zai-coding`（stdin 输入 key）
 > 与 `credential opencode-go` 启用路由模型；tray 已构建安装于
 > ~/Applications/Model Router.app 并在菜单栏运行，面板点「刷新」即得

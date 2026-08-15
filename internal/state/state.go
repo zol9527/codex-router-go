@@ -1,6 +1,7 @@
-// Package state 管理 ~/.codex/codex-router 状态目录：两个 secret、
-// provider 选择、凭据文件。目录格式与原 Node 栈完全一致，
-// 切换日 caller-secret / internal-secret / *.secret 原位复用。
+// Package state 管理 ~/.codex-router 状态目录：两个 secret、
+// provider 选择、凭据文件。目录格式与原 Node 栈完全一致；从原版
+// 嵌在 Codex 家目录里的 ~/.codex/codex-router 迁出（见
+// migrateLegacyState），旧目录原样保留、永不删除。
 package state
 
 import (
@@ -28,6 +29,25 @@ func DefaultDir() string {
 	if err != nil {
 		return ".codex-router-state"
 	}
+	return filepath.Join(home, ".codex-router")
+}
+
+// defaultDirNoEnv 是不带环境覆盖的默认目录；Open 用它判断"这次解析
+// 到的是不是新默认位置"，只有是才考虑旧目录迁移。
+func defaultDirNoEnv() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".codex-router")
+}
+
+// legacyDir 是原版（Node 栈）与 Go 切换期共用的旧状态目录。
+func legacyDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
 	return filepath.Join(home, ".codex", "codex-router")
 }
 
@@ -36,10 +56,68 @@ func Open(dir string) (*State, error) {
 	if dir == "" {
 		dir = DefaultDir()
 	}
+	if dir == defaultDirNoEnv() {
+		migrateLegacyState(dir)
+	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("create state dir: %w", err)
 	}
 	return &State{Dir: dir}, nil
+}
+
+// migrateLegacyState 把旧状态目录一次性复制到新默认目录。
+//
+// 约束（每条都有明确的失败场景在背后）：
+//   - 只在新目录尚不存在时执行 —— 已在的新目录是操作者自己的状态，
+//     任何自动写入都可能覆盖人家改过的东西；
+//   - 只复制、永不改动旧目录 —— 旧目录同时属于原 Node 栈，删除它
+//     违反"不动旧状态"的边界；
+//   - caller-secret 随迁，config.toml 里已发布的 base URL（内嵌该
+//     key）保持有效，无需重发布；
+//   - 每个文件经临时名 + rename 落盘，并发进程（service 与 control
+//     同时首跑）最多重复写一遍相同内容，不会读到半截 secret。
+func migrateLegacyState(newDir string) {
+	legacy := legacyDir()
+	if legacy == "" || legacy == newDir {
+		return
+	}
+	if _, err := os.Stat(newDir); err == nil {
+		return // 新目录已在：不是首次，操作者状态优先
+	}
+	entries, err := os.ReadDir(legacy)
+	if err != nil || len(entries) == 0 {
+		return // 没有旧状态：全新安装
+	}
+	if err := os.MkdirAll(newDir, 0o700); err != nil {
+		return
+	}
+	migrated := 0
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue // 状态目录是平的；子目录不属于状态契约
+		}
+		info, err := entry.Info()
+		if err != nil || !info.Mode().IsRegular() {
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join(legacy, entry.Name()))
+		if err != nil {
+			continue
+		}
+		tmp := filepath.Join(newDir, "."+entry.Name()+".migrating")
+		if err := os.WriteFile(tmp, raw, info.Mode().Perm()); err != nil {
+			continue
+		}
+		if err := os.Rename(tmp, filepath.Join(newDir, entry.Name())); err != nil {
+			os.Remove(tmp)
+			continue
+		}
+		migrated++
+	}
+	if migrated > 0 {
+		fmt.Fprintf(os.Stderr, "[codex-router] migrated %d state files from %s to %s (original left untouched)\n",
+			migrated, legacy, newDir)
+	}
 }
 
 // readSecretFile 读取一个去除首尾空白后的单行文件。
