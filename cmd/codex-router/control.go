@@ -249,9 +249,17 @@ func controlService(args []string) error {
 		fmt.Printf("service: %s\n", map[bool]string{true: "running", false: "stopped"}[running])
 		return nil
 	case "start", "restart":
+		// kickstart 只对已加载的任务有效；stop 的 bootout 把任务整个
+		// 从 launchd 卸掉了，此时 kickstart 报 "Could not find service"。
+		// 先 kickstart（已加载的常态路径，还能顺手重启），失败说明任务
+		// 未加载 —— load 会注册并按 RunAtLoad 立即启动。
 		out, err := exec.Command("/bin/launchctl", "kickstart", "-k", "gui/"+launchdUID()+"/"+launchdLabel).CombinedOutput()
 		if err != nil {
-			return fmt.Errorf("launchctl kickstart: %v: %s", err, strings.TrimSpace(string(out)))
+			loadOut, loadErr := exec.Command("/bin/launchctl", "load", launchdPlistPath()).CombinedOutput()
+			if loadErr != nil {
+				return fmt.Errorf("launchctl kickstart: %v: %s; load: %v: %s",
+					err, strings.TrimSpace(string(out)), loadErr, strings.TrimSpace(string(loadOut)))
+			}
 		}
 		fmt.Println("service: started")
 		return nil
