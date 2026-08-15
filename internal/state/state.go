@@ -13,6 +13,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/loyd/codex-router/internal/tomlconf"
 )
 
 // State 持有已解析的状态目录路径与内容。
@@ -259,4 +261,77 @@ func (s *State) WriteCredentialFile(file, value string) error {
 		return err
 	}
 	return os.Chmod(path, 0o600)
+}
+
+// ConfigPath 是操作者的凭证配置文件（config.toml）路径。
+func (s *State) ConfigPath() string {
+	return filepath.Join(s.Dir, "config.toml")
+}
+
+// ReadConfigCredential 从 config.toml 读 [table].api_key。
+// 文件缺失或不含该表都返回无；解析失败同样返回无 —— 凭证解析在请求
+// 路径上，fail-closed 的"无凭证"比带病猜测安全（坏文件的可见性由
+// doctor/control 负责，那里会给出带行号的错误）。
+func (s *State) ReadConfigCredential(table string) (string, bool) {
+	raw, err := os.ReadFile(s.ConfigPath())
+	if err != nil {
+		return "", false
+	}
+	doc, err := tomlconf.Parse(string(raw))
+	if err != nil {
+		return "", false
+	}
+	value, ok := doc.Get(table, "api_key")
+	if !ok || strings.TrimSpace(value) == "" {
+		return "", false
+	}
+	return value, true
+}
+
+// WriteConfigCredential 原子改写 config.toml 的 [table].api_key，
+// 保留操作者手写的注释与其他表。先整文解析校验 —— 解析不了的文件
+// 绝不被改写（fail-closed），然后做行级手术。
+func (s *State) WriteConfigCredential(table, value string) error {
+	return s.rewriteConfig(func(source string) (string, error) {
+		return tomlconf.UpsertKey(source, table, "api_key", value)
+	})
+}
+
+// RemoveConfigTable 删除 config.toml 里的一个表（其他内容原样）。
+func (s *State) RemoveConfigTable(table string) error {
+	return s.rewriteConfig(func(source string) (string, error) {
+		return tomlconf.RemoveTable(source, table)
+	})
+}
+
+// ConfigParseError 返回 config.toml 的解析错误（无错返回 nil）。
+// doctor 用它把坏文件指给操作者。
+func (s *State) ConfigParseError() error {
+	raw, err := os.ReadFile(s.ConfigPath())
+	if err != nil {
+		return nil // 文件不存在不是错误
+	}
+	_, err = tomlconf.Parse(string(raw))
+	return err
+}
+
+func (s *State) rewriteConfig(transform func(string) (string, error)) error {
+	source := ""
+	if raw, err := os.ReadFile(s.ConfigPath()); err == nil {
+		source = string(raw)
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	next, err := transform(source)
+	if err != nil {
+		return err
+	}
+	tmp := s.ConfigPath() + ".tmp"
+	if err := os.WriteFile(tmp, []byte(next), 0o600); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmp, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, s.ConfigPath())
 }

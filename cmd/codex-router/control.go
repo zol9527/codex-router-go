@@ -3,11 +3,16 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/loyd/codex-router/internal/cred"
 	"github.com/loyd/codex-router/internal/registry"
@@ -84,7 +89,7 @@ func cmdControl(args []string) error {
 	if err != nil {
 		return err
 	}
-	reg, err := registry.Load(defaultConfigDir())
+	reg, err := registry.LoadDefault("")
 	if err != nil {
 		return err
 	}
@@ -104,6 +109,8 @@ func cmdControl(args []string) error {
 		return fmt.Errorf("%s was removed in the go rewrite; this build serves codex routing only", cutControlCommand(rest))
 	case len(rest) >= 1 && rest[0] == "credential" && len(rest) >= 2:
 		return controlCredential(st, reg, rest[1:])
+	case len(rest) >= 1 && rest[0] == "config" && len(rest) >= 2:
+		return controlConfig(st, rest[1:])
 	case len(rest) >= 1 && rest[0] == "account":
 		return controlAccount(*stateDir, reg)
 	case len(rest) >= 1 && rest[0] == "provider-usage":
@@ -141,8 +148,9 @@ func controlUsage() {
   control service start|stop|restart|status
   control providers list [--json]
   control providers enable ID [ID...]     (append to selection)
-  control credential PROVIDER             read key from stdin (hidden prompt)
-  control credential PROVIDER --remove
+  control credential PROVIDER             write api_key to config.toml (stdin prompt)
+  control credential PROVIDER --remove    remove the provider's config.toml table
+  control config init                     write the commented config.toml template
   control presence set always|follow-codex
   control account --json | control provider-usage --json
   control vision-bridge pull TAG | pull-status | benchmark [TAG] | catalog
@@ -238,6 +246,10 @@ func orderedProviderIDs(reg *registry.Registry) []string {
 	return []string{"zai-coding", "opencode-go"}
 }
 
+// controlService：App 化后的服务面 —— 不再经 launchd，直接管进程。
+// 常态下服务由 Model Router App 作为子进程托管（App 退出它也退出）；
+// 这里的 start 是终端救急路径（分离进程，App 之外存活），stop 对
+// pidfile 里的进程发 SIGTERM —— App 托管的与终端拉起的都一样能停。
 func controlService(args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("service requires start|stop|restart|status")
@@ -249,24 +261,15 @@ func controlService(args []string) error {
 		fmt.Printf("service: %s\n", map[bool]string{true: "running", false: "stopped"}[running])
 		return nil
 	case "start", "restart":
-		// kickstart 只对已加载的任务有效；stop 的 bootout 把任务整个
-		// 从 launchd 卸掉了，此时 kickstart 报 "Could not find service"。
-		// 先 kickstart（已加载的常态路径，还能顺手重启），失败说明任务
-		// 未加载 —— load 会注册并按 RunAtLoad 立即启动。
-		out, err := exec.Command("/bin/launchctl", "kickstart", "-k", "gui/"+launchdUID()+"/"+launchdLabel).CombinedOutput()
-		if err != nil {
-			loadOut, loadErr := exec.Command("/bin/launchctl", "load", launchdPlistPath()).CombinedOutput()
-			if loadErr != nil {
-				return fmt.Errorf("launchctl kickstart: %v: %s; load: %v: %s",
-					err, strings.TrimSpace(string(out)), loadErr, strings.TrimSpace(string(loadOut)))
+		if action == "restart" {
+			if err := stopServiceByPidfile(); err != nil {
+				return err
 			}
 		}
-		fmt.Println("service: started")
-		return nil
+		return startServiceDetached()
 	case "stop":
-		out, err := exec.Command("/bin/launchctl", "bootout", "gui/"+launchdUID()+"/"+launchdLabel).CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("launchctl bootout: %v: %s", err, strings.TrimSpace(string(out)))
+		if err := stopServiceByPidfile(); err != nil {
+			return err
 		}
 		fmt.Println("service: stopped")
 		return nil
@@ -275,12 +278,74 @@ func controlService(args []string) error {
 	}
 }
 
-func launchdUID() string {
-	out, err := exec.Command("id", "-u").Output()
-	if err != nil {
-		return "501"
+// startServiceDetached 分离进程拉起 serve（终端救急：App 没开时也能有
+// 服务）。Setsid 脱离会话，stderr 追加进 router.log 保留线索。
+func startServiceDetached() error {
+	if probeURL(fmt.Sprintf("http://127.0.0.1:%d/health", defaultPort())) {
+		fmt.Println("service: already running")
+		return nil
 	}
-	return strings.TrimSpace(string(out))
+	exe, err := selfBinaryPath()
+	if err != nil {
+		return err
+	}
+	logFile, err := os.OpenFile(filepath.Join(state.DefaultDir(), "router.log"),
+		os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		logFile = nil
+	}
+	cmd := exec.Command(exe, "serve",
+		"--state", state.DefaultDir(), "--port", fmt.Sprintf("%d", defaultPort()))
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if logFile != nil {
+		cmd.Stdout = logFile
+		cmd.Stderr = logFile
+	}
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("spawn serve: %w", err)
+	}
+	if logFile != nil {
+		defer logFile.Close()
+	}
+	// 等 /health 就绪再报成功 —— 立即返回会让调用方误判。
+	for i := 0; i < 40; i++ {
+		time.Sleep(250 * time.Millisecond)
+		if probeURL(fmt.Sprintf("http://127.0.0.1:%d/health", defaultPort())) {
+			fmt.Println("service: started")
+			return nil
+		}
+	}
+	return fmt.Errorf("serve spawned but /health did not come up within 10s (see router.log)")
+}
+
+// stopServiceByPidfile 读状态目录的 pidfile，对进程发 SIGTERM。
+// pidfile 缺失/进程已死都视为已停止（清掉陈旧文件）。
+func stopServiceByPidfile() error {
+	pidfile := filepath.Join(state.DefaultDir(), "router.pid")
+	raw, err := os.ReadFile(pidfile)
+	if err != nil {
+		if probeURL(fmt.Sprintf("http://127.0.0.1:%d/health", defaultPort())) {
+			return fmt.Errorf("service is answering /health but wrote no pidfile; stop it from its owner (the app or its terminal)")
+		}
+		return nil
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil || pid <= 0 {
+		os.Remove(pidfile)
+		return nil
+	}
+	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
+		return fmt.Errorf("signal %d: %w", pid, err)
+	}
+	// 等优雅退出（最长 5s），超时不强杀 —— 请求有 10s 的排空预算。
+	for i := 0; i < 20; i++ {
+		time.Sleep(250 * time.Millisecond)
+		if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
+			os.Remove(pidfile)
+			return nil
+		}
+	}
+	return nil
 }
 
 // controlProvidersList 的 JSON 输出形状对齐 tray 的
@@ -355,22 +420,26 @@ func controlProvidersEnable(st *state.State, reg *registry.Registry, ids []strin
 }
 
 // controlCredential 从 stdin 读 key（tray 传 stdin，不在参数里）。
+// controlCredential：凭证的家是 config.toml（Claude Code 式配置项）。
+// stdin 隐藏输入的终端流程保留；tray 的 Add Key 走同一条路。改写是
+// 行级手术 —— 操作者的注释与其他表原样保留。
 func controlCredential(st *state.State, reg *registry.Registry, args []string) error {
 	providerID := args[0]
 	p := reg.Providers[providerID]
 	if p == nil {
 		return fmt.Errorf("unknown provider %q", providerID)
 	}
+	// 变体与家族主项共享一张凭证表（opencode-go-responses → opencode-go）。
+	family := p.ID
+	if p.VariantOf != "" {
+		family = p.VariantOf
+	}
 	if len(args) > 1 && args[1] == "--remove" {
-		path := st.CredentialFilePath(p.Credential.File)
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		if err := st.RemoveConfigTable(family); err != nil {
 			return err
 		}
-		fmt.Printf("credential removed: %s\n", providerID)
+		fmt.Printf("credential removed: %s (config.toml [%s] table)\n", providerID, family)
 		return nil
-	}
-	if p.Credential.File == "" {
-		return fmt.Errorf("provider %s has no file credential", providerID)
 	}
 	fmt.Fprintf(os.Stderr, "Paste %s (input hidden, then Enter): ", p.Credential.Prompt)
 	reader := bufio.NewReader(os.Stdin)
@@ -382,12 +451,50 @@ func controlCredential(st *state.State, reg *registry.Registry, args []string) e
 	if value == "" {
 		return fmt.Errorf("empty credential; nothing written")
 	}
-	if err := st.WriteCredentialFile(p.Credential.File, value); err != nil {
+	if err := st.WriteConfigCredential(family, value); err != nil {
 		return err
 	}
-	// keychain 副本：可选，失败不阻塞（文件已可用）。
-	fmt.Printf("credential stored: %s (file, 0600)\n", providerID)
+	fmt.Printf("credential stored: %s (config.toml [%s], 0600)\n", providerID, family)
 	return nil
+}
+
+// configTemplate 是 control config init 写出的带注释模板 ——
+// 每个可启用 provider 一节，api_key 以注释形态等着被填。
+const configTemplate = `# Model Router 凭证配置（Claude Code 式）。
+# 每个 provider 一节；api_key 即凭证。保存后下一回合请求即生效，
+# 无需重启。也可在 App 的设置页填入（写入同一文件）。
+
+[zai-coding]
+# api_key = "sk-..."
+
+[opencode-go]
+# api_key = "..."
+`
+
+// controlConfig：config 子命令。init —— 文件不存在则写模板（0600）
+// 并打印路径；已存在时不动，只打印路径。
+func controlConfig(st *state.State, args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("config requires init")
+	}
+	path := st.ConfigPath()
+	switch args[0] {
+	case "init":
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			if err := os.WriteFile(path, []byte(configTemplate), 0o600); err != nil {
+				return err
+			}
+			if err := os.Chmod(path, 0o600); err != nil {
+				return err
+			}
+			fmt.Printf("config template written: %s\n", path)
+			return nil
+		}
+		fmt.Printf("config already exists: %s\n", path)
+		return nil
+	default:
+		return fmt.Errorf("unknown config action %q", args[0])
+	}
 }
 
 func stdinFile() *os.File { return os.Stdin }

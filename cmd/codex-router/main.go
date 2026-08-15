@@ -94,15 +94,12 @@ func cmdServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	port := fs.Int("port", defaultPort(), "listen port")
 	stateDir := fs.String("state", state.DefaultDir(), "state directory")
-	configDir := fs.String("config", "", "registry config directory (default: <repo>/config)")
+	configDir := fs.String("config", "", "registry config directory override (default: embedded registry)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
-	if *configDir == "" {
-		*configDir = defaultConfigDir()
-	}
-	reg, err := registry.Load(*configDir)
+	reg, err := registry.LoadDefault(*configDir)
 	if err != nil {
 		return fmt.Errorf("load registry: %w", err)
 	}
@@ -144,6 +141,12 @@ func cmdServe(args []string) error {
 		}
 		return fmt.Errorf("listen %s: %w", listenAddr, err)
 	}
+	// pidfile 写在成功 listen 之后 —— bind 失败的实例绝不能覆盖健康
+	// 实例的 pidfile。control service stop 靠它找到进程。
+	pidfile := filepath.Join(st.Dir, "router.pid")
+	if err := os.WriteFile(pidfile, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0o644); err != nil {
+		log.Printf("[codex-router] pidfile write failed: %v", err)
+	}
 	log.Printf("[codex-router] listening on %s (version %s)", listenAddr, version)
 
 	done := make(chan os.Signal, 1)
@@ -154,7 +157,9 @@ func cmdServe(args []string) error {
 		defer cancel()
 		httpServer.Shutdown(ctx)
 	}()
-	return httpServer.Serve(listener)
+	err = httpServer.Serve(listener)
+	os.Remove(pidfile)
+	return err
 }
 
 func defaultPort() int {
@@ -167,35 +172,6 @@ func defaultPort() int {
 		}
 	}
 	return 4202
-}
-
-// defaultConfigDir 定位注册表 config/ 目录：优先自包含安装位（二进制
-// 旁边的 config/，install 时拷入），其次源码树（go run / go test 从
-// 当前目录向上找）。serve/control/doctor 都走这里 —— 仓库移走后
-// 部署仍完整。
-func defaultConfigDir() string {
-	if exe, err := os.Executable(); err == nil {
-		candidate := filepath.Join(filepath.Dir(exe), "config")
-		if st, err := os.Stat(candidate); err == nil && st.IsDir() {
-			return candidate
-		}
-	}
-	dir, err := os.Getwd()
-	if err != nil {
-		return "config"
-	}
-	for i := 0; i < 6; i++ {
-		candidate := filepath.Join(dir, "config")
-		if st, err := os.Stat(candidate); err == nil && st.IsDir() {
-			return candidate
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			break
-		}
-		dir = parent
-	}
-	return "config"
 }
 
 func envOr(name, fallback string) string {

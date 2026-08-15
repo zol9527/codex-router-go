@@ -1,5 +1,7 @@
-// Package cred 按 env → .secret 文件 → macOS Keychain 的顺序解析
-// provider 凭据，与原 provider-credentials.mjs 的优先级一致。
+// Package cred 按 env → config.toml → .secret 文件 → macOS Keychain
+// 的顺序解析 provider 凭据。config.toml 是操作者的家（Claude Code 式
+// 配置项），env 仍最高（开发覆盖）；.secret 文件与 Keychain 是历史
+// 来源，保留兼容。
 package cred
 
 import (
@@ -35,8 +37,8 @@ func New(st *state.State) *Resolver {
 	}
 }
 
-// Resolve 返回凭据值与来源标记（"environment" / "file" / "keychain"）。
-// 未配置时返回空串与空来源。
+// Resolve 返回凭据值与来源标记（"environment" / "config" / "file" /
+// "keychain"）。未配置时返回空串与空来源。
 func (r *Resolver) Resolve(p *registry.Provider) (string, string) {
 	if p == nil {
 		return "", ""
@@ -47,13 +49,22 @@ func (r *Resolver) Resolve(p *registry.Provider) (string, string) {
 			return v, "environment"
 		}
 	}
-	// 2. 状态目录里的 .secret 文件
+	// 2. config.toml 的 [family].api_key。变体（opencode-go-responses
+	// 等）与家族主项共享一张凭证 —— 表名按家族主项解析。
+	family := p.ID
+	if p.VariantOf != "" {
+		family = p.VariantOf
+	}
+	if v, ok := r.State.ReadConfigCredential(family); ok {
+		return v, "config"
+	}
+	// 3. 状态目录里的 .secret 文件
 	if p.Credential.File != "" {
 		if v, ok := r.State.ReadCredentialFile(p.Credential.File); ok {
 			return v, "file"
 		}
 	}
-	// 3. macOS Keychain（security find-generic-password -s <service> -a default -w）
+	// 4. macOS Keychain（security find-generic-password -s <service> -a default -w）
 	if len(p.Credential.KeychainServices) > 0 && runtime.GOOS == "darwin" {
 		if v, ok := r.keychain(p.Credential.KeychainServices[0]); ok {
 			return v, "keychain"

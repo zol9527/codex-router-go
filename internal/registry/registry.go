@@ -4,9 +4,12 @@
 package registry
 
 import (
+	"embed"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 )
@@ -75,24 +78,76 @@ type modelFile struct {
 	Models  []Model `json:"models"`
 }
 
-// Load 读取 configRoot 下的全部注册表片段并构建索引。
+// 注册表内嵌进二进制（go:embed 不允许 ".." 路径，所以目录住在包内）。
+// 二进制从此自包含：App bundle 里不需要携带 config/ 目录，注册表变更
+// 通过重编二进制分发 —— 本来就是 commit 驱动的。
+//
+//go:embed all:config
+var embeddedConfig embed.FS
+
+// registryFS 是注册表加载的文件源：真目录或内嵌 FS。
+type registryFS interface {
+	ReadDir(name string) ([]fs.DirEntry, error)
+	ReadFile(name string) ([]byte, error)
+}
+
+// dirFS 把磁盘目录适配成 registryFS。
+type dirFS struct{ root string }
+
+func (d dirFS) ReadDir(name string) ([]fs.DirEntry, error) {
+	return os.ReadDir(filepath.Join(d.root, name))
+}
+
+func (d dirFS) ReadFile(name string) ([]byte, error) {
+	return os.ReadFile(filepath.Join(d.root, name))
+}
+
+// Load 读取 configRoot 下的全部注册表片段并构建索引（开发/显式覆盖用）。
 func Load(configRoot string) (*Registry, error) {
+	return loadFS(dirFS{configRoot})
+}
+
+// LoadEmbedded 从内嵌注册表构建索引（发行形态）。
+func LoadEmbedded() (*Registry, error) {
+	sub, err := fs.Sub(embeddedConfig, "config")
+	if err != nil {
+		return nil, err
+	}
+	readDirFS, ok := sub.(registryFS)
+	if !ok {
+		return nil, fmt.Errorf("embedded registry does not support ReadDir")
+	}
+	return loadFS(readDirFS)
+}
+
+// LoadDefault 是所有命令的入口：显式目录存在就用它（开发、
+// --config 覆盖），否则落到内嵌注册表。
+func LoadDefault(configRoot string) (*Registry, error) {
+	if configRoot != "" {
+		if st, err := os.Stat(configRoot); err == nil && st.IsDir() {
+			return Load(configRoot)
+		}
+	}
+	return LoadEmbedded()
+}
+
+func loadFS(src registryFS) (*Registry, error) {
 	r := &Registry{
 		Providers:      map[string]*Provider{},
 		bySlug:         map[string]*Model{},
 		byGatewayModel: map[string]*Model{},
 	}
-	vendorDirs, err := os.ReadDir(configRoot)
+	vendorDirs, err := src.ReadDir(".")
 	if err != nil {
-		return nil, fmt.Errorf("read config root %s: %w", configRoot, err)
+		return nil, fmt.Errorf("read config root: %w", err)
 	}
 	for _, vendor := range vendorDirs {
 		if !vendor.IsDir() {
 			continue
 		}
-		vendorDir := filepath.Join(configRoot, vendor.Name())
-		definition := filepath.Join(vendorDir, vendor.Name()+".json")
-		if raw, err := os.ReadFile(definition); err == nil {
+		vendorDir := vendor.Name()
+		definition := path.Join(vendorDir, vendor.Name()+".json")
+		if raw, err := src.ReadFile(definition); err == nil {
 			var pf providerFile
 			if err := json.Unmarshal(raw, &pf); err != nil {
 				return nil, fmt.Errorf("parse %s: %w", definition, err)
@@ -106,7 +161,7 @@ func Load(configRoot string) (*Registry, error) {
 			}
 		}
 		// 每个 method 子目录里的模型片段
-		methodDirs, err := os.ReadDir(vendorDir)
+		methodDirs, err := src.ReadDir(vendorDir)
 		if err != nil {
 			continue
 		}
@@ -114,7 +169,7 @@ func Load(configRoot string) (*Registry, error) {
 			if !method.IsDir() {
 				continue
 			}
-			fragments, err := os.ReadDir(filepath.Join(vendorDir, method.Name()))
+			fragments, err := src.ReadDir(path.Join(vendorDir, method.Name()))
 			if err != nil {
 				continue
 			}
@@ -122,14 +177,14 @@ func Load(configRoot string) (*Registry, error) {
 				if fragment.IsDir() || !strings.HasSuffix(fragment.Name(), ".json") {
 					continue
 				}
-				path := filepath.Join(vendorDir, method.Name(), fragment.Name())
-				raw, err := os.ReadFile(path)
+				rel := path.Join(vendorDir, method.Name(), fragment.Name())
+				raw, err := src.ReadFile(rel)
 				if err != nil {
 					continue
 				}
 				var mf modelFile
 				if err := json.Unmarshal(raw, &mf); err != nil {
-					return nil, fmt.Errorf("parse %s: %w", path, err)
+					return nil, fmt.Errorf("parse %s: %w", rel, err)
 				}
 				for _, m := range mf.Models {
 					model := m // 拷贝出循环变量

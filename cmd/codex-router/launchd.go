@@ -6,27 +6,21 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
-	"text/template"
 	"time"
 )
 
-// launchd 集成：单二进制直接作为 LaunchAgent 服务，
-// KeepAlive 保活（对应旧栈 start.mjs 整组拉起的职责，这里一个进程全包）。
+// App 化后 launchd 不再参与服务生命周期（App 子进程托管服务）。
+// 这里只保留对旧安装遗留 plist 的清理，以及共享的小工具。
 
 const launchdLabel = "io.github.codex-router.go"
 
-func homeLibrary() string {
+func launchdPlistPath() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "."
 	}
-	return filepath.Join(home, "Library", "LaunchAgents")
-}
-
-func launchdPlistPath() string {
-	return filepath.Join(homeLibrary(), launchdLabel+".plist")
+	return filepath.Join(home, "Library", "LaunchAgents", launchdLabel+".plist")
 }
 
 func selfBinaryPath() (string, error) {
@@ -37,80 +31,7 @@ func selfBinaryPath() (string, error) {
 	return filepath.EvalSymlinks(exe)
 }
 
-const plistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>{{.Label}}</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{{.Binary}}</string>
-    <string>serve</string>
-    <string>--state</string>
-    <string>{{.StateDir}}</string>
-    <string>--config</string>
-    <string>{{.ConfigDir}}</string>
-    <string>--port</string>
-    <string>{{.Port}}</string>
-  </array>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <true/>
-  <key>ProcessType</key>
-  <string>Adaptive</string>
-  <key>ThrottleInterval</key>
-  <integer>10</integer>
-  <key>StandardOutPath</key>
-  <string>{{.LogPath}}</string>
-  <key>StandardErrorPath</key>
-  <string>{{.LogPath}}</string>
-</dict>
-</plist>
-`
-
-func installLaunchd(port int, stateDir string) error {
-	if runtime.GOOS != "darwin" {
-		return fmt.Errorf("launchd install is macOS-only (run the binary manually on %s)", runtime.GOOS)
-	}
-	binary, err := selfBinaryPath()
-	if err != nil {
-		return err
-	}
-	absState, err := filepath.Abs(stateDir)
-	if err != nil {
-		return err
-	}
-	logPath := filepath.Join(absState, "router.log")
-	var sb strings.Builder
-	tpl := template.Must(template.New("plist").Parse(plistTemplate))
-	err = tpl.Execute(&sb, map[string]any{
-		"Label":     launchdLabel,
-		"Binary":    binary,
-		"StateDir":  absState,
-		"ConfigDir": defaultConfigDir(),
-		"Port":      port,
-		"LogPath":   logPath,
-	})
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(homeLibrary(), 0o755); err != nil {
-		return err
-	}
-	if err := os.WriteFile(launchdPlistPath(), []byte(sb.String()), 0o644); err != nil {
-		return err
-	}
-	// 先卸旧再装载（幂等刷新）。
-	exec.Command("/bin/launchctl", "unload", launchdPlistPath()).Run()
-	out, err := exec.Command("/bin/launchctl", "load", launchdPlistPath()).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("launchctl load: %v: %s", err, strings.TrimSpace(string(out)))
-	}
-	return nil
-}
-
+// uninstallLaunchd 清除旧 launchd 布局遗留的 LaunchAgent。
 func uninstallLaunchd() error {
 	if _, err := os.Stat(launchdPlistPath()); err != nil {
 		return nil
@@ -153,4 +74,12 @@ func codexConfigPath() string {
 		home = filepath.Join(userHome, ".codex")
 	}
 	return filepath.Join(home, "config.toml")
+}
+
+func launchdUID() string {
+	out, err := exec.Command("id", "-u").Output()
+	if err != nil {
+		return "501"
+	}
+	return strings.TrimSpace(string(out))
 }
