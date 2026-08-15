@@ -25,6 +25,9 @@ type Provider struct {
 	Protocol    string     `json:"protocol"` // "" = chat completions; "openai-responses"; "anthropic"
 	VariantOf   string     `json:"variantOf"`
 	Credential  Credential `json:"credential"`
+	// ModelsDevID 是 models.dev 开源库里的 provider ID（动态注册时
+	// 查精确参数用），如 "zai-coding-plan" / "opencode-go"。
+	ModelsDevID string `json:"modelsDevId,omitempty"`
 }
 
 // Credential 描述一个 provider 凭据的三层解析来源。

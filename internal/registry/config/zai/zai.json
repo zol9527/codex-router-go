@@ -19,7 +19,8 @@
           "codex-router-zai-coding"
         ],
         "prompt": "Z.ai GLM Coding Plan API key"
-      }
+      },
+      "modelsDevId": "zai-coding-plan"
     },
     {
       "id": "zai-api",

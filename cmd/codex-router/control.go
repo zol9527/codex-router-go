@@ -14,9 +14,12 @@ import (
 	"syscall"
 	"time"
 
+	"context"
 	"github.com/loyd/codex-router/internal/catalog"
 	"github.com/loyd/codex-router/internal/configfile"
+
 	"github.com/loyd/codex-router/internal/cred"
+	"github.com/loyd/codex-router/internal/discover"
 	"github.com/loyd/codex-router/internal/registry"
 	"github.com/loyd/codex-router/internal/state"
 )
@@ -91,7 +94,7 @@ func cmdControl(args []string) error {
 	if err != nil {
 		return err
 	}
-	reg, err := registry.LoadDefault("")
+	reg, err := registry.LoadWithOverlay(st.Dir, "")
 	if err != nil {
 		return err
 	}
@@ -119,6 +122,8 @@ func cmdControl(args []string) error {
 		return controlPicker(st, reg, rest[1:])
 	case len(rest) >= 1 && rest[0] == "tool-result-aging":
 		return controlToolResultAging(st, rest[1:])
+	case len(rest) >= 1 && rest[0] == "models":
+		return controlModels(st, reg, rest[1:])
 	case len(rest) >= 1 && rest[0] == "reload":
 		return controlReload(st, reg)
 	case len(rest) >= 1 && rest[0] == "account":
@@ -165,6 +170,7 @@ func controlUsage() {
   control subagents status|mode <m>|select-all|unselect-all|set <slug> on|off|provider <id> on|off
   control picker set <slug> show|hide | provider <id> show|hide | all show|hide | status
   control tool-result-aging status|on|off
+  control models sync [PROVIDER]|list|remove <slug>|add PROVIDER <upstream-id>
   control presence set always|follow-codex
   control account --json | control provider-usage --json
   control vision-bridge pull TAG | pull-status | benchmark [TAG] | catalog
@@ -766,4 +772,165 @@ func controlToolResultAging(st *state.State, args []string) error {
 	raw, _ := json.MarshalIndent(state.ToolResultAgingSnapshot(st.Dir), "", "  ")
 	fmt.Println(string(raw))
 	return nil
+}
+
+// controlModels：动态模型注册面。
+//
+//	sync [PROVIDER]   发现+注册（无参数=所有已启用且有凭证的 provider）
+//	add PROVIDER ID   手动注册单个上游模型
+//	list / remove     覆盖层查看/移除
+//
+// 写入 user-models.json 覆盖层后向服务进程发 SIGUSR1 热重载注册表；
+// catalog 随之刷新（picker 显示仍需重开 Codex）。
+func controlModels(st *state.State, reg *registry.Registry, args []string) error {
+	action := "list"
+	if len(args) > 0 {
+		action = args[0]
+	}
+	printList := func() {
+		entries := registry.ReadUserModels(st.Dir)
+		if len(entries) == 0 {
+			fmt.Println("no dynamically registered models")
+			return
+		}
+		for _, e := range entries {
+			fmt.Printf("%-34s %-10s ctx=%-8d %s\n",
+				e.Model.Slug, e.Source, e.Model.ContextWindow, e.AddedAt)
+		}
+	}
+	switch action {
+	case "list":
+		printList()
+		return nil
+	case "remove":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: control models remove <slug>")
+		}
+		entries := registry.ReadUserModels(st.Dir)
+		kept := entries[:0]
+		removed := false
+		for _, e := range entries {
+			if e.Model.Slug == args[1] {
+				removed = true
+				continue
+			}
+			kept = append(kept, e)
+		}
+		if !removed {
+			return fmt.Errorf("no overlay entry for %s", args[1])
+		}
+		if err := registry.WriteUserModels(st.Dir, kept); err != nil {
+			return err
+		}
+		if err := controlReload(st, reg); err != nil {
+			return err
+		}
+		fmt.Printf("removed: %s\n", args[1])
+		return nil
+	case "add":
+		if len(args) < 3 {
+			return fmt.Errorf("usage: control models add PROVIDER <upstream-model-id>")
+		}
+		return runModelSync(st, reg, args[1], args[2])
+	case "sync":
+		targets := args[1:]
+		if action == "add" {
+			targets = args[1:2]
+		}
+		return runModelSyncAll(st, reg, targets)
+	default:
+		return fmt.Errorf("usage: control models sync [PROVIDER]|list|remove <slug>|add PROVIDER <id>")
+	}
+}
+
+// runModelSyncAll 对目标 provider（空=全部已启用且有凭证）执行发现+注册。
+func runModelSyncAll(st *state.State, reg *registry.Registry, targets []string) error {
+	resolver := cred.New(st)
+	if len(targets) == 0 {
+		targets = st.EnabledProviders()
+	}
+	total := 0
+	for _, id := range targets {
+		p := reg.Providers[reg.CanonicalProviderID(id)]
+		if p == nil {
+			return fmt.Errorf("unknown provider %q", id)
+		}
+		credential, source := resolver.Resolve(p)
+		if credential == "" {
+			fmt.Printf("%s: no credential (set api_key in %s) — embedded registry only\n", p.ID, st.ConfigPath())
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		report := discover.Sync(ctx, st.Dir, reg, p.ID, credential)
+		cancel()
+		if report.Err != nil {
+			fmt.Printf("%s: sync failed: %v (credential: %s)\n", p.ID, report.Err, source)
+			continue
+		}
+		for _, e := range report.Added {
+			fmt.Printf("%s: + %s (ctx=%d, %s)\n", p.ID, e.Model.Slug, e.Model.ContextWindow, e.Source)
+		}
+		fmt.Printf("%s: %d added (%d models.dev, %d cloned), %d already routed\n",
+			p.ID, len(report.Added), report.MetaHits, report.Clones, len(report.Skipped))
+		total += len(report.Added)
+	}
+	if total == 0 {
+		fmt.Println("no new models registered")
+		return nil
+	}
+	if err := controlReload(st, reg); err != nil {
+		return err
+	}
+	signalServerRegistryReload()
+	fmt.Println("overlay written; server registry reloaded (reopen Codex to see new picker entries)")
+	return nil
+}
+
+// runModelSync 手动注册单个模型（不经过货架对照，直接建模）。
+func runModelSync(st *state.State, reg *registry.Registry, providerID, upstreamID string) error {
+	p := reg.Providers[reg.CanonicalProviderID(providerID)]
+	if p == nil {
+		return fmt.Errorf("unknown provider %q", providerID)
+	}
+	resolver := cred.New(st)
+	credential, _ := resolver.Resolve(p)
+	if credential == "" {
+		return fmt.Errorf("no credential for %s — set api_key in %s first", p.ID, st.ConfigPath())
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	entry := discover.BuildEntry(reg, p, upstreamID, st.Dir, ctx)
+	entries := registry.ReadUserModels(st.Dir)
+	for _, e := range entries {
+		if e.Model.Slug == entry.Model.Slug {
+			fmt.Printf("already registered: %s\n", entry.Model.Slug)
+			return nil
+		}
+	}
+	entries = append(entries, entry)
+	if err := registry.WriteUserModels(st.Dir, entries); err != nil {
+		return err
+	}
+	fmt.Printf("registered: %s (ctx=%d, source=%s)\n", entry.Model.Slug, entry.Model.ContextWindow, entry.Source)
+	if err := controlReload(st, reg); err != nil {
+		return err
+	}
+	signalServerRegistryReload()
+	return nil
+}
+
+// signalServerRegistryReload 向 serve 进程发 SIGUSR1（读 router.pid）。
+// 服务没跑（App 关着）就跳过 —— 下次启动自然加载覆盖层。
+func signalServerRegistryReload() {
+	raw, err := os.ReadFile(filepath.Join(state.DefaultDir(), "router.pid"))
+	if err != nil {
+		return
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil || pid <= 0 {
+		return
+	}
+	if err := syscall.Kill(pid, syscall.SIGUSR1); err != nil {
+		fmt.Fprintf(os.Stderr, "[models] server reload signal failed: %v (restart picks it up)\n", err)
+	}
 }

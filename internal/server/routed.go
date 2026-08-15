@@ -52,8 +52,8 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request, route s
 	}
 	requestedModel, _ := payload["model"].(string)
 
-	routeModel := s.opt.Registry.ForSlug(requestedModel)
-	if routeModel != nil && !s.opt.State.ProviderEnabled(routeModel.Provider, s.opt.Registry.CanonicalProviderID) {
+	routeModel := s.registry().ForSlug(requestedModel)
+	if routeModel != nil && !s.opt.State.ProviderEnabled(routeModel.Provider, s.registry().CanonicalProviderID) {
 		writeJSON(w, http.StatusConflict, map[string]any{
 			"error": map[string]any{
 				"type": "provider_not_enabled", "provider": routeModel.Provider,
@@ -68,13 +68,13 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request, route s
 		return
 	}
 
-	provider := s.opt.Registry.ProviderFor(routeModel)
+	provider := s.registry().ProviderFor(routeModel)
 	if provider == nil {
 		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error",
 			"Model "+routeModel.Slug+" has no provider definition."))
 		return
 	}
-	providerID := s.opt.Registry.CanonicalProviderID(provider.ID)
+	providerID := s.registry().CanonicalProviderID(provider.ID)
 	setRoute(providerID, routeModel.Slug, sessionNameFromHeaders(r.Header))
 
 	credential, _ := s.opt.Credentials.Resolve(provider)
@@ -325,7 +325,7 @@ func (s *Server) serveRouted(w http.ResponseWriter, r *http.Request,
 	payload map[string]any, model *registry.Model, provider *registry.Provider,
 	credential string, started time.Time) {
 
-	providerID := s.opt.Registry.CanonicalProviderID(provider.ID)
+	providerID := s.registry().CanonicalProviderID(provider.ID)
 	setAging := func(stats translate.AgingStats) {
 		s.agingMu.Lock()
 		s.lastAging = stats
@@ -430,13 +430,13 @@ func (s *Server) serveRouted(w http.ResponseWriter, r *http.Request,
 				status: resp.StatusCode, bodyText: string(raw), retryAfter: retryAfter,
 			})
 			s.recordTurn(usage.Event{Model: model.Slug,
-				Provider: s.opt.Registry.CanonicalProviderID(provider.ID),
+				Provider: s.registry().CanonicalProviderID(provider.ID),
 				Status:   resp.StatusCode, DurationMs: time.Since(started).Milliseconds()})
 			return
 		}
 		s.relayResponse(w, resp)
 		s.recordTurn(usage.Event{Model: model.Slug,
-			Provider: s.opt.Registry.CanonicalProviderID(provider.ID),
+			Provider: s.registry().CanonicalProviderID(provider.ID),
 			Status:   resp.StatusCode, DurationMs: time.Since(started).Milliseconds()})
 		logf("model=%s provider=%s protocol=responses status=%d duration_ms=%d",
 			model.Slug, provider.ID, resp.StatusCode, time.Since(started).Milliseconds())

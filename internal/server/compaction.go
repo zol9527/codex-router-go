@@ -55,7 +55,7 @@ func (s *Server) handleRoutedCompaction(w http.ResponseWriter, r *http.Request,
 	payload map[string]any, model *registry.Model, provider *registry.Provider,
 	credential string, v2 bool, route string, started time.Time) {
 
-	providerID := s.opt.Registry.CanonicalProviderID(provider.ID)
+	providerID := s.registry().CanonicalProviderID(provider.ID)
 
 	// 请求构造：整段对话 + 压缩指令，非流式、无工具。
 	// 压缩重放协作条目，agent 载荷解析与普通回合相同（缓存按密文键，

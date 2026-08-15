@@ -1801,6 +1801,22 @@ final class RouterStore: ObservableObject {
     try await runControl(arguments: arguments)
   }
 
+  /// 动态模型同步：实时拉 provider 货架 + models.dev 参数 → 覆盖层。
+  /// 结果行（+ slug / 已收录数）直接显示在页脚消息里。
+  func syncModelsNow() async {
+    do {
+      let output = try await runControlPublic(arguments: ["models", "sync"])
+      let text = String(data: output, encoding: .utf8) ?? ""
+      let lines = text.split(separator: "\n").prefix(6).joined(separator: "\n")
+      message = lines.isEmpty
+        ? routerLocalized("Model sync finished.")
+        : lines
+      await refresh()
+    } catch {
+      message = error.localizedDescription
+    }
+  }
+
   private func runControl(arguments: [String], stdin: Data? = nil) async throws -> Data {
     let router = try RouterProcessLocator.shared.resolve()
     return try await Task.detached {

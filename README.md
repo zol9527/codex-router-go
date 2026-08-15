@@ -130,14 +130,22 @@ provider 在注册表里声明协议（`internal/registry/config/`），
   输出一律打码
 - 详见 [SECURITY.md](SECURITY.md)
 
-## 发现新模型
+## 动态模型注册（discover + models.dev）
 
 ```sh
-./codex-router discover zai-coding     # 实时拉 provider /v1/models 全量列表
+./codex-router discover zai-coding       # 只读：实时拉 provider /v1/models 全量列表
+./codex-router control models sync       # 发现 + 自动注册新模型（install 也会自动跑）
+./codex-router control models list       # 查看动态注册的模型（user-models.json）
+./codex-router control models remove <slug>
 ```
 
-`=` 已在注册表路由，`+` 是上游新上架、可加进注册表的模型（改
-`internal/registry/config/` 后 `make app` 重新分发）。
+- 参数来自 **models.dev** 开源库（上下文窗口/推理/视觉/描述，精确值），
+  未收录的模型回落同家族克隆（effort 档位始终来自家族）
+- 写入 `~/.codex-router/user-models.json` 覆盖层 —— 升级二进制不丢；
+  与内嵌注册表撞车时内嵌优先（正式收录永远赢）
+- 注册后向服务进程发 SIGUSR1 **热重载注册表**，即时可路由；
+  picker 显示需重开 Codex
+- App 设置页「模型同步 → 立即同步」是同一件事的按钮入口
 
 ## 卸载
 

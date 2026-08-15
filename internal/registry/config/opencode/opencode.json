@@ -19,7 +19,8 @@
           "codex-router-opencode-go"
         ],
         "prompt": "opencode API key"
-      }
+      },
+      "modelsDevId": "opencode-go"
     },
     {
       "id": "opencode-go-messages",

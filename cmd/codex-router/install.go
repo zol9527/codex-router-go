@@ -1,15 +1,18 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/loyd/codex-router/internal/catalog"
 	"github.com/loyd/codex-router/internal/configfile"
 	"github.com/loyd/codex-router/internal/cred"
+	"github.com/loyd/codex-router/internal/discover"
 	"github.com/loyd/codex-router/internal/registry"
 	"github.com/loyd/codex-router/internal/state"
 )
@@ -44,7 +47,7 @@ func cmdInstall(args []string) error {
 		return err
 	}
 
-	reg, err := registry.LoadDefault(*configDir)
+	reg, err := registry.LoadWithOverlay(st.Dir, *configDir)
 	if err != nil {
 		return err
 	}
@@ -100,6 +103,7 @@ func cmdInstall(args []string) error {
 		return err
 	}
 
+	syncModelsAfterInstall(st, reg)
 	fmt.Printf("installed: %d models published, config.toml integrated\n", count)
 	fmt.Printf("state: %s\n", st.Dir)
 	fmt.Println("service: starts with the Model Router app (open the app to serve)")
@@ -295,4 +299,45 @@ func isSecretShaped(value string) bool {
 		}
 	}
 	return true
+}
+
+// syncModelsAfterInstall 是 install 的收尾一步：对已启用且有凭证的
+// provider 执行实时发现 + 注册 —— catalog 以 provider 货架为准而不是
+// 内嵌快照（操作者的明确要求）。无凭证/失败不阻塞安装（内嵌兜底）。
+func syncModelsAfterInstall(st *state.State, reg *registry.Registry) {
+	resolver := cred.New(st)
+	added := 0
+	for _, id := range st.EnabledProviders() {
+		p := reg.Providers[reg.CanonicalProviderID(id)]
+		if p == nil {
+			continue
+		}
+		credential, _ := resolver.Resolve(p)
+		if credential == "" {
+			fmt.Printf("model sync: %s has no credential yet — embedded registry only (fill api_key and run 'control models sync')\n", p.ID)
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		report := discover.Sync(ctx, st.Dir, reg, p.ID, credential)
+		cancel()
+		if report.Err != nil {
+			fmt.Printf("model sync: %s failed: %v (embedded registry only)\n", p.ID, report.Err)
+			continue
+		}
+		for _, e := range report.Added {
+			fmt.Printf("model sync: %s + %s (ctx=%d, %s)\n", p.ID, e.Model.Slug, e.Model.ContextWindow, e.Source)
+		}
+		added += len(report.Added)
+	}
+	if added > 0 {
+		// 覆盖层落盘后重刷 catalog（sync 只写覆盖层，catalog 要重建）。
+		mergedPath := filepath.Join(st.Dir, "merged-models.json")
+		count, err := catalog.Refresh("codex", mergedPath, reg, func(providerID string) bool {
+			return st.ProviderEnabled(providerID, reg.CanonicalProviderID)
+		})
+		if err == nil {
+			fmt.Printf("model sync: catalog republished (%d models)\n", count)
+		}
+		signalServerRegistryReload()
+	}
 }

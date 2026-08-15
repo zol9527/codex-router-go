@@ -101,13 +101,14 @@ func cmdServe(args []string) error {
 		return err
 	}
 
-	reg, err := registry.LoadDefault(*configDir)
-	if err != nil {
-		return fmt.Errorf("load registry: %w", err)
-	}
 	st, err := state.Open(*stateDir)
 	if err != nil {
 		return err
+	}
+	// 注册表 = 内嵌 + user-models.json 覆盖层（动态注册的模型）。
+	reg, err := registry.LoadWithOverlay(st.Dir, *configDir)
+	if err != nil {
+		return fmt.Errorf("load registry: %w", err)
 	}
 	// Go 版不再依赖内部 hop，但 caller key 是 Codex config.toml 认证的
 	// 全部依据 —— 缺失必须在此失败而不是在每个请求上。
@@ -151,13 +152,28 @@ func cmdServe(args []string) error {
 	}
 	log.Printf("[codex-router] listening on %s (version %s)", listenAddr, version)
 
-	done := make(chan os.Signal, 1)
+	done := make(chan os.Signal, 2)
 	signal.Notify(done, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-done
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		httpServer.Shutdown(ctx)
+	}()
+	// SIGUSR1 = 热重载注册表（覆盖层变化后 control models 发来）。
+	// 换的是 Server 里的指针，请求路径只读，无需停机。
+	usr1 := make(chan os.Signal, 1)
+	signal.Notify(usr1, syscall.SIGUSR1)
+	go func() {
+		for range usr1 {
+			next, err := registry.LoadWithOverlay(st.Dir, *configDir)
+			if err != nil {
+				log.Printf("[codex-router] registry reload failed: %v (keeping previous)", err)
+				continue
+			}
+			srv.SetRegistry(next)
+			log.Printf("[codex-router] registry reloaded: %d models", len(next.Models))
+		}
 	}()
 	err = httpServer.Serve(listener)
 	os.Remove(pidfile)

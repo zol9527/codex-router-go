@@ -42,6 +42,10 @@ type Server struct {
 	opt       Options
 	client    *http.Client
 	callerKey string
+	// reg 是当前生效的注册表；SIGUSR1 热重载（动态注册模型后）整体
+	// 换指针 —— 请求路径只读，RWMutex 足够。
+	regMu sync.RWMutex
+	reg   *registry.Registry
 
 	mu           sync.Mutex
 	active       map[int]*activityEntry
@@ -64,6 +68,20 @@ type activityEntry struct {
 }
 
 // New 构造 Server。
+// registry 返回当前生效的注册表（请求路径只读；SIGUSR1 热重载换指针）。
+func (s *Server) registry() *registry.Registry {
+	s.regMu.RLock()
+	defer s.regMu.RUnlock()
+	return s.reg
+}
+
+// SetRegistry 原子替换注册表（SIGUSR1 热重载入口）。
+func (s *Server) SetRegistry(next *registry.Registry) {
+	s.regMu.Lock()
+	s.reg = next
+	s.regMu.Unlock()
+}
+
 func New(opt Options) (*Server, error) {
 	if opt.NativeBase == "" {
 		opt.NativeBase = "https://chatgpt.com/backend-api/codex"
@@ -75,6 +93,7 @@ func New(opt Options) (*Server, error) {
 	return &Server{
 		opt:       opt,
 		callerKey: callerKey,
+		reg:       opt.Registry,
 		client: &http.Client{
 			// 上游思考型模型可能长时间不吐首字节；取消由请求上下文管理，
 			// 这里不设全局超时（与 Node 版 fetch 行为一致）。
@@ -315,15 +334,15 @@ func (s *Server) handleHealth(w http.ResponseWriter) {
 
 func (s *Server) handleModels(w http.ResponseWriter) {
 	data := []any{}
-	for _, model := range s.opt.Registry.Models {
+	for _, model := range s.registry().Models {
 		if !model.Listed {
 			continue
 		}
-		if !s.opt.State.ProviderEnabled(model.Provider, s.opt.Registry.CanonicalProviderID) {
+		if !s.opt.State.ProviderEnabled(model.Provider, s.registry().CanonicalProviderID) {
 			continue
 		}
 		ownedBy := "openai"
-		if p := s.opt.Registry.ProviderFor(model); p != nil {
+		if p := s.registry().ProviderFor(model); p != nil {
 			ownedBy = p.OwnedBy
 		}
 		data = append(data, map[string]any{
