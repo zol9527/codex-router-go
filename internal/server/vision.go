@@ -2,7 +2,7 @@ package server
 
 // vision bridge 的 server 集成：引擎候选装配（registry 视觉模型 +
 // native GPT + 本地 Ollama）、三路 DescribeCaller、请求管线的图片
-// 替换。图片替换发生在协作解密之后、spill 之前。
+// 替换。图片替换发生在协作解密之后、协议翻译之前。
 
 import (
 	"context"
@@ -51,10 +51,6 @@ func (s *Server) bridgeVision(w http.ResponseWriter, r *http.Request,
 	if settings.Effort != "" {
 		reader.Effort = settings.Effort
 	}
-	if account := r.Header.Get("Chatgpt-Account-Id"); account != "" {
-		reader.Account = account
-	}
-
 	images := vision.CollectImages(input)
 	evidence := map[string]vision.Evidence{}
 	failures := map[string]string{}
@@ -74,14 +70,8 @@ func (s *Server) bridgeVision(w http.ResponseWriter, r *http.Request,
 			if err != nil {
 				failures[vision.ImageKey(image.DataURL)] = vision.FailureText(
 					engines[0].DisplayName, err)
-				logf("vision read failed engine-set=%d error=%v", len(engines), err)
+				logf("vision read failed engine=%s error=%v", engines[0].Slug, err)
 				return
-			}
-			if result.FellBack {
-				logf("vision read fellBack=true engine=%s", result.Engine)
-			}
-			for _, failure := range result.PriorFailures {
-				logf("vision engine attempt failed: %s", failure)
 			}
 			evidence[vision.ImageKey(image.DataURL)] = result
 		}()

@@ -10,23 +10,17 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/loyd/codex-router/internal/spill"
 	"github.com/loyd/codex-router/internal/usage"
 )
 
-// 空补全守卫：静默空流 → 隐形重试 → 第二次成功，client 只见一份响应。
-func TestEmptyCompletionSilentRetry(t *testing.T) {
+// 空补全守卫：静默空流会得到明确失败，Router 不再补发第二次请求。
+func TestEmptyCompletionIsReportedWithoutRouterRetry(t *testing.T) {
 	var calls int
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
 		w.Header().Set("Content-Type", "text/event-stream")
-		if calls == 1 {
-			// 空流：无 content、无 reasoning，直接终止。
-			fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
-			fmt.Fprint(w, "data: [DONE]\n\n")
-			return
-		}
-		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"Recovered.\"}}]}\n\n")
+		// 空流：无 content、无 reasoning，直接终止。
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
 		fmt.Fprint(w, "data: [DONE]\n\n")
 	}))
 	defer upstream.Close()
@@ -50,20 +44,20 @@ func TestEmptyCompletionSilentRetry(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	if calls != 2 {
-		t.Errorf("upstream calls = %d, want 2 (silent retry)", calls)
+	if calls != 1 {
+		t.Errorf("upstream calls = %d, want 1", calls)
 	}
 	body := readAll(t, resp)
 	if strings.Count(body, "event: response.created") != 1 {
 		t.Errorf("client must see exactly one response head, got:\n%s", body)
 	}
-	if !strings.Contains(body, "Recovered.") {
-		t.Errorf("retry result missing:\n%s", body)
+	if !strings.Contains(body, "empty_completion") || !strings.Contains(body, "did not retry") {
+		t.Errorf("empty completion failure must be explicit:\n%s", body)
 	}
-	// usage 记录空补全重试事实。
+	// usage 记录空补全事实，不再记录 Router 重试。
 	raw := readUsageRaw(t, recorder)
-	if !strings.Contains(raw, `"emptyCompletionRetried":true`) {
-		t.Errorf("usage event must record emptyCompletionRetried: %s", raw)
+	if !strings.Contains(raw, `"emptyCompletion":true`) {
+		t.Errorf("usage event must record emptyCompletion: %s", raw)
 	}
 }
 
@@ -96,7 +90,7 @@ func TestUnrepairableAfterLiveness(t *testing.T) {
 	defer resp.Body.Close()
 
 	if calls != 1 {
-		t.Errorf("a stream that proved liveness must not retry, calls=%d", calls)
+		t.Errorf("a stream that proved liveness must make one request, calls=%d", calls)
 	}
 	body := readAll(t, resp)
 	if !strings.Contains(body, "empty_completion") {
@@ -138,9 +132,9 @@ func TestCustomToolOnlyStreamFlushed(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	// custom 调用本身算内容（HasContent=true），不得触发隐形重试。
+	// custom 调用本身算内容，且 Router 始终只发出一次请求。
 	if calls != 1 {
-		t.Errorf("custom tool call is content, no silent retry expected, calls=%d", calls)
+		t.Errorf("custom tool call must use one upstream request, calls=%d", calls)
 	}
 	if ct := resp.Header.Get("Content-Type"); ct != "text/event-stream" {
 		t.Errorf("SSE head must be committed before handler returns, got content-type %q", ct)
@@ -230,11 +224,11 @@ func TestErrorTranslationClassification(t *testing.T) {
 	}
 }
 
-// spill：超阈值工具结果首过境即截断（内容判定，与位置无关），回执带
-// 落盘路径；小结果逐字节保留。
-func TestSpillInPipeline(t *testing.T) {
+// 大工具结果与小结果一样保留，Router 不落盘或替换成路径回执。
+func TestLargeToolResultPassesThroughPipeline(t *testing.T) {
 	// JSON 字符串内的换行必须转义（裸换行是非法 JSON）。
-	bigOutput := strings.ReplaceAll(strings.Repeat("result-line\n", 5000), "\n", "\\n") // ~55KB
+	bigText := strings.Repeat("result-line\n", 5000) // ~60KB
+	bigOutput := strings.ReplaceAll(bigText, "\n", "\\n")
 	var upstreamInput map[string]any
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewDecoder(r.Body).Decode(&upstreamInput)
@@ -250,15 +244,14 @@ func TestSpillInPipeline(t *testing.T) {
 	t.Setenv("ZAI_API_KEY", "")
 	callerKey, _ := srv.opt.State.CallerKey()
 
-	// 6 个 tool result：判定只看内容 —— 最新的大结果同样被截，
-	// 所有小结果逐字节保留。
+	// 6 个 tool result：第一个很大，其余很小，均应完整转发。
 	var items []string
 	for i := 1; i <= 6; i++ {
 		items = append(items,
 			fmt.Sprintf(`{"type":"function_call","call_id":"c%d","name":"shell","arguments":"{}"}`, i),
 			fmt.Sprintf(`{"type":"function_call_output","call_id":"c%d","output":"small-%d"}`, i, i))
 	}
-	// 第 1 个结果换成大文本（≥32KB → spill 目标，无论新旧）。
+	// 第 1 个结果换成大文本，仍必须完整发往上游。
 	items[1] = fmt.Sprintf(`{"type":"function_call_output","call_id":"c1","output":"%s"}`, bigOutput)
 	items = append(items, `{"type":"message","role":"user","content":[{"type":"input_text","text":"go"}]}`)
 	reqBody := fmt.Sprintf(`{"model":"zai-coding/glm-5.3","input":[%s],"stream":true}`,
@@ -284,28 +277,18 @@ func TestSpillInPipeline(t *testing.T) {
 	if len(toolContents) != 6 {
 		t.Fatalf("expected 6 tool results, got %d", len(toolContents))
 	}
-	// 超阈值的大结果换成回执：截断声明 + 落盘路径。
-	if !strings.Contains(toolContents[0], "truncated by Model Router on first transit") {
-		t.Errorf("oversized result should be spilled, got %.80s", toolContents[0])
-	}
-	if !strings.Contains(toolContents[0], srv.opt.State.Dir+string(os.PathSeparator)+spill.DirName) {
-		t.Errorf("receipt must point into the spill dir, got %.120s", toolContents[0])
+	// GLM thinking profile 会补命令/结果头，但大结果正文必须完整保留。
+	if want := "Command (shell).\nResult:\n" + bigText; toolContents[0] != want {
+		t.Errorf("large tool result must pass through unchanged, got %d bytes want %d", len(toolContents[0]), len(want))
 	}
 	// 全部小结果逐字节保留。zai-coding 走 glm-thinking profile：命令头
 	// 镜像（Z.ai 丢 tool_call arguments 的补偿，见 MirrorToolCallArguments）
-	// 会统一加 "Command (shell).\nResult:\n" 前缀；spill 对小结果仍零改动。
+	// 会统一加 "Command (shell).\nResult:\n" 前缀。
 	for i := 1; i <= 5; i++ {
 		want := fmt.Sprintf("Command (shell).\nResult:\nsmall-%d", i+1)
 		if toolContents[i] != want {
 			t.Errorf("small result %d must stay byte-for-byte (plus mirror header), got %q", i+1, toolContents[i])
 		}
-	}
-	// 回执指向的落盘文件真实存在。
-	pathIdx := strings.Index(toolContents[0], "Full output saved to: ")
-	spillPath := toolContents[0][pathIdx+len("Full output saved to: "):]
-	spillPath = spillPath[:strings.IndexByte(spillPath, '\n')]
-	if _, err := os.Stat(spillPath); err != nil {
-		t.Errorf("spill file must exist: %v", err)
 	}
 }
 

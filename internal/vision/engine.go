@@ -46,19 +46,13 @@ func RankVisionEngines(engines []Engine) []Engine {
 	return ranked
 }
 
-// MaxEngineAttempts 是一张图最多被送到的引擎数：
-// 第二意见值一点配额，第五个不值。
-const MaxEngineAttempts = 3
-
 // ResolveEngines 解析读图引擎列表：操作者 pin 优先；auto 只从
 // candidates 排名里取第一个非 loopback；pin 失效时——
 //   - 操作者显式 pin 的失效是操作者可见的问题（返回空表），
 //   - 默认引擎失效（无人选择过）静默落到排名首位。
 //
-// 首引擎之后按排名补充备用（非 loopback、去重、最多 3 个）：
-// 解析得到引擎与"够得着它"是两个问题 —— 401/503 不该让每次贴图
-// 都降级成"无法读取"。回退仅对非本地首引擎展开：pin 了本地引擎
-// 就是点名自己的机器，绝不为它花没人选择的 provider 配额。
+// Router 只选一个引擎，不对同一图片自动切换 provider；失败由 Codex
+// 决定是否重试或改选模型。
 func ResolveEngines(candidates []Engine, settings Settings, configured bool) []Engine {
 	if !settings.EffectiveEnabled(configured) {
 		return nil
@@ -90,22 +84,7 @@ func ResolveEngines(candidates []Engine, settings Settings, configured bool) []E
 	if primary == nil {
 		return nil
 	}
-	if primary.Local {
-		return []Engine{*primary}
-	}
-	engines := []Engine{*primary}
-	seen := map[string]bool{primary.Slug: true}
-	for _, candidate := range ranked {
-		if len(engines) >= MaxEngineAttempts {
-			break
-		}
-		if seen[candidate.Slug] || candidate.Loopback() {
-			continue
-		}
-		seen[candidate.Slug] = true
-		engines = append(engines, candidate)
-	}
-	return engines
+	return []Engine{*primary}
 }
 
 // localEngine 由 pin 设置构造本地引擎（无凭据直连 Ollama 兼容端点）。

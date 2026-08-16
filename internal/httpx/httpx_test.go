@@ -58,112 +58,25 @@ func TestUnknownEncoding(t *testing.T) {
 	}
 }
 
-// 重试：503 两次后成功。
-func TestRetryOn503(t *testing.T) {
+// 503 也只会发出一次请求；是否重试由 Codex 调用方决定。
+func TestFetchSendsOneAttempt(t *testing.T) {
 	var calls int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if atomic.AddInt32(&calls, 1) <= 2 {
-			w.WriteHeader(503)
-			return
-		}
-		w.WriteHeader(200)
+		atomic.AddInt32(&calls, 1)
+		w.WriteHeader(http.StatusServiceUnavailable)
 	}))
 	defer ts.Close()
 
-	opts := DefaultRetryOptions()
-	opts.BackoffMs = 1
-	resp, retries, err := FetchWithRetry(context.Background(), http.MethodPost, ts.URL, nil, []byte("{}"), opts)
+	resp, err := Fetch(context.Background(), http.MethodPost, ts.URL, nil, []byte("{}"), http.DefaultClient, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	if retries != 2 {
-		t.Errorf("retries = %d, want 2", retries)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusServiceUnavailable)
 	}
-	if calls != 3 {
-		t.Errorf("calls = %d, want 3", calls)
-	}
-}
-
-// 不重试：500 与 429 透传。
-func TestNoRetryOn500And429(t *testing.T) {
-	for _, status := range []int{500, 429, 400} {
-		var calls int32
-		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			atomic.AddInt32(&calls, 1)
-			w.WriteHeader(status)
-		}))
-		resp, retries, err := FetchWithRetry(context.Background(), http.MethodPost, ts.URL, nil, nil, DefaultRetryOptions())
-		if err != nil {
-			t.Fatal(err)
-		}
-		resp.Body.Close()
-		ts.Close()
-		if retries != 0 || calls != 1 {
-			t.Errorf("status %d: retries=%d calls=%d, want 0/1", status, retries, calls)
-		}
-	}
-}
-
-// canRetry 红线：调用方已中继字节后不再重试。
-func TestCanRetryGate(t *testing.T) {
-	var calls int32
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&calls, 1)
-		w.WriteHeader(503)
-	}))
-	defer ts.Close()
-
-	opts := DefaultRetryOptions()
-	opts.BackoffMs = 1
-	relayClosed := false
-	opts.CanRetry = func() bool { return relayClosed }
-	resp, retries, err := FetchWithRetry(context.Background(), http.MethodPost, ts.URL, nil, nil, opts)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	if retries != 0 || calls != 1 {
-		t.Errorf("canRetry=false must prevent retry: retries=%d calls=%d", retries, calls)
-	}
-}
-
-// 预算耗尽：昂贵的第一失败不重试。
-func TestBudgetStopsRetry(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(20 * time.Millisecond)
-		w.WriteHeader(503)
-	}))
-	defer ts.Close()
-
-	opts := DefaultRetryOptions()
-	opts.BudgetMs = 1 // 第一次尝试就超预算
-	resp, retries, err := FetchWithRetry(context.Background(), http.MethodPost, ts.URL, nil, nil, opts)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	if retries != 0 {
-		t.Errorf("budget should stop retry, retries=%d", retries)
-	}
-}
-
-// 连接拒绝（ECONNREFUSED）是可重试的传输错误。
-func TestConnectRefusedRetryable(t *testing.T) {
-	// 找一个保证没人监听的端口。
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	url := ts.URL
-	ts.Close()
-
-	opts := DefaultRetryOptions()
-	opts.Retries = 1
-	opts.BackoffMs = 1
-	_, retries, err := FetchWithRetry(context.Background(), http.MethodPost, url, nil, nil, opts)
-	if err == nil {
-		t.Fatal("expected connection error")
-	}
-	if retries != 1 {
-		t.Errorf("ECONNREFUSED should retry once, retries=%d", retries)
+	if calls != 1 {
+		t.Errorf("calls = %d, want 1", calls)
 	}
 }
 
@@ -211,8 +124,8 @@ func TestIdleReaderTripsOnSilence(t *testing.T) {
 	wrapped.Close()
 }
 
-// 管道级：FetchWithRetry 接受的响应 body 挂死 → ReadAll 收到哨兵。
-func TestFetchWithRetryWrapsIdle(t *testing.T) {
+// 管道级：Fetch 接受的响应 body 挂死 → ReadAll 收到哨兵。
+func TestFetchWrapsIdle(t *testing.T) {
 	release := make(chan struct{})
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -223,9 +136,7 @@ func TestFetchWithRetryWrapsIdle(t *testing.T) {
 	defer ts.Close()
 	defer close(release)
 
-	opts := DefaultRetryOptions()
-	opts.IdleTimeout = 80 * time.Millisecond
-	resp, _, err := FetchWithRetry(context.Background(), http.MethodPost, ts.URL, nil, nil, opts)
+	resp, err := Fetch(context.Background(), http.MethodPost, ts.URL, nil, nil, http.DefaultClient, 80*time.Millisecond)
 	if err != nil {
 		t.Fatal(err)
 	}

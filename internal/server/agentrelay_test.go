@@ -119,10 +119,10 @@ func TestAgentRelayEndToEnd(t *testing.T) {
 	}
 
 	turn()
-	turn() // 第二次应命中缓存
+	turn() // 每回合都由 Codex 决定是否重用，Router 不缓存中继结果。
 
-	if relayCalls != 1 {
-		t.Errorf("native relay calls = %d, want 1 (second turn must hit the cache)", relayCalls)
+	if relayCalls != 2 {
+		t.Errorf("native relay calls = %d, want 2 (no Router cache)", relayCalls)
 	}
 	messages := chatUpstreamInput["messages"].([]any)
 	found := false

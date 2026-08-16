@@ -48,8 +48,8 @@ func writeFile(t *testing.T, dir, name, content string) {
 	}
 }
 
-// 引擎解析：pin 优先、pin 失效（显式）返回空、auto 跳过 loopback、
-// 回退列表最多 3 个、本地 pin 不回退。
+// 引擎解析：pin 优先、pin 失效（显式）返回空、auto 跳过 loopback，
+// 且始终只选择一个引擎。
 func TestResolveEngines(t *testing.T) {
 	candidates := []Engine{
 		{Slug: "zai/glm-v", DisplayName: "GLM Vision", GatewayModel: "glm-v", Priority: 10, ImageCapable: true},
@@ -60,9 +60,9 @@ func TestResolveEngines(t *testing.T) {
 	enabled := true
 	on := Settings{Enabled: &enabled}
 
-	// auto：跳过 loopback 的 local-ollama，取 GLM Vision + 备用 2 个。
+	// auto：跳过 loopback 的 local-ollama，只取 GLM Vision。
 	engines := ResolveEngines(candidates, on, false)
-	if len(engines) != 3 || engines[0].Slug != "zai/glm-v" {
+	if len(engines) != 1 || engines[0].Slug != "zai/glm-v" {
 		t.Fatalf("auto resolution wrong: %+v", engines)
 	}
 	for _, engine := range engines {
@@ -184,8 +184,8 @@ func TestSubstituteFailure(t *testing.T) {
 	}
 }
 
-// 一图一购：同图并发读只打一次引擎；第二次读走缓存。
-func TestReadSharedInflight(t *testing.T) {
+// 每次读图都是独立的单次调用；Router 不复用缓存或 in-flight 结果。
+func TestReadDoesNotCacheOrShareInflight(t *testing.T) {
 	var calls int32
 	var mu sync.Mutex
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -210,7 +210,7 @@ func TestReadSharedInflight(t *testing.T) {
 	engines := []Engine{{Slug: "e1", DisplayName: "E1", ImageCapable: true}}
 	image := ImagePart{DataURL: "data:image/png;base64,CCCC", Question: "q"}
 
-	// 并发两次 + 串行一次：引擎只被调一次。
+	// 并发两次 + 串行一次：每一次都单独请求引擎。
 	var wg sync.WaitGroup
 	for i := 0; i < 2; i++ {
 		wg.Add(1)
@@ -225,86 +225,25 @@ func TestReadSharedInflight(t *testing.T) {
 	if _, err := reader.Read(context.Background(), engines, image); err != nil {
 		t.Fatal(err)
 	}
-	if calls != 1 {
-		t.Errorf("engine calls = %d, want 1 (inflight share + cache)", calls)
+	if calls != 3 {
+		t.Errorf("engine calls = %d, want 3 (no cache or inflight sharing)", calls)
 	}
 }
 
-// 回退：首引擎 503 后备用引擎接手，证据标记 fellBack。
-func TestReadFallback(t *testing.T) {
-	var callCount int
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		callCount++
-		if callCount == 1 {
-			// 首引擎 3 次尝试全 503（重试也耗尽）。
-			w.WriteHeader(503)
-			return
-		}
-		w.Write([]byte(`{"choices":[{"message":{"content":"from fallback"}}]}`))
-	}))
-	defer upstream.Close()
-
-	reader := NewReader(func(ctx context.Context, engine Engine, effort, question, dataURL string) (string, error) {
-		status, body, err := PostJSON(ctx, http.DefaultClient, upstream.URL, nil, nil)
-		_ = body
-		if err != nil {
-			return "", err
-		}
-		if status != 200 {
-			return "", StatusError(status, nil)
-		}
-		return "from " + engine.Slug, nil
-	})
-	_ = reader
-	// 直接测 readWithFallback（绕开 HTTP 层）。
-	reader2 := NewReader(func(ctx context.Context, engine Engine, effort, question, dataURL string) (string, error) {
-		if engine.Slug == "primary" {
-			return "", StatusError(503, nil)
-		}
-		return "transcript from " + engine.Slug, nil
-	})
-	engines := []Engine{
-		{Slug: "primary", DisplayName: "Primary", ImageCapable: true},
-		{Slug: "backup", DisplayName: "Backup", ImageCapable: true},
-	}
-	evidence, err := reader2.Read(context.Background(), engines, ImagePart{DataURL: "data:image/png;base64,X"})
-	if err != nil {
-		t.Fatalf("fallback must succeed: %v", err)
-	}
-	if evidence.Engine != "Backup" || !evidence.FellBack {
-		t.Errorf("evidence must name fallback engine: %+v", evidence)
-	}
-	if !strings.Contains(evidence.Transcript, "backup") {
-		t.Errorf("transcript from backup: %q", evidence.Transcript)
-	}
-}
-
-// 瞬时失败重试：429 重试后成功；400 不重试。
-func TestTransientRetry(t *testing.T) {
+// 瞬时失败也不在 Router 内重试。
+func TestReadDoesNotRetryTransientFailure(t *testing.T) {
 	attempts := 0
 	reader := NewReader(func(ctx context.Context, engine Engine, effort, question, dataURL string) (string, error) {
 		attempts++
-		if attempts == 1 {
-			return "", StatusError(429, nil)
-		}
-		return "recovered", nil
+		return "", StatusError(429, nil)
 	})
-	transcript, err := reader.readOneWithRetry(context.Background(),
+	transcript, err := reader.readOne(context.Background(),
 		Engine{Slug: "e", DisplayName: "E"}, ImagePart{DataURL: "x"})
-	if err != nil || transcript != "recovered" {
-		t.Errorf("429 must be retried: %v %q", err, transcript)
-	}
-
-	attempts = 0
-	reader2 := NewReader(func(ctx context.Context, engine Engine, effort, question, dataURL string) (string, error) {
-		attempts++
-		return "", StatusError(400, nil)
-	})
-	if _, err := reader2.readOneWithRetry(context.Background(), Engine{Slug: "e"}, ImagePart{}); err == nil {
-		t.Error("400 must not retry-succeed")
+	if err == nil || transcript != "" {
+		t.Errorf("429 must be returned without retry: %v %q", err, transcript)
 	}
 	if attempts != 1 {
-		t.Errorf("400 must not be retried, attempts = %d", attempts)
+		t.Errorf("429 must not be retried, attempts = %d", attempts)
 	}
 }
 
@@ -374,9 +313,8 @@ func TestAnthropicDescribe(t *testing.T) {
 	}
 }
 
-// 回退链的失败必须随证据上浮：成功兜底时首选引擎的错误进入
-// PriorFailures（否则排障只能看到 "fellBack=true" 而不知为何）。
-func TestReadWithFallbackSurfacesPriorFailures(t *testing.T) {
+// 首选引擎失败时不隐式切换到备用 provider。
+func TestReadStopsAfterSelectedEngineFailure(t *testing.T) {
 	engines := []Engine{
 		{Slug: "e1", DisplayName: "Engine One"},
 		{Slug: "e2", DisplayName: "Engine Two"},
@@ -389,15 +327,12 @@ func TestReadWithFallbackSurfacesPriorFailures(t *testing.T) {
 		}
 		return "transcript", nil
 	})
-	evidence, err := reader.Read(context.Background(), engines, ImagePart{DataURL: "data:image/png;base64,QQ"})
-	if err != nil {
-		t.Fatal(err)
+	_, err := reader.Read(context.Background(), engines, ImagePart{DataURL: "data:image/png;base64,QQ"})
+	if err == nil || !strings.Contains(err.Error(), "Engine One") || !strings.Contains(err.Error(), "anthropic rejected") {
+		t.Fatalf("selected engine failure must be returned: %v", err)
 	}
-	if !evidence.FellBack || evidence.Engine != "Engine Two" {
-		t.Fatalf("fallback outcome wrong: %+v", evidence)
-	}
-	if len(evidence.PriorFailures) != 1 || !strings.Contains(evidence.PriorFailures[0], "Engine One") || !strings.Contains(evidence.PriorFailures[0], "anthropic rejected") {
-		t.Errorf("prior failures must surface: %v", evidence.PriorFailures)
+	if calls != 1 {
+		t.Errorf("engine calls = %d, want 1 (no fallback)", calls)
 	}
 }
 

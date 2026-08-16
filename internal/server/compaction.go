@@ -59,9 +59,7 @@ func (s *Server) handleRoutedCompaction(w http.ResponseWriter, r *http.Request,
 	providerID := s.registry().CanonicalProviderID(provider.ID)
 
 	// 请求构造：整段对话 + 压缩指令，非流式、无工具。
-	// 压缩重放协作条目，agent 载荷解析与普通回合相同（缓存按密文键，
-	// 已解析过的会话零额外成本）；spill 亦与普通回合一致 —— 摘要器
-	// 不需要旧工具输出的中段，回执足够。
+	// 压缩重放协作条目，agent 载荷解析与普通回合相同。
 	compactionPayload := map[string]any{}
 	for k, v := range payload {
 		compactionPayload[k] = v
@@ -70,9 +68,8 @@ func (s *Server) handleRoutedCompaction(w http.ResponseWriter, r *http.Request,
 		compactionPayload["input"] = s.normalizeRoutedAgentInput(r.Context(), input)
 	}
 	// 压缩重放整段对话，任何残留图片同样要在到达文本模型前被读掉
-	//（证据已由贴图回合缓存，这里多半免费）。
+	//（会重新读取，是否重试由 Codex 决定）。
 	s.bridgeVision(w, r, compactionPayload, model)
-	spillStats := s.applySpill(compactionPayload)
 	if input, ok := compactionPayload["input"].([]any); ok {
 		// v1 压缩保留链式结构、v2 过滤触发标记后重放。
 		filtered := make([]any, 0, len(input))
@@ -119,15 +116,14 @@ func (s *Server) handleRoutedCompaction(w http.ResponseWriter, r *http.Request,
 	headers["Accept"] = prepared.Accept
 	target := strings.TrimSuffix(providerBaseURL(provider), "/") + prepared.Path
 
-	resp, retries, err := httpx.FetchWithRetry(r.Context(), http.MethodPost, target, headers, normalized, s.upstreamRetryOpts())
+	resp, err := httpx.Fetch(r.Context(), http.MethodPost, target, headers, normalized, s.client, s.upstreamIdle)
 	if err != nil {
 		logf("model=%s provider=%s status=502 duration_ms=%d compact err=%v",
 			model.Slug, provider.ID, time.Since(started).Milliseconds(), err)
 		writeJSON(w, http.StatusBadGateway, errBody("provider_api_proxy_error",
 			"The API-provider forwarder could not complete the request."))
 		s.recordTurn(usage.Event{Model: model.Slug, Provider: providerID, Status: 502,
-			DurationMs: time.Since(started).Milliseconds(), Retries: retries,
-			ToolResultsSpilled: spillStats.ToolResultsSpilled, ToolResultBytesSaved: spillStats.ToolResultBytesSaved})
+			DurationMs: time.Since(started).Milliseconds()})
 		return
 	}
 	defer resp.Body.Close()
@@ -167,7 +163,7 @@ func (s *Server) handleRoutedCompaction(w http.ResponseWriter, r *http.Request,
 			status: resp.StatusCode, bodyText: string(raw), retryAfter: retryAfter,
 		}, started)
 		s.recordTurn(usage.Event{Model: model.Slug, Provider: providerID, Status: resp.StatusCode,
-			DurationMs: time.Since(started).Milliseconds(), Retries: retries})
+			DurationMs: time.Since(started).Milliseconds()})
 		return
 	}
 
@@ -182,8 +178,7 @@ func (s *Server) handleRoutedCompaction(w http.ResponseWriter, r *http.Request,
 		writeJSON(w, http.StatusOK, map[string]any{"output": output})
 		s.recordTurn(usage.Event{Model: model.Slug, Provider: providerID, Status: 200,
 			DurationMs:  time.Since(started).Milliseconds(),
-			InputTokens: usageTokens.prompt, OutputTokens: usageTokens.completion,
-			ToolResultsSpilled: spillStats.ToolResultsSpilled, ToolResultBytesSaved: spillStats.ToolResultBytesSaved})
+			InputTokens: usageTokens.prompt, OutputTokens: usageTokens.completion})
 		return
 	}
 
@@ -200,8 +195,7 @@ func (s *Server) handleRoutedCompaction(w http.ResponseWriter, r *http.Request,
 	}
 	s.recordTurn(usage.Event{Model: model.Slug, Provider: providerID, Status: 200,
 		DurationMs:  time.Since(started).Milliseconds(),
-		InputTokens: usageTokens.prompt, OutputTokens: usageTokens.completion,
-		ToolResultsSpilled: spillStats.ToolResultsSpilled, ToolResultBytesSaved: spillStats.ToolResultBytesSaved})
+		InputTokens: usageTokens.prompt, OutputTokens: usageTokens.completion})
 }
 
 // userMessageItem 构造一个 user 文本消息 item。

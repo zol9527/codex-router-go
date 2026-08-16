@@ -2,9 +2,8 @@
 // 视觉模型代读，转录文本替换进回合。桥改变的是"到达模型的内容"而非
 // 模型自身能力 —— 注册表保持诚实的 modality 声明。
 //
-// 规格来源：vision-bridge.mjs（证据合同、引擎解析、替换、缓存）与
-// 旧 AGENTS.md 的 vision bridge 章节（一图一购、并发共享、重试与
-// 回退、fail-closed 语义）。
+// 规格来源：vision-bridge.mjs（证据合同、引擎解析与替换）与旧
+// AGENTS.md 的 vision bridge 章节（fail-closed 语义）。
 package vision
 
 import (

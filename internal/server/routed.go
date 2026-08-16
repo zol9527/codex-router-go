@@ -9,16 +9,13 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
 
-	"github.com/loyd/codex-router/internal/state"
 	"time"
 
 	"github.com/loyd/codex-router/internal/httpx"
 	"github.com/loyd/codex-router/internal/registry"
-	"github.com/loyd/codex-router/internal/spill"
 	"github.com/loyd/codex-router/internal/translate"
 	"github.com/loyd/codex-router/internal/usage"
 	"github.com/loyd/codex-router/internal/wire"
@@ -100,7 +97,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request, route s
 	}
 
 	// 全部路由流量经协议抽象层：provider 声明协议（chat 翻译 / Responses
-	// 直通 / 未来新增），server 管线（守卫、spill、namespace、计量）
+	// 直通 / 未来新增），server 管线（守卫、namespace、计量）
 	// 协议无关。
 	s.serveRouted(w, r, payload, routeModel, provider, credential, started)
 }
@@ -128,7 +125,7 @@ func (s *Server) handleNativeTurn(w http.ResponseWriter, r *http.Request, route 
 	if encoding != "" {
 		headers["Content-Encoding"] = encoding
 	}
-	resp, retries, err := httpx.FetchWithRetry(r.Context(), http.MethodPost, s.nativeTarget(route), headers, upstreamBody, s.upstreamRetryOpts())
+	resp, err := httpx.Fetch(r.Context(), http.MethodPost, s.nativeTarget(route), headers, upstreamBody, s.client, s.upstreamIdle)
 	if err != nil {
 		logf("native request failed model=%s error=%v", requestedModel, err)
 		writeJSON(w, http.StatusBadGateway, errBody("local_router_error", "The local router could not complete the request."))
@@ -138,7 +135,7 @@ func (s *Server) handleNativeTurn(w http.ResponseWriter, r *http.Request, route 
 	s.relayResponse(w, resp)
 	s.recordTurn(usage.Event{
 		Model: requestedModel, Provider: "openai",
-		Status: resp.StatusCode, DurationMs: time.Since(started).Milliseconds(), Retries: retries,
+		Status: resp.StatusCode, DurationMs: time.Since(started).Milliseconds(),
 	})
 	logf("model=%s provider=openai status=%d duration_ms=%d",
 		requestedModel, resp.StatusCode, time.Since(started).Milliseconds())
@@ -153,7 +150,6 @@ type attemptOutcome struct {
 	translator wire.StreamTranslator
 	events     *translate.OutputBuffer
 	status     int
-	retries    int // FetchWithRetry 的额外尝试数（观测用）
 }
 
 // upstreamFailure 携带上游错误响应供翻译。
@@ -166,10 +162,10 @@ type upstreamFailure struct {
 func (e *upstreamFailure) Error() string { return fmt.Sprintf("upstream status %d", e.status) }
 
 // streamRelay 实现空补全守卫的 hold/释放语义：
-//   - prologue（created/added 事件）缓冲不写 —— 空流可整段替换；
+//   - prologue（created/added 事件）缓冲不写，直到确认有活性；
 //   - 首个"活性"事件（reasoning/content/tool-call delta）到达即建立
-//     直通：缓冲 + 后续全部直写，从此不可重试；
-//   - 流结束仍无任何活性 → 调用方可丢弃缓冲隐形重试。
+//     直通：缓冲 + 后续全部直写；
+//   - 流结束仍无任何活性 → 调用方补写明确失败事件。
 //
 // 这对齐 Node 版 EmptyCompletionGuard 的 hold 语义，同时保留流式
 // （liveness 后的 delta 逐块写给 client，TTFT 不受影响）。
@@ -225,8 +221,8 @@ func (sr *streamRelay) emit(chunk []byte) {
 	sr.buffered = append(sr.buffered, chunk...)
 }
 
-// finishFlushWith 用给定字节（隐形重试的完整翻译输出）提交头并写出。
-// 仅在从未直通（首尝试是静默空流）时可用。
+// finishFlushWith 用给定字节提交头并写出。
+// 仅在从未直通时可用。
 func (sr *streamRelay) finishFlushWith(payload []byte) error {
 	if sr.writeErr != nil {
 		return sr.writeErr
@@ -247,17 +243,15 @@ func (sr *streamRelay) finishFlushWith(payload []byte) error {
 	return nil
 }
 
-// runChatAttempt 执行一次上游请求并增量翻译。relay 非 nil 时事件经
-// 守卫直写 client（liveness 起）；relay 为 nil 时全部累积在 events 缓冲
-// （隐形重试的第二次尝试用 —— 判定完再决定写不写）。
+// runChatAttempt 执行一次上游请求并增量翻译。事件先由 streamRelay
+// 缓冲，直到确认上游产生有效内容后才写给 Codex。
 func (s *Server) runChatAttempt(ctx context.Context, target string, headers map[string]string,
 	body []byte, model *registry.Model, proto wire.Protocol, opts wire.StreamOptions,
 	relay *streamRelay) (*attemptOutcome, error) {
 
-	resp, retries, err := httpx.FetchWithRetry(ctx, http.MethodPost, target, headers, body, s.upstreamRetryOpts())
+	resp, err := httpx.Fetch(ctx, http.MethodPost, target, headers, body, s.client, s.upstreamIdle)
 	if err != nil {
-		// outcome 带回 retries 供调用方记账。
-		return &attemptOutcome{retries: retries}, err
+		return &attemptOutcome{}, err
 	}
 	defer resp.Body.Close()
 	// 被动限额收割：响应头自报配额，零额外请求；持久化绝不在
@@ -271,7 +265,7 @@ func (s *Server) runChatAttempt(ctx context.Context, target string, headers map[
 		if ra := resp.Header.Get("Retry-After"); ra != "" {
 			fmt.Sscanf(ra, "%d", &retryAfter)
 		}
-		return &attemptOutcome{status: resp.StatusCode, retries: retries}, &upstreamFailure{
+		return &attemptOutcome{status: resp.StatusCode}, &upstreamFailure{
 			status: resp.StatusCode, bodyText: string(raw), retryAfter: retryAfter,
 		}
 	}
@@ -314,7 +308,7 @@ func (s *Server) runChatAttempt(ctx context.Context, target string, headers map[
 				// 错误链原样上抛（含 httpx.ErrUpstreamIdle 哨兵），
 				// 由调用方决定 504/截断/502 的映射。
 				return &attemptOutcome{translator: translator, events: events,
-						status: resp.StatusCode, retries: retries},
+						status: resp.StatusCode},
 					fmt.Errorf("upstream stream ended before completion: %w", readErr)
 			}
 			// EOF 而未见 [DONE] 哨兵（zai 偶发不发）：主动收尾补齐
@@ -329,49 +323,16 @@ func (s *Server) runChatAttempt(ctx context.Context, target string, headers map[
 				}
 			}
 			return &attemptOutcome{translator: translator, events: events,
-				status: resp.StatusCode, retries: retries}, nil
+				status: resp.StatusCode}, nil
 		}
 	}
-}
-
-// applySpill 对 payload["input"] 执行首过境确定性截断（见 internal/spill），
-// 返回本轮统计（未启用/无 input = 零值）。开关与阈值逐请求读状态文件，
-// 改完下一回合即生效；统计只在"实际发生截断"的回合累计落盘。
-func (s *Server) applySpill(payload map[string]any) spill.Stats {
-	enabled, maxBytes, _ := state.ReadToolResultSpill(s.opt.State.Dir)
-	if !enabled {
-		return spill.Stats{}
-	}
-	input, ok := payload["input"].([]any)
-	if !ok {
-		return spill.Stats{}
-	}
-	spilled, stats, err := spill.Process(input, spill.Options{
-		Dir:      filepath.Join(s.opt.State.Dir, spill.DirName),
-		MaxBytes: maxBytes,
-	})
-	if err != nil {
-		// 部分条目落盘失败：失败的保留原文，其余已截断 —— 请求照常
-		// 进行，只在日志里留痕（写盘恢复后回到一致的回执）。
-		logf("spill: %v (failed items keep their original output this turn)", err)
-	}
-	payload["input"] = spilled
-	if stats.ToolResultsSpilled > 0 {
-		state.RecordSpillStats(s.opt.State.Dir, state.SpillStats{
-			ResultsSpilled:       stats.ToolResultsSpilled,
-			BytesSaved:           stats.ToolResultBytesSaved,
-			EstimatedTokensSaved: stats.ToolResultBytesSaved / 4,
-		})
-	}
-	return stats
 }
 
 // serveChatTranslation：翻译请求发往 chat 上游，把上游 SSE 增量
 // 重组成 Responses 事件流写给 Codex。
 //
-// 管线：tool-result spill（请求方向，首过境确定性截断）→ 翻译 →
-// 上游 → 空补全守卫（整流判定 + 同字节隐形重试一次）→ prompt-token
-// 补零替换（completed 事件内，只落在显式零上）→ usage 计量。
+// 管线：翻译 → 上游 → 空补全守卫（整流判定 + 明确失败）→ prompt-token 补零替换
+// （completed 事件内，只落在显式零上）→ usage 计量。
 func (s *Server) serveRouted(w http.ResponseWriter, r *http.Request,
 	payload map[string]any, model *registry.Model, provider *registry.Provider,
 	credential string, started time.Time) {
@@ -379,7 +340,7 @@ func (s *Server) serveRouted(w http.ResponseWriter, r *http.Request,
 	providerID := s.registry().CanonicalProviderID(provider.ID)
 
 	// 协作载荷解密：collab 的 encrypted_content 外部模型读不了，
-	// 先换成明文（native 密文走中继，外部明文直接用，均带缓存）。
+	// 先换成明文（native 密文走中继，外部明文直接用）。
 	if input, ok := payload["input"].([]any); ok {
 		payload["input"] = s.normalizeRoutedAgentInput(r.Context(), input)
 	}
@@ -387,11 +348,6 @@ func (s *Server) serveRouted(w http.ResponseWriter, r *http.Request,
 	// 图片桥：文本模型收不到的贴图由视觉引擎代读，转录替换进回合
 	//（无图 / 桥关 / 无引擎零成本直通；失败降级为 stated failure）。
 	s.bridgeVision(w, r, payload, model)
-
-	// 请求方向 spill：超阈值的工具结果落盘+回执。判定是内容的纯函数，
-	// 同一内容任何请求产出逐字节相同的回执 —— 前缀缓存永不翻转
-	//（旧 aging 的 frontier 滚动会在 turn 内/跨 turn 改写历史）。
-	spillStats := s.applySpill(payload)
 
 	// codex app 工具合并：客户端只发精简 codex_app namespace，快照补全
 	// deferLoading 推迟的部分，让路由模型看到与原生模型相同的工具集。
@@ -444,15 +400,14 @@ func (s *Server) serveRouted(w http.ResponseWriter, r *http.Request,
 	// 直通协议：上游本来就是 Responses，字节原样转发
 	//（守卫/翻译管线只服务需要翻译的协议）。
 	if !proto.NeedsResponseTranslation() {
-		resp, retries, err := httpx.FetchWithRetry(r.Context(), http.MethodPost, target, headers, normalized, s.upstreamRetryOpts())
+		resp, err := httpx.Fetch(r.Context(), http.MethodPost, target, headers, normalized, s.client, s.upstreamIdle)
 		if err != nil {
 			logf("model=%s provider=%s status=502 duration_ms=%d protocol=responses err=%v",
 				model.Slug, provider.ID, time.Since(started).Milliseconds(), err)
 			writeJSON(w, http.StatusBadGateway, errBody("provider_api_proxy_error",
 				"The API-provider forwarder could not complete the request."))
 			s.recordTurn(usage.Event{Model: model.Slug, Provider: providerID, Status: 502,
-				DurationMs: time.Since(started).Milliseconds(), Retries: retries,
-				ToolResultsSpilled: spillStats.ToolResultsSpilled, ToolResultBytesSaved: spillStats.ToolResultBytesSaved})
+				DurationMs: time.Since(started).Milliseconds()})
 			return
 		}
 		defer resp.Body.Close()
@@ -467,30 +422,27 @@ func (s *Server) serveRouted(w http.ResponseWriter, r *http.Request,
 			}, started)
 			s.recordTurn(usage.Event{Model: model.Slug,
 				Provider: s.registry().CanonicalProviderID(provider.ID),
-				Status:   resp.StatusCode, DurationMs: time.Since(started).Milliseconds(),
-				Retries:            retries,
-				ToolResultsSpilled: spillStats.ToolResultsSpilled, ToolResultBytesSaved: spillStats.ToolResultBytesSaved})
+				Status:   resp.StatusCode, DurationMs: time.Since(started).Milliseconds()})
 			return
 		}
 		s.relayResponse(w, resp)
 		s.recordTurn(usage.Event{Model: model.Slug,
 			Provider: s.registry().CanonicalProviderID(provider.ID),
-			Status:   resp.StatusCode, DurationMs: time.Since(started).Milliseconds(), Retries: retries})
+			Status:   resp.StatusCode, DurationMs: time.Since(started).Milliseconds()})
 		logf("model=%s provider=%s protocol=responses status=%d duration_ms=%d",
 			model.Slug, provider.ID, resp.StatusCode, time.Since(started).Milliseconds())
 		return
 	}
 
 	if !prepared.Stream {
-		resp, retries, err := httpx.FetchWithRetry(r.Context(), http.MethodPost, target, headers, normalized, s.upstreamRetryOpts())
+		resp, err := httpx.Fetch(r.Context(), http.MethodPost, target, headers, normalized, s.client, s.upstreamIdle)
 		if err != nil {
 			logf("model=%s provider=%s status=502 duration_ms=%d err=%v",
 				model.Slug, provider.ID, time.Since(started).Milliseconds(), err)
 			writeJSON(w, http.StatusBadGateway, errBody("provider_api_proxy_error",
 				"The API-provider forwarder could not complete the request."))
 			s.recordTurn(usage.Event{Model: model.Slug, Provider: providerID, Status: 502,
-				DurationMs: time.Since(started).Milliseconds(), Retries: retries,
-				ToolResultsSpilled: spillStats.ToolResultsSpilled, ToolResultBytesSaved: spillStats.ToolResultBytesSaved})
+				DurationMs: time.Since(started).Milliseconds()})
 			return
 		}
 		defer resp.Body.Close()
@@ -504,9 +456,7 @@ func (s *Server) serveRouted(w http.ResponseWriter, r *http.Request,
 				status: resp.StatusCode, bodyText: string(raw), retryAfter: retryAfter,
 			}, started)
 			s.recordTurn(usage.Event{Model: model.Slug, Provider: providerID,
-				Status: resp.StatusCode, DurationMs: time.Since(started).Milliseconds(),
-				Retries:            retries,
-				ToolResultsSpilled: spillStats.ToolResultsSpilled, ToolResultBytesSaved: spillStats.ToolResultBytesSaved})
+				Status: resp.StatusCode, DurationMs: time.Since(started).Milliseconds()})
 			return
 		}
 		raw, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
@@ -523,8 +473,7 @@ func (s *Server) serveRouted(w http.ResponseWriter, r *http.Request,
 				model.Slug, provider.ID, status, time.Since(started).Milliseconds(), idle, err)
 			writeJSON(w, status, errBody(errType, message))
 			s.recordTurn(usage.Event{Model: model.Slug, Provider: providerID, Status: status,
-				DurationMs: time.Since(started).Milliseconds(), Retries: retries, UpstreamIdle: idle,
-				ToolResultsSpilled: spillStats.ToolResultsSpilled, ToolResultBytesSaved: spillStats.ToolResultBytesSaved})
+				DurationMs: time.Since(started).Milliseconds(), UpstreamIdle: idle})
 			return
 		}
 		var chatBody map[string]any
@@ -545,9 +494,7 @@ func (s *Server) serveRouted(w http.ResponseWriter, r *http.Request,
 			DurationMs:  time.Since(started).Milliseconds(),
 			InputTokens: inputTokens, OutputTokens: outputTokens,
 			TotalTokens:          totalTokens,
-			Retries:              retries,
 			EstimatedInputTokens: int64(substituted),
-			ToolResultsSpilled:   spillStats.ToolResultsSpilled, ToolResultBytesSaved: spillStats.ToolResultBytesSaved,
 		})
 		return
 	}
@@ -568,94 +515,42 @@ func (s *Server) serveRouted(w http.ResponseWriter, r *http.Request,
 		if errors.As(firstErr, &failure) {
 			s.writeUpstreamError(w, provider, model, failure, started)
 			s.recordTurn(usage.Event{Model: model.Slug, Provider: providerID,
-				Status: failure.status, DurationMs: time.Since(started).Milliseconds(),
-				Retries:            attemptRetries(first),
-				ToolResultsSpilled: spillStats.ToolResultsSpilled, ToolResultBytesSaved: spillStats.ToolResultBytesSaved})
+				Status: failure.status, DurationMs: time.Since(started).Milliseconds()})
 			return
 		}
-		s.failLiveStream(w, provider, model, firstErr, relay, first.translator, started, usage.Event{
-			Retries:              attemptRetries(first),
-			ToolResultsSpilled:   spillStats.ToolResultsSpilled,
-			ToolResultBytesSaved: spillStats.ToolResultBytesSaved,
-		})
+		s.failLiveStream(w, provider, model, firstErr, relay, first.translator, started, usage.Event{})
 		return
 	}
 
 	chosen := first
 	emptyCompletion := !first.translator.HasContent()
-	emptyRetried := false
-	unrepairable := false
-	if emptyCompletion && r.Context().Err() == nil && relay.writeErr == nil {
+	if emptyCompletion {
+		// Router 不重放上游请求。把本次空流明确结束为失败事件，交由
+		// Codex 决定是否重试、何时退避或放弃。
+		if !relay.headersWritten() && relay.writeErr == nil && r.Context().Err() == nil {
+			if err := relay.finishFlushWith(first.events.Bytes()); err != nil {
+				s.recordTurn(usage.Event{Model: model.Slug, Provider: providerID, Status: 0,
+					DurationMs: time.Since(started).Milliseconds()})
+				return
+			}
+		}
 		if relay.headersWritten() {
-			// 上游证明过活性（reasoning）后零产出：头已提交，不可替换，
-			// 只能声明失败（Node 版 suppressedPrologue 的另一半）。
-			unrepairable = true
-			io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"empty_completion\",\"message\":\"The model streamed reasoning but produced no output. The router could not retry because the response had already started.\"}}}\n\n")
+			io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"empty_completion\",\"message\":\"The model returned an empty completion. The router did not retry it.\"}}}\n\n")
 			if flusher != nil {
 				flusher.Flush()
 			}
-		} else {
-			// 静默空流：同字节同头隐形重试一次（client 一无所见）。
-			emptyRetried = true
-			second, secondErr := s.runChatAttempt(r.Context(), target, headers, normalized, model, proto, streamOpts, nil)
-			switch {
-			case secondErr != nil:
-				var failure *upstreamFailure
-				if errors.As(secondErr, &failure) {
-					s.writeUpstreamError(w, provider, model, failure, started)
-					s.recordTurn(usage.Event{Model: model.Slug, Provider: providerID,
-						Status: failure.status, DurationMs: time.Since(started).Milliseconds(),
-						Retries:         attemptRetries(first) + attemptRetries(second),
-						EmptyCompletion: true, EmptyCompletionRetried: true,
-						ToolResultsSpilled: spillStats.ToolResultsSpilled, ToolResultBytesSaved: spillStats.ToolResultBytesSaved})
-					return
-				}
-				// 第二次尝试头必未提交（首次是静默空流），可安全回 JSON。
-				idle := errors.Is(secondErr, httpx.ErrUpstreamIdle)
-				status := http.StatusBadGateway
-				errType, message := "empty_completion_retry_failed",
-					"The model returned an empty completion and the router's retry failed upstream."
-				if idle {
-					status = http.StatusGatewayTimeout
-					errType, message = "upstream_idle_timeout",
-						"The upstream produced no data within the idle window during the router's retry."
-				}
-				logf("model=%s provider=%s status=%d duration_ms=%d empty_completion=true retried=true upstream_idle=%v err=%v",
-					model.Slug, provider.ID, status, time.Since(started).Milliseconds(), idle, secondErr)
-				writeJSON(w, status, errBody(errType, message))
-				s.recordTurn(usage.Event{Model: model.Slug, Provider: providerID, Status: status,
-					DurationMs:      time.Since(started).Milliseconds(),
-					Retries:         attemptRetries(first) + attemptRetries(second),
-					UpstreamIdle:    idle,
-					EmptyCompletion: true, EmptyCompletionRetried: true})
-				return
-			case second.translator.HasContent():
-				chosen = second
-				emptyCompletion = false
-				if err := relay.finishFlushWith(second.events.Bytes()); err != nil {
-					s.recordTurn(usage.Event{Model: model.Slug, Provider: providerID, Status: 0,
-						DurationMs: time.Since(started).Milliseconds()})
-					return
-				}
-			default:
-				// 两次都空：写出第二份（空）流并声明失败。
-				chosen = second
-				if err := relay.finishFlushWith(second.events.Bytes()); err == nil {
-					io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"empty_completion\",\"message\":\"The model returned an empty completion. The router retried once and the completion was empty again.\"}}}\n\n")
-					if flusher != nil {
-						flusher.Flush()
-					}
-				}
-			}
 		}
+		s.recordTurn(usage.Event{Model: model.Slug, Provider: providerID, Status: http.StatusBadGateway,
+			DurationMs: time.Since(started).Milliseconds(), EmptyCompletion: true})
+		return
 	}
 
 	// 兜底写出：custom-tool-only 流全程无活性事件（custom 调用刻意不
 	// 发 function_call_arguments.delta），头从未提交 —— 不补写的话
 	// handler 静默返回 200 + content-length:0，Codex 判
 	// "stream closed before response.completed" 整轮重试至耗尽
-	//（2026-08-16 01:33-01:41 实发 5/5）。守卫语义不变：活性直通、
-	// 隐形重试或失败声明的路径头均已提交，此处零输出。
+	//（2026-08-16 01:33-01:41 实发 5/5）。此处只补齐本次流，不重放
+	// 上游请求。
 	if !relay.headersWritten() && relay.writeErr == nil && r.Context().Err() == nil {
 		if err := relay.finishFlushWith(chosen.events.Bytes()); err != nil {
 			s.recordTurn(usage.Event{Model: model.Slug, Provider: providerID, Status: 0,
@@ -664,11 +559,6 @@ func (s *Server) serveRouted(w http.ResponseWriter, r *http.Request,
 		}
 	}
 
-	// 重试记账：实际发生过的尝试都计入（隐形重试时 chosen 是第二次）。
-	totalRetries := attemptRetries(first)
-	if emptyRetried {
-		totalRetries += attemptRetries(chosen)
-	}
 	s.recordTurn(usage.Event{
 		Model: model.Slug, Provider: providerID, Status: 200,
 		DurationMs:           time.Since(started).Milliseconds(),
@@ -676,27 +566,13 @@ func (s *Server) serveRouted(w http.ResponseWriter, r *http.Request,
 		OutputTokens:         chosen.translator.OutputTokens(),
 		TotalTokens:          chosen.translator.TotalTokens(),
 		EstimatedInputTokens: int64(chosen.translator.SubstitutedInputTokens()),
-		Retries:              totalRetries,
-		ToolResultsSpilled:   spillStats.ToolResultsSpilled, ToolResultBytesSaved: spillStats.ToolResultBytesSaved,
-		EmptyCompletion: emptyCompletion, EmptyCompletionRetried: emptyRetried,
-		StreamAborted: unrepairable && false,
+		EmptyCompletion:      emptyCompletion,
 	})
-	if unrepairable {
-		// unrepairable 的空补全在 usage 里同样以 EmptyCompletion 记录。
-	}
 	logf("model=%s provider=%s status=200 duration_ms=%d in=%d out=%d%s%s",
 		model.Slug, provider.ID, time.Since(started).Milliseconds(),
 		chosen.translator.PromptTokens(), chosen.translator.OutputTokens(),
 		boolText(chosen.translator.SubstitutedInputTokens() > 0, " estimated-input=true"),
 		boolText(emptyCompletion, " empty-completion=true"))
-}
-
-// attemptRetries 从尝试结果安全取 FetchWithRetry 的额外尝试数。
-func attemptRetries(outcome *attemptOutcome) int {
-	if outcome == nil {
-		return 0
-	}
-	return outcome.retries
 }
 
 // failLiveStream 处理传输/看门狗类失败的收尾（响应从未给过结论）：

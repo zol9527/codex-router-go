@@ -4,6 +4,8 @@
 > 基线：本仓库 `go-rewrite` 分支（含未部署的 arguments 镜像修复）
 > 方法：router 侧事实来自本仓库源码与运维记录；opencode 侧只采信一手来源（sst/opencode dev 分支源码，commit `976c1851`，与 opencode.ai 官方文档），逐条附出处。
 > 落点：`docs/research/`（既有调研笔记目录约定）。
+>
+> **历史快照说明（2026-08-17）**：本文记录的是调研当日的实现基线。后续 Router 已删除上游自动重试、协作/视觉缓存和 tool-result spill；涉及这些机制的“现状”描述不再代表当前代码。
 
 ## 1. 背景与问题定义
 

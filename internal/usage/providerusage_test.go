@@ -131,7 +131,7 @@ func TestBuildProviderUsageSnapshotShape(t *testing.T) {
 	}
 }
 
-// 不可信速率（检测失败的流）必须被剔除；重试/空补全回合不进速率样本。
+// 不可信速率（检测失败的流）与空补全回合不进速率样本。
 func TestSpeedSampleFiltering(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now().UTC()
@@ -140,10 +140,6 @@ func TestSpeedSampleFiltering(t *testing.T) {
 		{At: now.Add(-time.Hour).Format(time.RFC3339), Provider: "zai-coding",
 			Model: "m", Status: 200, DurationMs: 10, FirstTokenMs: 1,
 			OutputTokens: 5000, InputTokens: 1},
-		// 重试回合不可计量。
-		{At: now.Add(-time.Hour).Format(time.RFC3339), Provider: "zai-coding",
-			Model: "m", Status: 200, DurationMs: 2_000, FirstTokenMs: 500,
-			Retries: 1, OutputTokens: 100, InputTokens: 1},
 		// 空补全回合不可计量。
 		{At: now.Add(-time.Hour).Format(time.RFC3339), Provider: "zai-coding",
 			Model: "m", Status: 200, DurationMs: 2_000, FirstTokenMs: 500,

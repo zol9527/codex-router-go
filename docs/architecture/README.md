@@ -49,9 +49,8 @@ flowchart LR
 | `internal/state/` | 管理 `~/.codex-router`：caller/internal secret、配置、模型可见性、子代理设置、spill 统计。 |
 | `internal/catalog/` | 合并 Codex 原生模型与注册表路由模型，生成 picker 用的 `merged-models.json`。 |
 | `internal/usage/` | 记录 `usage-events.jsonl`，维护配额、限流、供应商用量统计。 |
-| `internal/spill/` | 工具结果确定性截断与落盘，避免超大工具输出撑爆上下文。 |
 | `internal/vision/` | 图片桥：文本模型无法直接读图时，由本地视觉模型先读图并转成文字描述。 |
-| `internal/httpx/` | HTTP 客户端、重试、压缩、超时、SSE / 流式传输基础设施。 |
+| `internal/httpx/` | HTTP 客户端、压缩、超时、SSE / 流式传输基础设施。 |
 | `apps/macos/ModelRouterTray/` | macOS Swift / SwiftUI App：托盘、主窗口、设置页、服务托管、模型管理。 |
 | `skills/` | 项目相关 Codex 技能说明。 |
 | `docs/` | 研究与架构文档。 |
@@ -166,7 +165,7 @@ POST /v1/search/...
 5. **合并 Codex App 工具**：补全客户端精简版 `codex_app` 工具集。
 6. **Namespace 拍平**：把 namespace 工具展开为 `<ns>__<tool>`，响应方向再还原。
 7. **选择协议适配器**：根据 provider 的 `Protocol` 字段选择 `wire.Protocol`。
-8. **发起上游请求**：通过 `internal/httpx` 发送，带重试、响应头超时、SSE 空闲看门狗。
+8. **发起上游请求**：通过 `internal/httpx` 单次发送，带响应头超时、SSE 空闲看门狗。
 9. **响应回放**：Chat Completions 响应重组为 Responses 事件流；原生 Responses 响应直通。
 10. **记录 usage**：写入 `usage-events.jsonl`，用于供应商用量、失败率、限流统计。
 
@@ -316,8 +315,7 @@ make install-app
 | 凭据解析 | `internal/cred/cred.go` |
 | 状态目录 | `internal/state/state.go` |
 | 模型目录合并 | `internal/catalog/catalog.go` |
-| 工具结果 spill | `internal/spill/spill.go` |
 | 图片桥 | `internal/vision/vision.go` |
-| HTTP 重试与看门狗 | `internal/httpx/httpx.go` |
+| HTTP 单次转发与看门狗 | `internal/httpx/httpx.go` |
 | 用量事件 | `internal/usage/usage.go` |
 | Codex 配置受管块 | `internal/configfile/configfile.go` |

@@ -8,13 +8,10 @@ package server
 //     native 端点用一次强制工具调用解出明文（本机已登录的会话）；
 //   - 非 Fernet：外部父代理自己写的明文装在 encrypted_content 字段里，
 //     直接当明文用。
-// 解出的明文按密文 sha256 缓存（15min / 8MB / 256 条），同一会话的
-// 压缩与后续回合不再付费。
+// Router 不保存明文或密文；需要重用时由 Codex 的会话管理负责。
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -23,17 +20,9 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
-	"sync"
-	"time"
 )
 
 const agentPayloadRelayTool = "relay_external_agent_payload"
-
-const (
-	agentPayloadCacheTTL       = 15 * time.Minute
-	agentPayloadCacheMaxBytes  = 8 << 20
-	agentPayloadCacheMaxPieces = 256
-)
 
 // nativeEncryptedTokenPattern：OpenAI 发的每个 encrypted_content 都是
 // Fernet 令牌 —— 版本字节 0x80 + 大端时间戳的本世纪前导零，base64url
@@ -48,83 +37,6 @@ func isNativeEncryptedToken(value string) bool {
 // （“Message Type: NEW_TASK|MESSAGE|FOLLOWUP_TASK|FINAL_ANSWER … Payload:”结尾）。
 var relayAgentMessageTypePattern = regexp.MustCompile(
 	`(?is)Message Type:\s*(?:NEW_TASK|MESSAGE|FOLLOWUP_TASK|FINAL_ANSWER)\b.*\nPayload:\s*$`)
-
-// agentPayloadCache 是密文 → 明文的 LRU（带 TTL 与字节/条目上限）。
-type agentPayloadCache struct {
-	mu      sync.Mutex
-	entries map[string]agentCacheEntry
-	lru     []string // 最旧在前
-	bytes   int
-}
-
-type agentCacheEntry struct {
-	plaintext string
-	expiresAt time.Time
-}
-
-var agentCache = &agentPayloadCache{entries: map[string]agentCacheEntry{}}
-
-func (c *agentPayloadCache) get(encrypted string) (string, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	key := agentCacheKey(encrypted)
-	entry, ok := c.entries[key]
-	if !ok {
-		return "", false
-	}
-	if time.Now().After(entry.expiresAt) {
-		c.removeLocked(key, entry.plaintext)
-		return "", false
-	}
-	// 触碰 LRU 尾部。
-	c.touchLocked(key)
-	return entry.plaintext, true
-}
-
-func (c *agentPayloadCache) put(encrypted, plaintext string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	key := agentCacheKey(encrypted)
-	if old, ok := c.entries[key]; ok {
-		c.removeLocked(key, old.plaintext)
-	}
-	c.entries[key] = agentCacheEntry{
-		plaintext: plaintext,
-		expiresAt: time.Now().Add(agentPayloadCacheTTL),
-	}
-	c.lru = append(c.lru, key)
-	c.bytes += len(plaintext)
-	for len(c.lru) > agentPayloadCacheMaxPieces || c.bytes > agentPayloadCacheMaxBytes {
-		oldest := c.lru[0]
-		c.lru = c.lru[1:]
-		if entry, ok := c.entries[oldest]; ok {
-			c.removeLocked(oldest, entry.plaintext)
-		}
-	}
-}
-
-func (c *agentPayloadCache) removeLocked(key, plaintext string) {
-	delete(c.entries, key)
-	c.bytes -= len(plaintext)
-	if c.bytes < 0 {
-		c.bytes = 0
-	}
-}
-
-func (c *agentPayloadCache) touchLocked(key string) {
-	for i, k := range c.lru {
-		if k == key {
-			c.lru = append(c.lru[:i], c.lru[i+1:]...)
-			c.lru = append(c.lru, key)
-			return
-		}
-	}
-}
-
-func agentCacheKey(encrypted string) string {
-	digest := sha256.Sum256([]byte(encrypted))
-	return base64.RawURLEncoding.EncodeToString(digest[:])
-}
 
 // extractEncryptedAgentPayload 从协作消息 item 提取密文与形态。
 // 可见文本必须以 "Payload:" 结尾且带 Message Type 标记 —— 这是对
@@ -164,9 +76,9 @@ func extractEncryptedAgentPayload(item map[string]any) (content string, native b
 }
 
 // normalizeRoutedAgentInput 把 input 里的协作密文换成明文。
-// native Fernet 密文中继解密；非 Fernet 明文直接使用。
-// 缓存命中零成本；中继失败保持原样（上游可能收到不可读载荷并失败，
-// 这比丢历史诚实）。
+// native Fernet 密文中继解密；非 Fernet 明文直接使用。Router 不保存
+// 载荷或解密结果；会话复用与重试由 Codex 负责。中继失败保持原样
+// （上游可能收到不可读载荷并失败，这比丢历史诚实）。
 func (s *Server) normalizeRoutedAgentInput(ctx context.Context, input []any) []any {
 	needsRelay := false
 	for _, raw := range input {
@@ -195,14 +107,11 @@ func (s *Server) normalizeRoutedAgentInput(ctx context.Context, input []any) []a
 			continue
 		}
 		plaintext := ""
-		if cached, ok := agentCache.get(encrypted); ok {
-			plaintext = cached
-		} else if !native {
+		if !native {
 			// 外部父代理写的明文装在 encrypted_content 字段里。
 			plaintext = encrypted
 		} else if resolved, err := s.relayAgentPayload(ctx, item, encrypted); err == nil {
 			plaintext = resolved
-			agentCache.put(encrypted, plaintext)
 		} else {
 			logf("agent payload relay failed: %v", err)
 			out[i] = raw // 保持原样

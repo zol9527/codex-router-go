@@ -1463,15 +1463,6 @@ final class RouterStore: ObservableObject {
     await applyModelSettings(arguments: ["vision-bridge", enabled ? "on" : "off"])
   }
 
-  func setToolResultSpillEnabled(_ enabled: Bool) async {
-    await applyModelSettings(
-      arguments: ["tool-result-spill", enabled ? "on" : "off"],
-      successMessage: enabled
-        ? "Oversized tool results are saved to disk and replaced with pointer receipts."
-        : "Exact tool results will be sent on the next external-model request."
-    )
-  }
-
   /// Picks a cloud engine ("auto" or a model slug) as the image reader, and
   /// optionally the reasoning effort it reads at. Passing "default" for the
   /// effort hands the level back to the model. One command, so the two never
@@ -2392,36 +2383,7 @@ struct RouterModel: Decodable, Identifiable {
 struct ModelSettingsSnapshot: Decodable {
   let subagents: SubagentSettingsSnapshot
   let picker: PickerSettingsSnapshot
-  let toolResultSpill: ToolResultSpillSnapshot?
   let visionBridge: VisionBridgeSnapshot?
-}
-
-// Go 侧 control --json 的 toolResultSpill 块（internal/state/spill.go）。
-// spill = 首过境确定性截断：超阈值工具结果落盘+回执，前缀缓存友好。
-struct ToolResultSpillSnapshot: Decodable {
-  let enabled: Bool
-  let maxBytes: Int?
-  let stats: ToolResultSpillStats?
-}
-
-struct ToolResultSpillStats: Decodable {
-  let requests: Int?
-  let resultsSpilled: Int?
-  let bytesSaved: Int?
-  let estimatedTokensSaved: Int?
-
-  var savingsSummary: String? {
-    guard let requests, requests > 0, let estimatedTokensSaved, let bytesSaved else { return nil }
-    let tokens = Self.compactCount(estimatedTokensSaved)
-    let megabytes = String(format: "%.1f", Double(bytesSaved) / 1_048_576)
-    return "Saved ~\(tokens) tokens (\(megabytes) MB) across \(requests) requests"
-  }
-
-  static func compactCount(_ value: Int) -> String {
-    if value >= 1_000_000 { return String(format: "%.1fM", Double(value) / 1_000_000) }
-    if value >= 1_000 { return String(format: "%.1fk", Double(value) / 1_000) }
-    return String(value)
-  }
 }
 
 
@@ -2929,36 +2891,6 @@ private struct TrayView: View {
       )
     }
 
-    if let spillStats = target?.modelSettings?.toolResultSpill?.stats,
-       let spillRequests = spillStats.requests, spillRequests > 0 {
-      sectionLabel("Context savings", detail: "\(spillRequests) requests compacted all-time")
-      VStack(alignment: .leading, spacing: 8) {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-          VStack(alignment: .leading, spacing: 2) {
-            Text("Oversized tool results saved to disk, receipts inline")
-              .font(.system(size: 10, weight: .medium))
-              .lineLimit(1)
-            if let summary = spillStats.savingsSummary {
-              Text(summary)
-                .font(.system(size: 8))
-                .foregroundStyle(routerMuted)
-                .lineLimit(1)
-            }
-          }
-          Spacer(minLength: 8)
-          Text("~\(compactTokenCount(Double(spillStats.estimatedTokensSaved ?? 0))) tok")
-            .font(.system(size: 15, weight: .semibold, design: .monospaced))
-            .foregroundStyle(routerMint)
-            .monospacedDigit()
-        }
-      }
-      .padding(9)
-      .background(
-        Color.primary.opacity(0.045),
-        in: RoundedRectangle(cornerRadius: 9, style: .continuous)
-      )
-    }
-
     sectionLabel(
       routerLocalized("Live requests"),
       detail: store.activeRequests.isEmpty ? routerLocalized("None") : "\(store.activeRequests.count)"
@@ -3228,16 +3160,6 @@ private struct TrayView: View {
         set: { enabled in Task { await store.setLoginFree(enabled) } }
       ),
       isDisabled: store.providerOperation != nil || store.signedRouting
-    )
-    settingRow(
-      title: routerLocalized("Spill oversized tool results"),
-      detail: target.modelSettings?.toolResultSpill?.stats?.savingsSummary
-        ?? routerLocalized("On by default · oversized results saved to disk with a pointer receipt"),
-      isOn: Binding(
-        get: { target.modelSettings?.toolResultSpill?.enabled ?? true },
-        set: { enabled in Task { await store.setToolResultSpillEnabled(enabled) } }
-      ),
-      isDisabled: store.providerOperation != nil
     )
     maintenanceRow
     AccordionPanel(

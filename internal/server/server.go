@@ -8,16 +8,13 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/loyd/codex-router/internal/cred"
-	"github.com/loyd/codex-router/internal/httpx"
 	"github.com/loyd/codex-router/internal/registry"
-	"github.com/loyd/codex-router/internal/spill"
 	"github.com/loyd/codex-router/internal/state"
 	"github.com/loyd/codex-router/internal/usage"
 )
@@ -64,8 +61,8 @@ type Server struct {
 	opt       Options
 	client    *http.Client
 	callerKey string
-	// upstreamIdle 是解析后的响应体看门狗窗口（0=关闭），
-	// 供所有上游请求的 RetryOptions 使用。
+	// upstreamIdle 是解析后的响应体看门狗窗口（0=关闭）。它只将无
+	// 字节流转换为明确错误，不在 Router 内重放请求。
 	upstreamIdle time.Duration
 	// wsSilent 是解析后的 WS 管道看门狗窗口（0=关闭）。
 	wsSilent time.Duration
@@ -145,8 +142,6 @@ func New(opt Options) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	// spill 落盘文件的保留期清理（启动即清一次，之后每小时）。
-	spill.StartJanitor(filepath.Join(opt.State.Dir, spill.DirName))
 	headerTimeout := resolveTimeout(opt.UpstreamHeaderTimeout, DefaultUpstreamHeaderTimeout)
 	idleTimeout := resolveTimeout(opt.UpstreamIdleTimeout, DefaultUpstreamIdleTimeout)
 	wsSilent := resolveTimeout(opt.WSSilentTimeout, DefaultWSSilentTimeout)
@@ -162,7 +157,7 @@ func New(opt Options) (*Server, error) {
 			// 上游思考型模型可能长时间不吐首字节 —— 但"永远不吐"必须
 			// fail-fast：响应头窗口由 ResponseHeaderTimeout 把关（计时
 			// 从请求写完到首字节响应头，不含 body 流式时长），body 挂死
-			// 由 FetchWithRetry 的空闲看门狗把关。取消仍由请求上下文管理，
+			// 由 httpx.Fetch 的空闲看门狗把关。取消仍由请求上下文管理，
 			// 这里依旧不设全局超时。
 			Transport: &http.Transport{
 				Proxy: http.ProxyFromEnvironment,
@@ -497,20 +492,4 @@ func sessionNameFromHeaders(header http.Header) string {
 // logf 统一服务日志（时间戳 + 组件前缀，等价 Node 版 console.error）。
 func logf(format string, args ...any) {
 	log.Printf("[codex-router] "+format, args...)
-}
-
-// upstreamRetryOpts 是所有上游请求共用的重试/超时装配：
-//   - Client 固定为 s.client —— 此前调用点漏传 Client 实际走了
-//     http.DefaultClient，server 里精心构造的 Transport（拨号超时、
-//     ResponseHeaderTimeout）对主请求路径不生效；
-//   - IdleTimeout 挂响应体看门狗（0=关闭）；
-//   - OnRetry 把静默重试变成 router.log 里的可见行。
-func (s *Server) upstreamRetryOpts() httpx.RetryOptions {
-	opts := httpx.DefaultRetryOptions()
-	opts.Client = s.client
-	opts.IdleTimeout = s.upstreamIdle
-	opts.OnRetry = func(attempt, status int, err error, delayMs int) {
-		logf("upstream retry attempt=%d status=%d err=%v delay_ms=%d", attempt, status, err, delayMs)
-	}
-	return opts
 }
