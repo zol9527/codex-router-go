@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -118,20 +119,33 @@ func (s *Server) handleRoutedCompaction(w http.ResponseWriter, r *http.Request,
 	headers["Accept"] = prepared.Accept
 	target := strings.TrimSuffix(providerBaseURL(provider), "/") + prepared.Path
 
-	resp, _, err := httpx.FetchWithRetry(r.Context(), http.MethodPost, target, headers, normalized, httpx.DefaultRetryOptions())
+	resp, retries, err := httpx.FetchWithRetry(r.Context(), http.MethodPost, target, headers, normalized, s.upstreamRetryOpts())
 	if err != nil {
+		logf("model=%s provider=%s status=502 duration_ms=%d compact err=%v",
+			model.Slug, provider.ID, time.Since(started).Milliseconds(), err)
 		writeJSON(w, http.StatusBadGateway, errBody("provider_api_proxy_error",
 			"The API-provider forwarder could not complete the request."))
 		s.recordTurn(usage.Event{Model: model.Slug, Provider: providerID, Status: 502,
-			DurationMs:         time.Since(started).Milliseconds(),
+			DurationMs: time.Since(started).Milliseconds(), Retries: retries,
 			ToolResultsSpilled: spillStats.ToolResultsSpilled, ToolResultBytesSaved: spillStats.ToolResultBytesSaved})
 		return
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
 	if err != nil {
-		writeJSON(w, http.StatusBadGateway, errBody("provider_api_proxy_error",
-			"The compaction response could not be read."))
+		idle := errors.Is(err, httpx.ErrUpstreamIdle)
+		status := http.StatusBadGateway
+		errType, message := "provider_api_proxy_error", "The compaction response could not be read."
+		if idle {
+			status = http.StatusGatewayTimeout
+			errType, message = "upstream_idle_timeout",
+				"The upstream produced no data within the idle window while the compaction response was being read."
+		}
+		logf("model=%s provider=%s status=%d duration_ms=%d compact upstream_idle=%v err=%v",
+			model.Slug, provider.ID, status, time.Since(started).Milliseconds(), idle, err)
+		writeJSON(w, status, errBody(errType, message))
+		s.recordTurn(usage.Event{Model: model.Slug, Provider: providerID, Status: status,
+			DurationMs: time.Since(started).Milliseconds(), UpstreamIdle: idle})
 		return
 	}
 	if len(raw) >= 32<<20 {
@@ -151,9 +165,9 @@ func (s *Server) handleRoutedCompaction(w http.ResponseWriter, r *http.Request,
 		}
 		s.writeUpstreamError(w, provider, model, &upstreamFailure{
 			status: resp.StatusCode, bodyText: string(raw), retryAfter: retryAfter,
-		})
+		}, started)
 		s.recordTurn(usage.Event{Model: model.Slug, Provider: providerID, Status: resp.StatusCode,
-			DurationMs: time.Since(started).Milliseconds()})
+			DurationMs: time.Since(started).Milliseconds(), Retries: retries})
 		return
 	}
 

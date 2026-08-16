@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/loyd/codex-router/internal/cred"
+	"github.com/loyd/codex-router/internal/httpx"
 	"github.com/loyd/codex-router/internal/registry"
 	"github.com/loyd/codex-router/internal/spill"
 	"github.com/loyd/codex-router/internal/state"
@@ -39,6 +40,17 @@ type Options struct {
 	// DisableWebSocketPassthrough 关闭 WS 透传（回滚开关）：/responses
 	// 上的升级握手一律 426，调用方全部走 HTTP。默认开启透传。
 	DisableWebSocketPassthrough bool
+	// UpstreamHeaderTimeout 是上游响应头超时（请求写完到首字节响应头）。
+	// 0 = 默认档；负值 = 关闭。背景：2026-08-16 zai 黑洞 —— 上游 505s
+	// 才回 500，无此超时只能靠用户手动停（GLM turn 挂死 8 分 26 秒事故）。
+	UpstreamHeaderTimeout time.Duration
+	// UpstreamIdleTimeout 是上游响应体看门狗窗口（SSE 流上连续无字节
+	// 即断开，错误链带 httpx.ErrUpstreamIdle）。0 = 默认档；负值 = 关闭。
+	UpstreamIdleTimeout time.Duration
+	// WSSilentTimeout 是 WS 透传管道的方向相关看门狗窗口：客户端发过
+	// 请求帧而上游此后零回帧超过该窗口 → 主动拆管（调用方重连自愈）。
+	// 跨 turn 空闲不拆。0 = 默认档；负值 = 关闭。
+	WSSilentTimeout time.Duration
 }
 
 // Server 持有全部共享状态。
@@ -46,6 +58,11 @@ type Server struct {
 	opt       Options
 	client    *http.Client
 	callerKey string
+	// upstreamIdle 是解析后的响应体看门狗窗口（0=关闭），
+	// 供所有上游请求的 RetryOptions 使用。
+	upstreamIdle time.Duration
+	// wsSilent 是解析后的 WS 管道看门狗窗口（0=关闭）。
+	wsSilent time.Duration
 	// reg 是当前生效的注册表；SIGUSR1 热重载（动态注册模型后）整体
 	// 换指针 —— 请求路径只读，RWMutex 足够。
 	regMu sync.RWMutex
@@ -83,6 +100,32 @@ func (s *Server) SetRegistry(next *registry.Registry) {
 	s.regMu.Unlock()
 }
 
+// 上游 fail-fast 默认档（对齐 AI SDK 语义：把无限挂起变成可重试的
+// 快速失败）。档位取保守值：GLM max effort + 90k 上下文的最长健康
+// 请求约 90s，300s 响应头窗口极难误伤；SSE 思考增量连续吐，180s
+// 零字节只可能是挂死。均可经 main 的 env 覆盖。
+const (
+	DefaultUpstreamHeaderTimeout = 300 * time.Second
+	DefaultUpstreamIdleTimeout   = 180 * time.Second
+	// DefaultWSSilentTimeout：上游 response.created 正常 ~1s 内到达，
+	// 60s 极保守 —— 触发即认定上游侧黑洞（见 wsWatchdog）。
+	DefaultWSSilentTimeout = 60 * time.Second
+)
+
+// resolveTimeout 把 Options 的三态（0=默认 / 负=关闭 / 正=指定）解析成
+// 实际生效值。关闭时返回 0（http.Transport 的 ResponseHeaderTimeout
+// 与看门狗窗口都以零值表示不超时）。
+func resolveTimeout(v, def time.Duration) time.Duration {
+	switch {
+	case v > 0:
+		return v
+	case v < 0:
+		return 0
+	default:
+		return def
+	}
+}
+
 func New(opt Options) (*Server, error) {
 	if opt.NativeBase == "" {
 		opt.NativeBase = "https://chatgpt.com/backend-api/codex"
@@ -93,23 +136,32 @@ func New(opt Options) (*Server, error) {
 	}
 	// spill 落盘文件的保留期清理（启动即清一次，之后每小时）。
 	spill.StartJanitor(filepath.Join(opt.State.Dir, spill.DirName))
+	headerTimeout := resolveTimeout(opt.UpstreamHeaderTimeout, DefaultUpstreamHeaderTimeout)
+	idleTimeout := resolveTimeout(opt.UpstreamIdleTimeout, DefaultUpstreamIdleTimeout)
+	wsSilent := resolveTimeout(opt.WSSilentTimeout, DefaultWSSilentTimeout)
 	return &Server{
-		opt:       opt,
-		callerKey: callerKey,
-		reg:       opt.Registry,
+		opt:          opt,
+		callerKey:    callerKey,
+		reg:          opt.Registry,
+		upstreamIdle: idleTimeout,
+		wsSilent:     wsSilent,
 		client: &http.Client{
-			// 上游思考型模型可能长时间不吐首字节；取消由请求上下文管理，
-			// 这里不设全局超时（与 Node 版 fetch 行为一致）。
+			// 上游思考型模型可能长时间不吐首字节 —— 但"永远不吐"必须
+			// fail-fast：响应头窗口由 ResponseHeaderTimeout 把关（计时
+			// 从请求写完到首字节响应头，不含 body 流式时长），body 挂死
+			// 由 FetchWithRetry 的空闲看门狗把关。取消仍由请求上下文管理，
+			// 这里依旧不设全局超时。
 			Transport: &http.Transport{
 				Proxy: http.ProxyFromEnvironment,
 				DialContext: (&net.Dialer{
 					Timeout:   30 * time.Second,
 					KeepAlive: 30 * time.Second,
 				}).DialContext,
-				MaxIdleConns:        16,
-				MaxIdleConnsPerHost: 8,
-				IdleConnTimeout:     90 * time.Second,
-				ForceAttemptHTTP2:   true,
+				MaxIdleConns:          16,
+				MaxIdleConnsPerHost:   8,
+				IdleConnTimeout:       90 * time.Second,
+				ForceAttemptHTTP2:     true,
+				ResponseHeaderTimeout: headerTimeout,
 			},
 		},
 		active: map[int]*activityEntry{},
@@ -405,4 +457,20 @@ func sessionNameFromHeaders(header http.Header) string {
 // logf 统一服务日志（时间戳 + 组件前缀，等价 Node 版 console.error）。
 func logf(format string, args ...any) {
 	log.Printf("[codex-router] "+format, args...)
+}
+
+// upstreamRetryOpts 是所有上游请求共用的重试/超时装配：
+//   - Client 固定为 s.client —— 此前调用点漏传 Client 实际走了
+//     http.DefaultClient，server 里精心构造的 Transport（拨号超时、
+//     ResponseHeaderTimeout）对主请求路径不生效；
+//   - IdleTimeout 挂响应体看门狗（0=关闭）；
+//   - OnRetry 把静默重试变成 router.log 里的可见行。
+func (s *Server) upstreamRetryOpts() httpx.RetryOptions {
+	opts := httpx.DefaultRetryOptions()
+	opts.Client = s.client
+	opts.IdleTimeout = s.upstreamIdle
+	opts.OnRetry = func(attempt, status int, err error, delayMs int) {
+		logf("upstream retry attempt=%d status=%d err=%v delay_ms=%d", attempt, status, err, delayMs)
+	}
+	return opts
 }

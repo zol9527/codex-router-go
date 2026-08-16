@@ -28,6 +28,7 @@ type Event struct {
 	CachedInputTokens      int64  `json:"cachedInputTokens,omitempty"`
 	EstimatedInputTokens   int64  `json:"estimatedInputTokens,omitempty"`
 	StreamAborted          bool   `json:"streamAborted,omitempty"`
+	UpstreamIdle           bool   `json:"upstreamIdle,omitempty"`
 	EmptyCompletion        bool   `json:"emptyCompletion,omitempty"`
 	EmptyCompletionRetried bool   `json:"emptyCompletionRetried,omitempty"`
 	ToolResultsSpilled     int    `json:"toolResultsSpilled,omitempty"`

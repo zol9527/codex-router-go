@@ -18,9 +18,11 @@ package server
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -47,6 +49,33 @@ var wsDialer = &websocket.Dialer{
 
 // errRoutedFrameOnNativePipe：原生管道上出现路由帧的哨兵错误。
 var errRoutedFrameOnNativePipe = errors.New("routed frame on native pipe")
+
+// wsWatchdog 是方向相关的上游静默看门狗：客户端发过数据帧、上游此后
+// 零回帧并持续超过窗口 → 判定黑洞，主动拆管（2026-08-16 13:44 实发：
+// 握手 101 通但上游帧被吞 ~10 分钟，调用方只能干等）。
+// 跨 turn 空闲（无待答请求）是合法状态，不拆。
+type wsWatchdog struct {
+	timeout      time.Duration
+	lastClientTx atomic.Int64 // 客户端帧到达本路由的时刻（unix nanos）
+	lastUpstream atomic.Int64 // 上游帧到达本路由的时刻（unix nanos）
+	tripped      atomic.Bool
+}
+
+// check 判定是否触发。触发即置位（幂等）并返回 true。
+func (wd *wsWatchdog) check(now time.Time) bool {
+	if wd == nil || wd.timeout <= 0 || wd.tripped.Load() {
+		return false
+	}
+	tx, rx := wd.lastClientTx.Load(), wd.lastUpstream.Load()
+	if tx == 0 || tx <= rx {
+		return false // 无待答请求：跨 turn 空闲合法
+	}
+	if now.UnixNano()-tx <= int64(wd.timeout) {
+		return false
+	}
+	wd.tripped.Store(true)
+	return true
+}
 
 // writeWebSocketUnsupported 回 426 —— Codex 的干净回退信号（契约见文件头）。
 func writeWebSocketUnsupported(w http.ResponseWriter) {
@@ -103,20 +132,46 @@ func (s *Server) handleResponsesWebSocket(w http.ResponseWriter, r *http.Request
 }
 
 // serveWSPipe 承担一条已建立管道的生命周期：活动状态上报、双向帧
-// 搬运、收线。任一侧出错即整体拆除。
+// 搬运、上游静默看门狗、收线。任一侧出错即整体拆除。
 func (s *Server) serveWSPipe(client, upstream *websocket.Conn, r *http.Request) {
 	setRoute, finish := s.beginRequest()
 	session := sessionNameFromHeaders(r.Header)
 	started := time.Now()
 	logf("ws pipe opened")
 
+	// 上游静默看门狗：待答请求超窗口无上游帧 → 拆管让调用方重连。
+	wd := &wsWatchdog{timeout: s.wsSilent}
+	wdStop := make(chan struct{})
+	defer close(wdStop)
+	if wd.timeout > 0 {
+		go func() {
+			ticker := time.NewTicker(250 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-wdStop:
+					return
+				case now := <-ticker.C:
+					if wd.check(now) {
+						logf("ws upstream silent: no upstream frames %v after client request; tearing pipe down", wd.timeout)
+						_ = client.Close()
+						_ = upstream.Close()
+						return
+					}
+				}
+			}
+		}()
+	}
+
 	done := make(chan error, 2)
-	go func() { done <- relayFrames(upstream, client, nil) }()
+	go func() {
+		done <- relayFrames(upstream, client, nil, wd.noteUpstream)
+	}()
 	go func() {
 		done <- relayFrames(client, upstream, func(model string) {
 			// 首帧上报活动状态（与 HTTP native 路径同一入口）。
 			setRoute("openai", model, session)
-		})
+		}, wd.noteClient)
 	}()
 	err := <-done
 
@@ -131,19 +186,31 @@ func (s *Server) serveWSPipe(client, upstream *websocket.Conn, r *http.Request) 
 	<-done
 
 	finish(pipeCloseStatus(err))
+	cause := pipeCloseCause(err)
+	if wd.tripped.Load() {
+		cause = fmt.Sprintf("upstream silent watchdog (%v without upstream frames after client request)", wd.timeout)
+	}
 	logf("ws pipe closed duration_ms=%d cause=%s",
-		time.Since(started).Milliseconds(), pipeCloseCause(err))
+		time.Since(started).Milliseconds(), cause)
 }
+
+// noteUpstream/noteClient 由两侧搬运协程在读到帧时回调（看门狗指纹）。
+func (wd *wsWatchdog) noteUpstream() { wd.lastUpstream.Store(time.Now().UnixNano()) }
+func (wd *wsWatchdog) noteClient()   { wd.lastClientTx.Store(time.Now().UnixNano()) }
 
 // relayFrames 单向搬运帧。控制帧（ping/pong/close）由 gorilla 在各自
 // 连接上就地处理，不跨侧转发 —— 与通用 WS 代理的 hop-by-hop 语义一致。
-// onModel 在首个带 model 字段的文本帧上回调一次。
-func relayFrames(src, dst *websocket.Conn, onModel func(string)) error {
+// onModel 在首个带 model 字段的文本帧上回调一次；onFrame 在每次读到
+// 帧时回调（看门狗的活性指纹）。
+func relayFrames(src, dst *websocket.Conn, onModel func(string), onFrame func()) error {
 	reported := false
 	for {
 		mtype, data, err := src.ReadMessage()
 		if err != nil {
 			return err
+		}
+		if onFrame != nil {
+			onFrame()
 		}
 		if mtype == websocket.TextMessage {
 			model := frameModel(data)

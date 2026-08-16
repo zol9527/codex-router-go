@@ -13,6 +13,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -121,11 +123,17 @@ func cmdServe(args []string) error {
 		Registry:    reg,
 		Credentials: cred.New(st),
 		ListenAddr:  fmt.Sprintf("127.0.0.1:%d", *port),
-		NativeBase: envOr("CODEX_NATIVE_BASE_URL", "https://chatgpt.com/backend-api/codex"),
+		NativeBase:  envOr("CODEX_NATIVE_BASE_URL", "https://chatgpt.com/backend-api/codex"),
 		// WS 透传回滚开关：设 0 退回"升级握手一律 426、全部走 HTTP"。
 		DisableWebSocketPassthrough: os.Getenv("CODEX_WS_PASSTHROUGH") == "0",
 		Usage:                       usage.NewRecorder(st.Dir),
 		RateLimits:                  usage.NewRateLimitStore(st.Dir),
+		// 上游 fail-fast 三闸（秒；0=默认档，设 0 秒之外的关闭值见
+		// README「上游超时与看门狗」）：响应头超时 / SSE 流空闲看门狗 /
+		// WS 管道方向相关静默看门狗。
+		UpstreamHeaderTimeout: envDurationSec("CODEX_ROUTER_HEADER_TIMEOUT_SEC", server.DefaultUpstreamHeaderTimeout),
+		UpstreamIdleTimeout:   envDurationSec("CODEX_ROUTER_IDLE_TIMEOUT_SEC", server.DefaultUpstreamIdleTimeout),
+		WSSilentTimeout:       envDurationSec("CODEX_ROUTER_WS_SILENT_TIMEOUT_SEC", server.DefaultWSSilentTimeout),
 	})
 	if err != nil {
 		return err
@@ -199,4 +207,21 @@ func envOr(name, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// envDurationSec 解析秒数 env：缺省 → 默认档；"0" → 负一（关闭）；
+// 正整数 → 指定档。非法值按缺省处理（fail-open 到默认，启动不炸）。
+func envDurationSec(name string, def time.Duration) time.Duration {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return def
+	}
+	sec, err := strconv.Atoi(v)
+	if err != nil || sec < 0 {
+		return def
+	}
+	if sec == 0 {
+		return -1 // 关闭（server.resolveTimeout 负值语义）
+	}
+	return time.Duration(sec) * time.Second
 }

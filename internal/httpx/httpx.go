@@ -176,11 +176,25 @@ type RetryOptions struct {
 	CanRetry  func() bool
 	OnRetry   func(attempt int, status int, err error, delayMs int)
 	Client    *http.Client
+	// IdleTimeout 是响应体看门狗窗口：最终接受的响应 body 连续
+	// 这么久没有字节即断开（错误链上带 ErrUpstreamIdle）。0=关闭。
+	// 只作用于"响应已开始"后的挂死 —— 响应头超时由 http.Transport
+	// 的 ResponseHeaderTimeout 负责。
+	IdleTimeout time.Duration
 }
 
 // DefaultRetryOptions 返回与 Node 版一致的默认值。
 func DefaultRetryOptions() RetryOptions {
 	return RetryOptions{Retries: 2, BackoffMs: 250, BudgetMs: 5000}
+}
+
+// wrapIdle 给最终接受的响应 body 挂空闲看门狗（见 idle.go）。
+// 中间被丢弃的重试响应不包 —— 它们的 body 只被排空后关闭。
+func wrapIdle(resp *http.Response, opts RetryOptions) *http.Response {
+	if resp != nil && resp.Body != nil && opts.IdleTimeout > 0 {
+		resp.Body = NewIdleReadCloser(resp.Body, opts.IdleTimeout)
+	}
+	return resp
 }
 
 // FetchWithRetry 发送请求并在"响应从未开始"类失败上有限重试。
@@ -207,7 +221,7 @@ func FetchWithRetry(ctx context.Context, method, url string, headers map[string]
 		}
 		resp, err := client.Do(req)
 		if attempt >= opts.Retries {
-			return resp, attempt, err
+			return wrapIdle(resp, opts), attempt, err
 		}
 		var retryable bool
 		var status int
@@ -218,13 +232,13 @@ func FetchWithRetry(ctx context.Context, method, url string, headers map[string]
 			retryable = RetryableStatuses[status]
 		}
 		if !retryable {
-			return resp, attempt, err
+			return wrapIdle(resp, opts), attempt, err
 		}
 		if ctx.Err() != nil || (opts.CanRetry != nil && !opts.CanRetry()) {
-			return resp, attempt, err
+			return wrapIdle(resp, opts), attempt, err
 		}
 		if time.Since(started) >= time.Duration(opts.BudgetMs)*time.Millisecond {
-			return resp, attempt, err
+			return wrapIdle(resp, opts), attempt, err
 		}
 		if resp != nil && resp.Body != nil {
 			io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))

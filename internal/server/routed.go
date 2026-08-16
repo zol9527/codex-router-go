@@ -128,7 +128,7 @@ func (s *Server) handleNativeTurn(w http.ResponseWriter, r *http.Request, route 
 	if encoding != "" {
 		headers["Content-Encoding"] = encoding
 	}
-	resp, _, err := httpx.FetchWithRetry(r.Context(), http.MethodPost, s.nativeTarget(route), headers, upstreamBody, httpx.DefaultRetryOptions())
+	resp, retries, err := httpx.FetchWithRetry(r.Context(), http.MethodPost, s.nativeTarget(route), headers, upstreamBody, s.upstreamRetryOpts())
 	if err != nil {
 		logf("native request failed model=%s error=%v", requestedModel, err)
 		writeJSON(w, http.StatusBadGateway, errBody("local_router_error", "The local router could not complete the request."))
@@ -138,7 +138,7 @@ func (s *Server) handleNativeTurn(w http.ResponseWriter, r *http.Request, route 
 	s.relayResponse(w, resp)
 	s.recordTurn(usage.Event{
 		Model: requestedModel, Provider: "openai",
-		Status: resp.StatusCode, DurationMs: time.Since(started).Milliseconds(),
+		Status: resp.StatusCode, DurationMs: time.Since(started).Milliseconds(), Retries: retries,
 	})
 	logf("model=%s provider=openai status=%d duration_ms=%d",
 		requestedModel, resp.StatusCode, time.Since(started).Milliseconds())
@@ -153,6 +153,7 @@ type attemptOutcome struct {
 	translator wire.StreamTranslator
 	events     *translate.OutputBuffer
 	status     int
+	retries    int // FetchWithRetry 的额外尝试数（观测用）
 }
 
 // upstreamFailure 携带上游错误响应供翻译。
@@ -253,9 +254,10 @@ func (s *Server) runChatAttempt(ctx context.Context, target string, headers map[
 	body []byte, model *registry.Model, proto wire.Protocol, opts wire.StreamOptions,
 	relay *streamRelay) (*attemptOutcome, error) {
 
-	resp, _, err := httpx.FetchWithRetry(ctx, http.MethodPost, target, headers, body, httpx.DefaultRetryOptions())
+	resp, retries, err := httpx.FetchWithRetry(ctx, http.MethodPost, target, headers, body, s.upstreamRetryOpts())
 	if err != nil {
-		return nil, err
+		// outcome 带回 retries 供调用方记账。
+		return &attemptOutcome{retries: retries}, err
 	}
 	defer resp.Body.Close()
 	// 被动限额收割：响应头自报配额，零额外请求；持久化绝不在
@@ -269,7 +271,7 @@ func (s *Server) runChatAttempt(ctx context.Context, target string, headers map[
 		if ra := resp.Header.Get("Retry-After"); ra != "" {
 			fmt.Sscanf(ra, "%d", &retryAfter)
 		}
-		return &attemptOutcome{status: resp.StatusCode}, &upstreamFailure{
+		return &attemptOutcome{status: resp.StatusCode, retries: retries}, &upstreamFailure{
 			status: resp.StatusCode, bodyText: string(raw), retryAfter: retryAfter,
 		}
 	}
@@ -309,7 +311,10 @@ func (s *Server) runChatAttempt(ctx context.Context, target string, headers map[
 		if readErr != nil {
 			emit()
 			if !errors.Is(readErr, io.EOF) && ctx.Err() == nil {
-				return &attemptOutcome{translator: translator, events: events, status: resp.StatusCode},
+				// 错误链原样上抛（含 httpx.ErrUpstreamIdle 哨兵），
+				// 由调用方决定 504/截断/502 的映射。
+				return &attemptOutcome{translator: translator, events: events,
+						status: resp.StatusCode, retries: retries},
 					fmt.Errorf("upstream stream ended before completion: %w", readErr)
 			}
 			// EOF 而未见 [DONE] 哨兵（zai 偶发不发）：主动收尾补齐
@@ -323,7 +328,8 @@ func (s *Server) runChatAttempt(ctx context.Context, target string, headers map[
 					relay.emit(closing)
 				}
 			}
-			return &attemptOutcome{translator: translator, events: events, status: resp.StatusCode}, nil
+			return &attemptOutcome{translator: translator, events: events,
+				status: resp.StatusCode, retries: retries}, nil
 		}
 	}
 }
@@ -438,10 +444,15 @@ func (s *Server) serveRouted(w http.ResponseWriter, r *http.Request,
 	// 直通协议：上游本来就是 Responses，字节原样转发
 	//（守卫/翻译管线只服务需要翻译的协议）。
 	if !proto.NeedsResponseTranslation() {
-		resp, _, err := httpx.FetchWithRetry(r.Context(), http.MethodPost, target, headers, normalized, httpx.DefaultRetryOptions())
+		resp, retries, err := httpx.FetchWithRetry(r.Context(), http.MethodPost, target, headers, normalized, s.upstreamRetryOpts())
 		if err != nil {
+			logf("model=%s provider=%s status=502 duration_ms=%d protocol=responses err=%v",
+				model.Slug, provider.ID, time.Since(started).Milliseconds(), err)
 			writeJSON(w, http.StatusBadGateway, errBody("provider_api_proxy_error",
 				"The API-provider forwarder could not complete the request."))
+			s.recordTurn(usage.Event{Model: model.Slug, Provider: providerID, Status: 502,
+				DurationMs: time.Since(started).Milliseconds(), Retries: retries,
+				ToolResultsSpilled: spillStats.ToolResultsSpilled, ToolResultBytesSaved: spillStats.ToolResultBytesSaved})
 			return
 		}
 		defer resp.Body.Close()
@@ -453,26 +464,33 @@ func (s *Server) serveRouted(w http.ResponseWriter, r *http.Request,
 			}
 			s.writeUpstreamError(w, provider, model, &upstreamFailure{
 				status: resp.StatusCode, bodyText: string(raw), retryAfter: retryAfter,
-			})
+			}, started)
 			s.recordTurn(usage.Event{Model: model.Slug,
 				Provider: s.registry().CanonicalProviderID(provider.ID),
-				Status:   resp.StatusCode, DurationMs: time.Since(started).Milliseconds()})
+				Status:   resp.StatusCode, DurationMs: time.Since(started).Milliseconds(),
+				Retries:            retries,
+				ToolResultsSpilled: spillStats.ToolResultsSpilled, ToolResultBytesSaved: spillStats.ToolResultBytesSaved})
 			return
 		}
 		s.relayResponse(w, resp)
 		s.recordTurn(usage.Event{Model: model.Slug,
 			Provider: s.registry().CanonicalProviderID(provider.ID),
-			Status:   resp.StatusCode, DurationMs: time.Since(started).Milliseconds()})
+			Status:   resp.StatusCode, DurationMs: time.Since(started).Milliseconds(), Retries: retries})
 		logf("model=%s provider=%s protocol=responses status=%d duration_ms=%d",
 			model.Slug, provider.ID, resp.StatusCode, time.Since(started).Milliseconds())
 		return
 	}
 
 	if !prepared.Stream {
-		resp, _, err := httpx.FetchWithRetry(r.Context(), http.MethodPost, target, headers, normalized, httpx.DefaultRetryOptions())
+		resp, retries, err := httpx.FetchWithRetry(r.Context(), http.MethodPost, target, headers, normalized, s.upstreamRetryOpts())
 		if err != nil {
+			logf("model=%s provider=%s status=502 duration_ms=%d err=%v",
+				model.Slug, provider.ID, time.Since(started).Milliseconds(), err)
 			writeJSON(w, http.StatusBadGateway, errBody("provider_api_proxy_error",
 				"The API-provider forwarder could not complete the request."))
+			s.recordTurn(usage.Event{Model: model.Slug, Provider: providerID, Status: 502,
+				DurationMs: time.Since(started).Milliseconds(), Retries: retries,
+				ToolResultsSpilled: spillStats.ToolResultsSpilled, ToolResultBytesSaved: spillStats.ToolResultBytesSaved})
 			return
 		}
 		defer resp.Body.Close()
@@ -484,15 +502,29 @@ func (s *Server) serveRouted(w http.ResponseWriter, r *http.Request,
 			}
 			s.writeUpstreamError(w, provider, model, &upstreamFailure{
 				status: resp.StatusCode, bodyText: string(raw), retryAfter: retryAfter,
-			})
+			}, started)
 			s.recordTurn(usage.Event{Model: model.Slug, Provider: providerID,
-				Status: resp.StatusCode, DurationMs: time.Since(started).Milliseconds()})
+				Status: resp.StatusCode, DurationMs: time.Since(started).Milliseconds(),
+				Retries:            retries,
+				ToolResultsSpilled: spillStats.ToolResultsSpilled, ToolResultBytesSaved: spillStats.ToolResultBytesSaved})
 			return
 		}
 		raw, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 		if err != nil {
-			writeJSON(w, http.StatusBadGateway, errBody("provider_api_proxy_error",
-				"The upstream response could not be read."))
+			idle := errors.Is(err, httpx.ErrUpstreamIdle)
+			status := http.StatusBadGateway
+			errType, message := "provider_api_proxy_error", "The upstream response could not be read."
+			if idle {
+				status = http.StatusGatewayTimeout
+				errType, message = "upstream_idle_timeout",
+					"The upstream produced no data within the idle window while the response was being read."
+			}
+			logf("model=%s provider=%s status=%d duration_ms=%d upstream_idle=%v err=%v",
+				model.Slug, provider.ID, status, time.Since(started).Milliseconds(), idle, err)
+			writeJSON(w, status, errBody(errType, message))
+			s.recordTurn(usage.Event{Model: model.Slug, Provider: providerID, Status: status,
+				DurationMs: time.Since(started).Milliseconds(), Retries: retries, UpstreamIdle: idle,
+				ToolResultsSpilled: spillStats.ToolResultsSpilled, ToolResultBytesSaved: spillStats.ToolResultBytesSaved})
 			return
 		}
 		var chatBody map[string]any
@@ -513,6 +545,7 @@ func (s *Server) serveRouted(w http.ResponseWriter, r *http.Request,
 			DurationMs:  time.Since(started).Milliseconds(),
 			InputTokens: inputTokens, OutputTokens: outputTokens,
 			TotalTokens:          totalTokens,
+			Retries:              retries,
 			EstimatedInputTokens: int64(substituted),
 			ToolResultsSpilled:   spillStats.ToolResultsSpilled, ToolResultBytesSaved: spillStats.ToolResultBytesSaved,
 		})
@@ -533,14 +566,18 @@ func (s *Server) serveRouted(w http.ResponseWriter, r *http.Request,
 	if firstErr != nil {
 		var failure *upstreamFailure
 		if errors.As(firstErr, &failure) {
-			s.writeUpstreamError(w, provider, model, failure)
+			s.writeUpstreamError(w, provider, model, failure, started)
 			s.recordTurn(usage.Event{Model: model.Slug, Provider: providerID,
 				Status: failure.status, DurationMs: time.Since(started).Milliseconds(),
+				Retries:            attemptRetries(first),
 				ToolResultsSpilled: spillStats.ToolResultsSpilled, ToolResultBytesSaved: spillStats.ToolResultBytesSaved})
 			return
 		}
-		writeJSON(w, http.StatusBadGateway, errBody("provider_api_proxy_error",
-			"The API-provider forwarder could not complete the request."))
+		s.failLiveStream(w, provider, model, firstErr, relay, started, usage.Event{
+			Retries:              attemptRetries(first),
+			ToolResultsSpilled:   spillStats.ToolResultsSpilled,
+			ToolResultBytesSaved: spillStats.ToolResultBytesSaved,
+		})
 		return
 	}
 
@@ -565,17 +602,31 @@ func (s *Server) serveRouted(w http.ResponseWriter, r *http.Request,
 			case secondErr != nil:
 				var failure *upstreamFailure
 				if errors.As(secondErr, &failure) {
-					s.writeUpstreamError(w, provider, model, failure)
+					s.writeUpstreamError(w, provider, model, failure, started)
 					s.recordTurn(usage.Event{Model: model.Slug, Provider: providerID,
 						Status: failure.status, DurationMs: time.Since(started).Milliseconds(),
+						Retries:         attemptRetries(first) + attemptRetries(second),
 						EmptyCompletion: true, EmptyCompletionRetried: true,
 						ToolResultsSpilled: spillStats.ToolResultsSpilled, ToolResultBytesSaved: spillStats.ToolResultBytesSaved})
 					return
 				}
-				writeJSON(w, http.StatusBadGateway, errBody("empty_completion_retry_failed",
-					"The model returned an empty completion and the router's retry failed upstream."))
-				s.recordTurn(usage.Event{Model: model.Slug, Provider: providerID, Status: 502,
+				// 第二次尝试头必未提交（首次是静默空流），可安全回 JSON。
+				idle := errors.Is(secondErr, httpx.ErrUpstreamIdle)
+				status := http.StatusBadGateway
+				errType, message := "empty_completion_retry_failed",
+					"The model returned an empty completion and the router's retry failed upstream."
+				if idle {
+					status = http.StatusGatewayTimeout
+					errType, message = "upstream_idle_timeout",
+						"The upstream produced no data within the idle window during the router's retry."
+				}
+				logf("model=%s provider=%s status=%d duration_ms=%d empty_completion=true retried=true upstream_idle=%v err=%v",
+					model.Slug, provider.ID, status, time.Since(started).Milliseconds(), idle, secondErr)
+				writeJSON(w, status, errBody(errType, message))
+				s.recordTurn(usage.Event{Model: model.Slug, Provider: providerID, Status: status,
 					DurationMs:      time.Since(started).Milliseconds(),
+					Retries:         attemptRetries(first) + attemptRetries(second),
+					UpstreamIdle:    idle,
 					EmptyCompletion: true, EmptyCompletionRetried: true})
 				return
 			case second.translator.HasContent():
@@ -613,6 +664,11 @@ func (s *Server) serveRouted(w http.ResponseWriter, r *http.Request,
 		}
 	}
 
+	// 重试记账：实际发生过的尝试都计入（隐形重试时 chosen 是第二次）。
+	totalRetries := attemptRetries(first)
+	if emptyRetried {
+		totalRetries += attemptRetries(chosen)
+	}
 	s.recordTurn(usage.Event{
 		Model: model.Slug, Provider: providerID, Status: 200,
 		DurationMs:           time.Since(started).Milliseconds(),
@@ -620,6 +676,7 @@ func (s *Server) serveRouted(w http.ResponseWriter, r *http.Request,
 		OutputTokens:         chosen.translator.OutputTokens(),
 		TotalTokens:          chosen.translator.TotalTokens(),
 		EstimatedInputTokens: int64(chosen.translator.SubstitutedInputTokens()),
+		Retries:              totalRetries,
 		ToolResultsSpilled:   spillStats.ToolResultsSpilled, ToolResultBytesSaved: spillStats.ToolResultBytesSaved,
 		EmptyCompletion: emptyCompletion, EmptyCompletionRetried: emptyRetried,
 		StreamAborted: unrepairable && false,
@@ -632,6 +689,52 @@ func (s *Server) serveRouted(w http.ResponseWriter, r *http.Request,
 		chosen.translator.PromptTokens(), chosen.translator.OutputTokens(),
 		boolText(chosen.translator.SubstitutedInputTokens() > 0, " estimated-input=true"),
 		boolText(emptyCompletion, " empty-completion=true"))
+}
+
+// attemptRetries 从尝试结果安全取 FetchWithRetry 的额外尝试数。
+func attemptRetries(outcome *attemptOutcome) int {
+	if outcome == nil {
+		return 0
+	}
+	return outcome.retries
+}
+
+// failLiveStream 处理传输/看门狗类失败的收尾（响应从未给过结论）：
+//   - 头未提交：回 JSON 状态 —— 空闲看门狗 504（Codex 对 5xx 自带
+//     重试接管），其余传输失败 502；
+//   - 头已提交（liveness 后中断）：绝不能再 writeJSON —— 那会触发
+//     superfluous WriteHeader 并把 JSON 追加进 SSE 流。只截断返回，
+//     Codex 按既有语义整轮重试。
+func (s *Server) failLiveStream(w http.ResponseWriter, provider *registry.Provider, model *registry.Model,
+	err error, relay *streamRelay, started time.Time, base usage.Event) {
+
+	idle := errors.Is(err, httpx.ErrUpstreamIdle)
+	status := http.StatusBadGateway
+	if idle {
+		status = http.StatusGatewayTimeout
+	}
+	base.Model, base.Provider = model.Slug, provider.ID
+	base.Status = status
+	base.DurationMs = time.Since(started).Milliseconds()
+	base.UpstreamIdle = idle
+
+	if relay != nil && (relay.headersWritten() || relay.writeErr != nil) {
+		base.StreamAborted = true
+		logf("model=%s provider=%s status=%d duration_ms=%d stream_truncated=true upstream_idle=%v err=%v",
+			model.Slug, provider.ID, status, base.DurationMs, idle, err)
+		s.recordTurn(base)
+		return
+	}
+	logf("model=%s provider=%s status=%d duration_ms=%d upstream_idle=%v err=%v",
+		model.Slug, provider.ID, status, base.DurationMs, idle, err)
+	if idle {
+		writeJSON(w, status, errBody("upstream_idle_timeout",
+			"The upstream stream produced no data within the configured idle window; the router closed it so the client can retry."))
+	} else {
+		writeJSON(w, status, errBody("provider_api_proxy_error",
+			"The API-provider forwarder could not complete the request."))
+	}
+	s.recordTurn(base)
 }
 
 // usageFromResponsesJSON 从 Responses 形态的响应体提取计量
@@ -658,8 +761,12 @@ func boolText(cond bool, text string) string {
 }
 
 // writeUpstreamError 用完整错误翻译重写上游错误（配额/套餐分类）。
+// 失败同样落 router.log —— 此前失败请求只进 usage-events.jsonl，
+// 日志审计时会漏（2026-08-16 黑洞 500 只能靠 usage 考古发现）。
 func (s *Server) writeUpstreamError(w http.ResponseWriter, provider *registry.Provider,
-	model *registry.Model, failure *upstreamFailure) {
+	model *registry.Model, failure *upstreamFailure, started time.Time) {
+	logf("model=%s provider=%s status=%d duration_ms=%d upstream_error=%.200s",
+		model.Slug, provider.ID, failure.status, time.Since(started).Milliseconds(), failure.bodyText)
 	if failure.retryAfter > 0 {
 		w.Header().Set("Retry-After", fmt.Sprintf("%d", failure.retryAfter))
 	}

@@ -202,3 +202,99 @@ func TestWebSocketPassthroughDisabled(t *testing.T) {
 		t.Fatalf("disabled handshake = %v, want 426", resp)
 	}
 }
+
+// startWSSilentUpstream 起一个"黑洞上游"：接受升级、收帧，但永不回帧
+// （2026-08-16 13:44 黑洞的形状：握手 101 通、客户端帧已送达、上游零回帧）。
+func startWSSilentUpstream(t *testing.T) *httptest.Server {
+	t.Helper()
+	up := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+			// 收帧不回 —— 挂死。
+		}
+	}))
+	t.Cleanup(ts.Close)
+	return ts
+}
+
+// 静默看门狗：待答请求超窗口无上游帧 → 主动拆管，客户端侧连接关闭。
+func TestWSSilentWatchdogTearsDownPipe(t *testing.T) {
+	upstream := startWSSilentUpstream(t)
+	srv, ts := newTestServer(t)
+	srv.opt.NativeBase = upstream.URL
+	srv.wsSilent = 300 * time.Millisecond
+
+	callerKey, _ := srv.opt.State.CallerKey()
+	header := http.Header{}
+	header.Set("X-Codex-Routing-Hint", "model=gpt-5.6-sol")
+	conn, _, err := websocket.DefaultDialer.Dial(wsRouterURL(ts, callerKey), header)
+	if err != nil {
+		t.Fatalf("native hint should upgrade: %v", err)
+	}
+	defer conn.Close()
+
+	frame := `{"type":"response.create","model":"gpt-5.6-sol","stream":true}`
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(frame)); err != nil {
+		t.Fatal(err)
+	}
+	// 上游永不回帧：看门狗应在 ~窗口 + 轮询间隔内拆管。
+	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	started := time.Now()
+	for {
+		if _, _, err := conn.ReadMessage(); err != nil {
+			elapsed := time.Since(started)
+			if elapsed > 2500*time.Millisecond {
+				t.Fatalf("watchdog tore down too late: %v", elapsed)
+			}
+			return // 连接被拆 = 预期
+		}
+		// 收到帧即意外（黑洞上游不回帧）。
+		t.Fatal("silent upstream must not send frames")
+	}
+}
+
+// 看门狗不误杀跨 turn 空闲：一问一答后管道静默超过窗口（无待答请求）
+// 不拆；下一问照样通。
+func TestWSSilentWatchdogSparesIdlePipe(t *testing.T) {
+	upstream, _ := startWSMockUpstream(t)
+	srv, ts := newTestServer(t)
+	srv.opt.NativeBase = upstream.URL
+	srv.wsSilent = 300 * time.Millisecond
+
+	callerKey, _ := srv.opt.State.CallerKey()
+	header := http.Header{}
+	header.Set("X-Codex-Routing-Hint", "model=gpt-5.6-sol")
+	conn, _, err := websocket.DefaultDialer.Dial(wsRouterURL(ts, callerKey), header)
+	if err != nil {
+		t.Fatalf("native hint should upgrade: %v", err)
+	}
+	defer conn.Close()
+
+	ask := func(payload string) {
+		t.Helper()
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(payload)); err != nil {
+			t.Fatalf("ask failed: %v", err)
+		}
+		conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		for {
+			_, data, err := conn.ReadMessage()
+			if err != nil {
+				t.Fatalf("reply lost: %v", err)
+			}
+			if strings.Contains(string(data), "response.completed") {
+				return
+			}
+		}
+	}
+	ask(`{"type":"response.create","model":"gpt-5.6-sol","stream":true}`)
+	time.Sleep(600 * time.Millisecond) // 跨 turn 空闲 > 窗口，但无待答请求
+	ask(`{"type":"response.create","model":"gpt-5.6-sol","stream":true}`)
+}

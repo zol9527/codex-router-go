@@ -16,3 +16,4 @@ apps/desktop/src-tauri/icons/icon.icns
 generated/
 /codex-router
 .serena
+.zcode

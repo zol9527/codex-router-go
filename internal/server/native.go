@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"os"
@@ -86,7 +87,7 @@ func (s *Server) handleNative(w http.ResponseWriter, r *http.Request, route stri
 	}
 
 	target := s.nativeTarget(route)
-	resp, _, err := httpx.FetchWithRetry(r.Context(), http.MethodPost, target, headers, upstreamBody, httpx.DefaultRetryOptions())
+	resp, retries, err := httpx.FetchWithRetry(r.Context(), http.MethodPost, target, headers, upstreamBody, s.upstreamRetryOpts())
 	if err != nil {
 		logf("native request failed model=%s error=%v", requestedModel, err)
 		writeJSON(w, http.StatusBadGateway, errBody("local_router_error", "The local router could not complete the request."))
@@ -96,7 +97,7 @@ func (s *Server) handleNative(w http.ResponseWriter, r *http.Request, route stri
 	s.relayResponse(w, resp)
 	s.recordTurn(usage.Event{
 		Model: requestedModel, Provider: "openai",
-		Status: resp.StatusCode, DurationMs: time.Since(started).Milliseconds(),
+		Status: resp.StatusCode, DurationMs: time.Since(started).Milliseconds(), Retries: retries,
 	})
 	logf("model=%s provider=openai status=%d duration_ms=%d",
 		requestedModel, resp.StatusCode, time.Since(started).Milliseconds())
@@ -132,6 +133,12 @@ func (s *Server) relayResponse(w http.ResponseWriter, resp *http.Response) {
 			}
 		}
 		if err != nil {
+			// 响应中途死掉（含空闲看门狗断开）：头已无法重写，只能
+			// 截断 —— 留一行日志供审计，调用方按流提前结束自愈。
+			if !errors.Is(err, io.EOF) {
+				logf("relay truncated status=%d idle=%v err=%v",
+					resp.StatusCode, errors.Is(err, httpx.ErrUpstreamIdle), err)
+			}
 			return
 		}
 	}
