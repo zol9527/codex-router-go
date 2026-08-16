@@ -77,11 +77,7 @@ func FocusInstructions(question string) string {
 
 // Settings 是 vision-bridge.json 的形状。
 type Settings struct {
-	Enabled      *bool  `json:"enabled,omitempty"`
-	Engine       string `json:"engine,omitempty"`    // pin 的引擎 slug；"local" 特指本地
-	Defaulted    bool   `json:"defaulted,omitempty"` // engine 是默认值而非操作者选择
-	LocalModel   string `json:"localModel,omitempty"`
-	LocalBaseURL string `json:"localBaseUrl,omitempty"`
+	Enabled *bool `json:"enabled,omitempty"`
 	// Effort 是操作者 pin 的读图推理档；空 = 跟随会话档，
 	// "default" 由写入端归一为空（把档位交还给引擎自己的默认）。
 	Effort string `json:"effort,omitempty"`
@@ -116,15 +112,6 @@ func WriteSettings(stateDir string, settings Settings) error {
 	}
 	return os.Rename(name, filepath.Join(stateDir, "vision-bridge.json"))
 }
-
-// LocalEngineSlug 是本地引擎的固定 pin 名。
-const LocalEngineSlug = "local"
-
-// Defaults for local engine。
-const (
-	DefaultLocalVisionBaseURL = "http://127.0.0.1:11434/v1"
-	DefaultLocalVisionModel   = "qwen2.5vl:3b"
-)
 
 // State 门控语义（结构性，非哨兵）：
 //   - 无文件 = 没人回答过 → 当前默认（开）适用；

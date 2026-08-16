@@ -1,8 +1,8 @@
 package server
 
-// vision bridge 的 server 集成：引擎候选装配（registry 视觉模型 +
-// native GPT + 本地 Ollama）、三路 DescribeCaller、请求管线的图片
-// 替换。图片替换发生在协作解密之后、协议翻译之前。
+// vision bridge 的 server 集成：native 引擎候选装配（调用方会话里的
+// 视觉原生模型）、native 读图调用、请求管线的图片替换。图片替换发生
+// 在协作解密之后、协议翻译之前。
 
 import (
 	"context"
@@ -15,7 +15,6 @@ import (
 	"sync"
 
 	"github.com/loyd/codex-router/internal/registry"
-	"github.com/loyd/codex-router/internal/translate"
 	"github.com/loyd/codex-router/internal/vision"
 )
 
@@ -93,51 +92,20 @@ func (s *Server) bridgeVision(w http.ResponseWriter, r *http.Request,
 	payload["input"] = vision.Substitute(input, evidence, failures)
 }
 
-// visionCandidates 装配引擎候选：
-//   - registry 里启用 + 有凭据 + 声明 image 的模型（按优先级）；
-//   - native 候选：调用方带会话时，从 merged 目录里取 listed 的
-//     视觉原生模型 —— native 授权的唯一证据是请求手里的活会话，
-//     磁盘上的捕获可能已过期（登出后仍能读到文件）。
-//
-// 候选构建做同步凭据探测（macOS 上每 provider 一次 security spawn），
-// 所以只在确定要读图时调用（调用方已做图片预检）。
+// visionCandidates 装配读图引擎候选：只取调用方 ChatGPT 会话可用的
+// 视觉原生模型（merged 目录里 listed 的）—— native 授权的唯一证据
+// 是请求手里的活会话，磁盘上的捕获可能已过期（登出后仍能读到文件）。
+// 读图走 native 单路：不消耗付费 provider 配额，也不做同步凭据探测。
 func (s *Server) visionCandidates(r *http.Request) []vision.Engine {
-	var candidates []vision.Engine
+	if !s.hasUpstreamAuthorization(r) {
+		return nil
+	}
+	registrySlugs := map[string]bool{}
 	for _, model := range s.opt.Registry.Models {
-		if !vision.SupportsImage(model.InputModalities) {
-			continue
-		}
-		if !s.opt.State.ProviderEnabled(model.Provider, s.opt.Registry.CanonicalProviderID) {
-			continue
-		}
-		provider := s.opt.Registry.ProviderFor(model)
-		if provider == nil {
-			continue
-		}
-		if credential, _ := s.opt.Credentials.Resolve(provider); credential == "" {
-			continue
-		}
-		efforts := make([]string, 0, len(model.ReasoningLevels))
-		for _, level := range model.ReasoningLevels {
-			efforts = append(efforts, level.Effort)
-		}
-		candidates = append(candidates, vision.Engine{
-			Slug: model.Slug, DisplayName: model.DisplayName,
-			GatewayModel: model.UpstreamModel, Provider: provider.ID,
-			Priority: model.Priority, Efforts: efforts,
-			DefaultEffort: model.DefaultEffort, ImageCapable: true,
-		})
+		registrySlugs[model.Slug] = true
 	}
-	// native 候选：调用方带上游会话头（Codex 总是带）。
-	if s.hasUpstreamAuthorization(r) {
-		registrySlugs := map[string]bool{}
-		for _, model := range s.opt.Registry.Models {
-			registrySlugs[model.Slug] = true
-		}
-		candidates = append(candidates, vision.NativeEnginesFromCatalogFile(
-			filepath.Join(s.opt.State.Dir, "merged-models.json"), registrySlugs)...)
-	}
-	return candidates
+	return vision.NativeEnginesFromCatalogFile(
+		filepath.Join(s.opt.State.Dir, "merged-models.json"), registrySlugs)
 }
 
 func (s *Server) hasUpstreamAuthorization(r *http.Request) bool {
@@ -148,104 +116,13 @@ func (s *Server) hasUpstreamAuthorization(r *http.Request) bool {
 	return !s.isRouterLocalToken(header)
 }
 
-// describeCaller 装配三路读图调用。native 路径经闭包捕获原始请求
-// （它贡献会话头，而 DescribeCaller 的抽象签名不携带请求）。
+// describeCaller 装配读图调用：native 单路。native 路径经闭包捕获
+// 原始请求（它贡献会话头，而 DescribeCaller 的抽象签名不携带请求）。
 func (s *Server) describeCaller(routeModel *registry.Model, r *http.Request) vision.DescribeCaller {
 	_ = routeModel
 	return func(ctx context.Context, engine vision.Engine, effort, question, dataURL string) (string, error) {
-		switch {
-		case engine.Local:
-			return s.describeLocal(ctx, engine, effort, question, dataURL)
-		case engine.Native:
-			return s.describeNative(ctx, engine, effort, question, dataURL, r)
-		default:
-			// anthropic 协议的引擎（opencode 的 messages 变体）走
-			// messages 形态；chat 形态发过去只会 404/400。
-			if provider := s.opt.Registry.Providers[engine.Provider]; provider != nil && provider.Protocol == "anthropic" {
-				return s.describeAnthropic(ctx, engine, question, dataURL)
-			}
-			return s.describeRegistry(ctx, engine, effort, question, dataURL)
-		}
+		return s.describeNative(ctx, engine, effort, question, dataURL, r)
 	}
-}
-
-// describeAnthropic：anthropic messages 协议引擎读图。x-api-key +
-// anthropic-version 头；非流式即可 —— "stream 必须 true" 是 ChatGPT
-// 后端的约束，不适用于 opencode 中继。effort 无对应字段，不传。
-func (s *Server) describeAnthropic(ctx context.Context, engine vision.Engine, question, dataURL string) (string, error) {
-	provider := s.opt.Registry.Providers[engine.Provider]
-	if provider == nil {
-		return "", fmt.Errorf("vision engine provider missing: %s", engine.Provider)
-	}
-	credential, _ := s.opt.Credentials.Resolve(provider)
-	if credential == "" {
-		return "", fmt.Errorf("vision engine credential missing: %s", engine.Provider)
-	}
-	body, ok := vision.AnthropicDescribeRequest(engine.GatewayModel, question, dataURL)
-	if !ok {
-		return "", fmt.Errorf("image data URL is not base64 form")
-	}
-	headers := translate.UpstreamHeadersFrom(nil, credential, Version)
-	headers["Content-Type"] = "application/json"
-	headers["Accept"] = "application/json"
-	headers["x-api-key"] = credential
-	headers["anthropic-version"] = "2023-06-01"
-	target := strings.TrimSuffix(providerBaseURL(provider), "/") + "/messages"
-	status, raw, err := vision.PostJSON(ctx, s.client, target, headers, body)
-	if err != nil {
-		return "", err
-	}
-	if status != http.StatusOK {
-		return "", vision.StatusErrorWithBody(status, raw)
-	}
-	return vision.ParseAnthropicDescribeResponse(raw)
-}
-
-// describeRegistry：经 chat 上游读图（与普通回合同一凭据/头清洗）。
-// effort 走标准 reasoning_effort 字段 —— 上游不认时会拒绝或忽略，
-// 与路由回合同一契约。
-func (s *Server) describeRegistry(ctx context.Context, engine vision.Engine, effort, question, dataURL string) (string, error) {
-	provider := s.opt.Registry.Providers[engine.Provider]
-	if provider == nil {
-		return "", fmt.Errorf("vision engine provider missing: %s", engine.Provider)
-	}
-	credential, _ := s.opt.Credentials.Resolve(provider)
-	if credential == "" {
-		return "", fmt.Errorf("vision engine credential missing: %s", engine.Provider)
-	}
-	body := vision.ChatDescribeRequest(engine.GatewayModel, question, dataURL)
-	if effort != "" {
-		body["reasoning_effort"] = effort
-	}
-	headers := translate.UpstreamHeadersFrom(nil, credential, Version)
-	headers["Content-Type"] = "application/json"
-	headers["Accept"] = "application/json"
-	target := strings.TrimSuffix(providerBaseURL(provider), "/") + "/chat/completions"
-	status, raw, err := vision.PostJSON(ctx, s.client, target, headers, body)
-	if err != nil {
-		return "", err
-	}
-	if status != http.StatusOK {
-		return "", vision.StatusErrorWithBody(status, raw)
-	}
-	return vision.ParseChatDescribeResponse(raw)
-}
-
-// describeLocal：无凭据直连 Ollama 兼容端点（显式 pin 才会出现）。
-func (s *Server) describeLocal(ctx context.Context, engine vision.Engine, effort, question, dataURL string) (string, error) {
-	settings, _ := vision.ReadSettings(s.opt.State.Dir)
-	base := vision.LocalBaseURLOf(settings)
-	body := vision.ChatDescribeRequest(vision.LocalModelOf(settings), question, dataURL)
-	headers := map[string]string{"Accept": "application/json"}
-	status, raw, err := vision.PostJSON(ctx, s.client, strings.TrimSuffix(base, "/")+"/chat/completions", headers, body)
-	if err != nil {
-		// 保留传输层自己的措辞 —— 操作者因此知道本地引擎没开。
-		return "", err
-	}
-	if status != http.StatusOK {
-		return "", vision.StatusErrorWithBody(status, raw)
-	}
-	return vision.ParseChatDescribeResponse(raw)
 }
 
 // describeNative：调用方的活会话 + ChatGPT 后端 /responses 读图。

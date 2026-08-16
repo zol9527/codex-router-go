@@ -3,8 +3,6 @@ package vision
 import (
 	"context"
 	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"strings"
 	"sync"
@@ -52,43 +50,25 @@ func writeFile(t *testing.T, dir, name, content string) {
 // 且始终只选择一个引擎。
 func TestResolveEngines(t *testing.T) {
 	candidates := []Engine{
-		{Slug: "zai/glm-v", DisplayName: "GLM Vision", GatewayModel: "glm-v", Priority: 10, ImageCapable: true},
-		{Slug: "local-ollama", DisplayName: "Local", Local: true, Priority: 1, ImageCapable: true},
-		{Slug: "oc/gpt-v", DisplayName: "GPT Vision", GatewayModel: "gpt-v", Priority: 20, ImageCapable: true},
-		{Slug: "oc/claude-v", DisplayName: "Claude Vision", GatewayModel: "claude-v", Priority: 30, ImageCapable: true},
+		{Slug: "oc/gpt-v", DisplayName: "GPT Vision", GatewayModel: "gpt-v", Native: true, Priority: 20, ImageCapable: true},
+		{Slug: "gpt-5.6-luna", DisplayName: "Luna", Native: true, Priority: 5, ImageCapable: true},
+		{Slug: "oc/claude-v", DisplayName: "Claude Vision", Native: true, Priority: 30, ImageCapable: true},
 	}
 	enabled := true
 	on := Settings{Enabled: &enabled}
 
-	// auto：跳过 loopback 的 local-ollama，只取 GLM Vision。
+	// 排序取首位：priority 小者优先（luna=5）。
 	engines := ResolveEngines(candidates, on, false)
-	if len(engines) != 1 || engines[0].Slug != "zai/glm-v" {
-		t.Fatalf("auto resolution wrong: %+v", engines)
+	if len(engines) != 1 || engines[0].Slug != "gpt-5.6-luna" {
+		t.Fatalf("resolution must take the ranked head: %+v", engines)
 	}
-	for _, engine := range engines {
-		if engine.Loopback() {
-			t.Errorf("auto must never nominate loopback: %v", engine.Slug)
-		}
-	}
-	// 显式 pin 失效 → 空（操作者可见）。
-	engines = ResolveEngines(candidates, Settings{Enabled: &enabled, Engine: "gone"}, true)
-	if len(engines) != 0 {
-		t.Errorf("explicit dead pin must resolve nothing, got %+v", engines)
-	}
-	// 默认引擎失效 → 静默落到排名首位。
-	engines = ResolveEngines(candidates, Settings{Enabled: &enabled, Engine: "gone", Defaulted: true}, true)
-	if len(engines) == 0 || engines[0].Slug != "zai/glm-v" {
-		t.Errorf("dead default falls to ranked head: %+v", engines)
-	}
-	// 本地 pin：单引擎，绝不回退到 provider。
-	engines = ResolveEngines(candidates, Settings{Enabled: &enabled, Engine: LocalEngineSlug}, true)
-	if len(engines) != 1 || !engines[0].Local {
-		t.Fatalf("local pin must be solo: %+v", engines)
+	// 无候选 → 空。
+	if engines := ResolveEngines(nil, on, false); len(engines) != 0 {
+		t.Errorf("no candidates must resolve nothing, got %+v", engines)
 	}
 	// 关闭 → 空。
-	off := Settings{Enabled: &enabled}
-	off.Enabled = &[]bool{false}[0]
-	if engines = ResolveEngines(candidates, off, true); len(engines) != 0 {
+	off := Settings{Enabled: &[]bool{false}[0]}
+	if engines := ResolveEngines(candidates, off, true); len(engines) != 0 {
 		t.Errorf("disabled bridge must resolve nothing")
 	}
 }
@@ -184,28 +164,16 @@ func TestSubstituteFailure(t *testing.T) {
 	}
 }
 
-// 每次读图都是独立的单次调用；Router 不复用缓存或 in-flight 结果。
+// 每次读图都是独立的单次调用；Reader 层不复用缓存或 in-flight 结果
+// （会话级缓存住在 server 的 SessionCache，不在这层）。
 func TestReadDoesNotCacheOrShareInflight(t *testing.T) {
-	var calls int32
 	var mu sync.Mutex
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	calls := 0
+	reader := NewReader(func(_ context.Context, _ Engine, _, _, _ string) (string, error) {
 		mu.Lock()
 		calls++
 		mu.Unlock()
-		w.Write([]byte(`{"choices":[{"message":{"content":"## Summary\nshared read."}}]}`))
-	}))
-	defer upstream.Close()
-
-	reader := NewReader(func(ctx context.Context, engine Engine, effort, question, dataURL string) (string, error) {
-		status, body, err := PostJSON(ctx, http.DefaultClient, upstream.URL, nil,
-			ChatDescribeRequest("m", question, dataURL))
-		if err != nil {
-			return "", err
-		}
-		if status != 200 {
-			return "", StatusError(status, nil)
-		}
-		return ParseChatDescribeResponse(body)
+		return "## Summary\nshared read.", nil
 	})
 	engines := []Engine{{Slug: "e1", DisplayName: "E1", ImageCapable: true}}
 	image := ImagePart{DataURL: "data:image/png;base64,CCCC", Question: "q"}
@@ -264,52 +232,6 @@ func TestBodySnippet(t *testing.T) {
 	}
 	if got := BodySnippet(nil); got != "" {
 		t.Errorf("empty body should be empty, got %q", got)
-	}
-}
-
-// anthropic 代读：data URL 拆解、请求形状（system + image source 块）、
-// 响应解析（text block 提取）。
-func TestAnthropicDescribe(t *testing.T) {
-	media, data, ok := splitDataURL("data:image/png;base64,AAAB")
-	if !ok || media != "image/png" || data != "AAAB" {
-		t.Fatalf("splitDataURL wrong: %q %q %v", media, data, ok)
-	}
-	if _, _, ok := splitDataURL("https://example.com/x.png"); ok {
-		t.Error("non-data URL must be rejected")
-	}
-	if _, _, ok := splitDataURL("data:image/png,AAAB"); ok {
-		t.Error("non-base64 data URL must be rejected")
-	}
-
-	body, ok := AnthropicDescribeRequest("qwen3.7-max", "read the error", "data:image/png;base64,AAAB")
-	if !ok {
-		t.Fatal("request must build")
-	}
-	if body["model"] != "qwen3.7-max" || body["max_tokens"] != 4096 {
-		t.Errorf("model/max_tokens wrong: %v %v", body["model"], body["max_tokens"])
-	}
-	if sys, _ := body["system"].(string); !strings.Contains(sys, "read the error") {
-		t.Errorf("question must fold into system instructions: %q", sys)
-	}
-	blocks := body["messages"].([]any)[0].(map[string]any)["content"].([]any)
-	image := blocks[1].(map[string]any)
-	if image["type"] != "image" {
-		t.Fatalf("second block must be image, got %v", image["type"])
-	}
-	source := image["source"].(map[string]any)
-	if source["media_type"] != "image/png" || source["data"] != "AAAB" || source["type"] != "base64" {
-		t.Errorf("image source wrong: %v", source)
-	}
-
-	got, err := ParseAnthropicDescribeResponse([]byte(`{"content":[{"type":"text","text":"A dialog."},{"type":"thinking","text":"..."},{"type":"text","text":"Reads boom."}]}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != "A dialog.\nReads boom." {
-		t.Errorf("text blocks wrong: %q", got)
-	}
-	if _, err := ParseAnthropicDescribeResponse([]byte(`{"content":[]}`)); err == nil {
-		t.Error("empty content must error")
 	}
 }
 

@@ -82,33 +82,20 @@ func TestControlVisionBridgeOnOff(t *testing.T) {
 	}
 }
 
-// 引擎 pin：auto/local/合法 slug 通过，未知 slug 必须报错
-// （pin 失效的引擎会让每次贴图静默降级）。
-func TestControlVisionBridgeEngine(t *testing.T) {
+// 档位 pin：level 落盘、"default" 归一为空（档位交还引擎默认）。
+func TestControlVisionBridgeEffort(t *testing.T) {
 	dir := t.TempDir()
 	writeTestCatalog(t, dir)
 	reg := visionTestRegistry()
 
-	if err := controlVisionBridge(dir, reg, []string{"engine", "auto"}); err != nil {
-		t.Fatalf("auto: %v", err)
+	if err := controlVisionBridge(dir, reg, []string{"effort", "high"}); err != nil {
+		t.Fatalf("effort: %v", err)
 	}
 	settings, _ := vision.ReadSettings(dir)
-	if settings.Engine != "" {
-		t.Errorf("auto must clear the pin, got %q", settings.Engine)
+	if settings.Effort != "high" {
+		t.Errorf("effort must land, got %+v", settings)
 	}
 
-	if err := controlVisionBridge(dir, reg, []string{"engine", "gpt-5.6-luna", "high"}); err != nil {
-		t.Fatalf("native slug: %v", err)
-	}
-	settings, _ = vision.ReadSettings(dir)
-	if settings.Engine != "gpt-5.6-luna" || settings.Effort != "high" {
-		t.Errorf("engine+effort must land together: %+v", settings)
-	}
-
-	// registry 视觉模型同样可 pin；随后 effort 归还默认。
-	if err := controlVisionBridge(dir, reg, []string{"engine", "test-provider/vision-model"}); err != nil {
-		t.Fatalf("registry slug: %v", err)
-	}
 	if err := controlVisionBridge(dir, reg, []string{"effort", "default"}); err != nil {
 		t.Fatalf("effort default: %v", err)
 	}
@@ -117,29 +104,16 @@ func TestControlVisionBridgeEngine(t *testing.T) {
 		t.Errorf("default must clear effort, got %q", settings.Effort)
 	}
 
-	if err := controlVisionBridge(dir, reg, []string{"engine", "no-such-engine"}); err == nil {
-		t.Error("unknown engine slug must fail visibly")
+	if err := controlVisionBridge(dir, reg, []string{"engine", "gpt-5.6-luna"}); err == nil {
+		t.Error("engine selection is gone; the action must fail visibly")
 	}
-	// 纯文本模型不是引擎。
-	if err := controlVisionBridge(dir, reg, []string{"engine", "test-provider/text-model"}); err == nil {
-		t.Error("text-only model must not be pinnable as engine")
-	}
-}
-
-// 本地引擎 pin：tray 的 useLocalVisionModel 路径。
-func TestControlVisionBridgeLocal(t *testing.T) {
-	dir := t.TempDir()
-	if err := controlVisionBridge(dir, visionTestRegistry(), []string{"local", "qwen2.5vl:3b"}); err != nil {
-		t.Fatalf("local: %v", err)
-	}
-	settings, _ := vision.ReadSettings(dir)
-	if settings.Engine != vision.LocalEngineSlug || settings.LocalModel != "qwen2.5vl:3b" {
-		t.Fatalf("local pin must land: %+v", settings)
+	if err := controlVisionBridge(dir, reg, []string{"local", "qwen2.5vl:3b"}); err == nil {
+		t.Error("local pin is gone; the action must fail visibly")
 	}
 }
 
-// 快照块形状：enabled 恒在；engine/effort 只有 pin 时出现；
-// nativeEngines 来自 merged 目录；resolvedEngine 在 auto 且有候选时非空。
+// 快照块形状：enabled 恒在；resolvedEngine 来自 merged 目录的
+// native 候选（引擎固定 native，没有选择字段）。
 func TestVisionBridgeSnapshotShape(t *testing.T) {
 	dir := t.TempDir()
 	writeTestCatalog(t, dir)
@@ -153,34 +127,22 @@ func TestVisionBridgeSnapshotShape(t *testing.T) {
 	if snapshot["enabled"] != true {
 		t.Errorf("never-configured bridge must snapshot as enabled (default on), got %v", snapshot["enabled"])
 	}
-	if _, ok := snapshot["engine"]; ok {
-		t.Error("engine must be absent when nothing is pinned")
-	}
-	natives, _ := snapshot["nativeEngines"].([]map[string]any)
-	if len(natives) != 1 || natives[0]["slug"] != "gpt-5.6-luna" {
-		t.Errorf("nativeEngines must come from the merged catalog: %v", snapshot["nativeEngines"])
-	}
 	if snapshot["resolvedEngine"] != "gpt-5.6-luna" {
-		t.Errorf("auto resolution must pick the ranked native engine, got %v", snapshot["resolvedEngine"])
+		t.Errorf("resolution must pick the ranked native engine, got %v", snapshot["resolvedEngine"])
+	}
+	for _, gone := range []string{"engine", "local", "paidEngines", "nativeEngines", "download", "hostMemGib"} {
+		if _, ok := snapshot[gone]; ok {
+			t.Errorf("selection-era key %q must be gone from the snapshot", gone)
+		}
 	}
 
-	// pin local 后：local 块出现、resolvedEngine 变为 local。
-	if err := controlVisionBridge(dir, reg, []string{"local", "qwen2.5vl:3b"}); err != nil {
-		t.Fatal(err)
-	}
+	// 档位 pin 进快照。
 	if err := controlVisionBridge(dir, reg, []string{"effort", "low"}); err != nil {
 		t.Fatal(err)
 	}
 	snapshot = visionBridgeSnapshot(st, reg)
-	if snapshot["engine"] != "local" || snapshot["effort"] != "low" {
-		t.Errorf("pins must surface in the snapshot: %v", snapshot)
-	}
-	local, _ := snapshot["local"].(map[string]any)
-	if local["model"] != "qwen2.5vl:3b" {
-		t.Errorf("local pin model must surface: %v", snapshot["local"])
-	}
-	if snapshot["resolvedEngine"] != "local" {
-		t.Errorf("local pin must resolve to local, got %v", snapshot["resolvedEngine"])
+	if snapshot["effort"] != "low" {
+		t.Errorf("effort must surface in the snapshot: %v", snapshot)
 	}
 
 	// off 之后 enabled=false —— tray 的开关回读路径。

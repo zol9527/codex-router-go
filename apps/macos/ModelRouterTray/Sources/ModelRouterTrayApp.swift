@@ -153,7 +153,6 @@ final class RouterStore: ObservableObject {
   @Published private(set) var providerUsageError: String?
   @Published private(set) var providerSetup: [String: ProviderSetupState] = [:]
   @Published private(set) var providerOperation: String?
-  @Published private(set) var visionDownload: VisionDownloadState?
   @Published private(set) var benchmarkingTag: String?
   @Published private(set) var maintenanceMessage: String?
   @Published private(set) var maintenanceSucceeded = false
@@ -1463,45 +1462,6 @@ final class RouterStore: ObservableObject {
     await applyModelSettings(arguments: ["vision-bridge", enabled ? "on" : "off"])
   }
 
-  /// Picks a cloud engine ("auto" or a model slug) as the image reader, and
-  /// optionally the reasoning effort it reads at. Passing "default" for the
-  /// effort hands the level back to the model. One command, so the two never
-  /// land out of step.
-  func setVisionBridgeEngine(_ value: String, effort: String? = nil) async {
-    var arguments = ["vision-bridge", "engine", value]
-    if let effort { arguments.append(effort) }
-    await applyModelSettings(arguments: arguments)
-  }
-
-  func setVisionBridgeEffort(_ effort: String) async {
-    await applyModelSettings(arguments: ["vision-bridge", "effort", effort])
-  }
-
-
-  /// Deletes the model from disk. Irreversible short of downloading it again,
-  /// so the tray arms the row before this is reachable.
-
-  /// Switches the reader to an already-installed local model.
-  func useLocalVisionModel(_ tag: String) async {
-    await applyModelSettings(arguments: ["vision-bridge", "local", tag])
-  }
-
-  /// Scores an installed model against the checked-in ground-truth image. This
-  /// is what makes "not benchmarked" actionable in the tray: download any
-  /// model, then measure whether it actually reads before trusting it.
-  func benchmarkLocalVisionModel(_ tag: String) async {
-    guard benchmarkingTag == nil else { return }
-    benchmarkingTag = tag
-    defer { benchmarkingTag = nil }
-    do {
-      _ = try await runControl(arguments: ["vision-bridge", "benchmark", tag])
-      await refresh()
-      message = "\(tag) tested. The score is on its row."
-    } catch {
-      message = error.localizedDescription
-    }
-  }
-
   /// Measures Ollama's own eval counters, so the number is this machine's
   /// observed generation speed rather than a marketing estimate.
   func benchmarkLocalModelSpeed(_ tag: String) async {
@@ -1517,61 +1477,10 @@ final class RouterStore: ObservableObject {
     }
   }
 
-  /// Downloads a local vision model with Ollama, then pins it. The tray row
-  /// shows the size, so the click is the consent for the download.
-  ///
-  /// Gigabytes take minutes: the control command starts a detached worker and
-  /// returns at once, and this polls progress so the row shows a live
-  /// percentage instead of a frozen panel. Only the download buttons are
-  /// disabled meanwhile — the rest of the tray stays usable.
-  func downloadLocalVisionModel(_ tag: String) async {
-    guard visionDownload?.isRunning != true else { return }
-    let startedAt = Date().timeIntervalSince1970 * 1_000
-    visionDownload = VisionDownloadState(
-      tag: tag,
-      status: "downloading",
-      detail: "starting",
-      percent: 0,
-      error: nil,
-      startedAt: startedAt,
-      updatedAt: startedAt
-    )
-    do {
-      _ = try await runControl(arguments: ["vision-bridge", "pull", tag])
-    } catch {
-      message = error.localizedDescription
-      visionDownload = nil
-      return
-    }
-    await pollVisionDownload()
-  }
-
   /// Downloads a local chat model through Ollama, installs/starts Ollama when
   /// needed, and checks the model on for Codex after the pull completes. The
   /// control command returns immediately; the state file is polled so the
   /// tray remains responsive during multi-gigabyte downloads.
-  /// `force` carries the operator's deliberate override for a model this
-  /// machine is rated too small for. Every catalog entry is offered, so the
-  /// only way to attempt an oversized one is to say so explicitly here.
-  private func pollVisionDownload() async {
-    while !Task.isCancelled {
-      try? await Task.sleep(nanoseconds: 1_000_000_000)
-      guard let data = try? await runControl(arguments: ["vision-bridge", "pull-status"]),
-        let state = try? JSONDecoder().decode(VisionDownloadState.self, from: data)
-      else { continue }
-      visionDownload = state
-      if state.isRunning { continue }
-      // Terminal: refresh so the row flips to "in use" and the engine label
-      // catches up, then report what happened.
-      await refresh()
-      message = state.status == "done"
-        ? "\(state.tag ?? "Model") downloaded. Restart Codex to refresh its picker."
-        : (state.error ?? "The download failed.")
-      visionDownload = nil
-      return
-    }
-  }
-
   private func applyModelSettings(
     arguments: [String],
     successMessage: String = "Model settings applied. Restart Codex to refresh its picker."
@@ -2393,55 +2302,13 @@ struct LocalCatalogSnapshot: Decodable {
 }
 
 
-/// A model/tag worth displaying, already rated against this machine's memory
-/// by the router. Cloud aliases are intentionally visible but non-downloadable.
-
-/// A model that can only read images. Ranked by what it actually scored
-/// against a known image, never by size alone.
-
-
-struct VisionEngineOption: Decodable, Identifiable, Equatable {
-  let slug: String
-  let displayName: String
-  // The reasoning levels this model itself declares. Older routers do not send
-  // them, and some models declare none, so an empty list means "no level to
-  // choose" rather than "no levels allowed".
-  let efforts: [String]?
-  var id: String { slug }
-}
-
+/// The vision bridge snapshot. The reading engine is fixed to the native
+/// vision model of the signed-in ChatGPT session, so there is no engine
+/// choice to carry — only whether the bridge is on and what it resolves to.
 struct VisionBridgeSnapshot: Decodable {
   let enabled: Bool
-  let engine: String?
-  let local: VisionLocalPin?
   let resolvedEngine: String?
   let resolvedEngineName: String?
-  let hostMemGib: Double?
-  let paidEngines: [VisionEngineOption]
-  // Vision models from the signed-in ChatGPT session. Older routers do not send
-  // this, so it defaults to empty rather than failing the whole decode.
-  let nativeEngines: [VisionEngineOption]?
-  /// Pinned reasoning effort, `nil` when the reader runs at its own default.
-  let effort: String?
-  let download: VisionDownloadState?
-}
-
-struct VisionLocalPin: Decodable, Equatable {
-  let model: String?
-}
-
-struct VisionDownloadState: Decodable, Equatable {
-  let tag: String?
-  let status: String
-  let detail: String?
-  let percent: Int?
-  let error: String?
-  // These timestamps let the tray reject an older terminal record when the
-  // operator retries the same tag while a refresh is in flight.
-  let startedAt: Double?
-  let updatedAt: Double?
-
-  var isRunning: Bool { status == "downloading" }
 }
 
 struct SubagentSettingsSnapshot: Decodable {
@@ -3474,126 +3341,17 @@ private struct TrayView: View {
           ),
           disabled: busy
         )
-        // The row stays put when the switch flips. Showing and hiding it
-        // resized the whole panel on every toggle, and because the state only
-        // settles after the control command returns, the jump happened twice.
-        HStack(spacing: 8) {
-          Text(routerLocalized("Engine"))
-            .font(.system(size: 11, weight: .medium))
-            // The one label that must never compress; it is four characters
-            // and the menu beside it is what should give way.
-            .fixedSize()
-          Spacer(minLength: 8)
-          engineMenu
-        }
-        .padding(.horizontal, 2)
-        .opacity(vision?.enabled == true ? 1 : 0.45)
-        .disabled(vision?.enabled != true)
       }
     }
 
-    @ViewBuilder private var engineMenu: some View {
-      Menu {
-        // No "Auto" entry. It was labelled "cheapest paid model", but the
-        // ranking behind it scored cost by testing slugs against
-        // /flash|haiku|mini|lite|small|turbo/ -- which matches none of the
-        // engines a typical install has, so they tied and the winner fell out
-        // of alphabetical order. The menu now offers only models the operator
-        // can actually evaluate, and a fresh install starts on a named default.
-        if !(vision?.paidEngines ?? []).isEmpty {
-          Section(routerLocalized("Paid (cloud)")) {
-            ForEach(vision?.paidEngines ?? []) { option in
-              engineEntry(option)
-            }
-          }
-        }
-        if !(vision?.nativeEngines ?? []).isEmpty {
-          Section(routerLocalized("Your ChatGPT plan")) {
-            ForEach(vision?.nativeEngines ?? []) { option in
-              engineEntry(option)
-            }
-          }
-        }
-      } label: {
-        HStack(spacing: 4) {
-          Text(currentEngineLabel)
-            .lineLimit(1)
-            // A label reads "Auto · MiniMax M3 (opencode Go) · high": the ends
-            // carry the meaning, so the middle is what goes.
-            .truncationMode(.middle)
-          Image(systemName: "chevron.up.chevron.down")
-            .font(.system(size: 8))
-            .fixedSize()
-        }
-        .font(.system(size: 10, weight: .medium))
-        .foregroundStyle(routerMint)
-      }
-      .menuStyle(.borderlessButton)
-      // Not fixedSize: that asks for the label's ideal width and ignores the
-      // 352pt popover, so a long engine name pushed the row off the panel
-      // instead of truncating. A ceiling lets it shrink and keeps the chevron
-      // on screen.
-      .frame(maxWidth: 230, alignment: .trailing)
-      .help(currentEngineLabel)
-      .disabled(busy)
-    }
-
-    // Hovering a model opens its own levels, so picking the reader and how hard
-    // it reads is one gesture. A model that declares no levels stays a plain
-    // button: there would be nothing behind the submenu.
-    @ViewBuilder private func engineEntry(_ option: VisionEngineOption) -> some View {
-      let efforts = option.efforts ?? []
-      if efforts.isEmpty {
-        Button(engineEntryLabel(option, selected: isSelectedEngine(option.slug))) {
-          Task { await store.setVisionBridgeEngine(option.slug) }
-        }
-      } else {
-        Menu(engineEntryLabel(option, selected: isSelectedEngine(option.slug))) {
-          Button(effortEntryLabel(routerLocalized("Model default"), selected: isSelectedEngine(option.slug) && vision?.effort == nil)) {
-            Task { await store.setVisionBridgeEngine(option.slug, effort: "default") }
-          }
-          ForEach(efforts, id: \.self) { effort in
-            Button(
-              effortEntryLabel(
-                effort.capitalized,
-                selected: isSelectedEngine(option.slug) && vision?.effort == effort
-              )
-            ) {
-              Task { await store.setVisionBridgeEngine(option.slug, effort: effort) }
-            }
-          }
-        }
-      }
-    }
-
-    private func isSelectedEngine(_ slug: String) -> Bool { vision?.engine == slug }
-
-    private func engineEntryLabel(_ option: VisionEngineOption, selected: Bool) -> String {
-      selected ? "\u{2713} \(option.displayName)" : option.displayName
-    }
-
-    private func effortEntryLabel(_ title: String, selected: Bool) -> String {
-      selected ? "\u{2713} \(title)" : title
-    }
 
     private var vision: VisionBridgeSnapshot? { settings?.visionBridge }
 
+    // The engine is fixed (native, from the signed-in ChatGPT session); the
+    // label only reports what the bridge resolved to.
     private var currentEngineLabel: String {
       guard let vision else { return routerLocalized("none") }
-      if vision.engine == "local" {
-        return "\(routerLocalized("Local")) · \(vision.local?.model ?? routerLocalized("MODEL"))"
-      }
-      let suffix = vision.effort.map { " · \($0)" } ?? ""
-      if vision.engine == nil {
-        // While a change is in flight the snapshot can arrive with the choice
-        // recorded but nothing resolved yet. "Auto" alone is true throughout;
-        // "Auto · none" was a claim that flashed and then contradicted itself.
-        guard let resolved = vision.resolvedEngineName ?? vision.resolvedEngine else {
-          return "\(routerLocalized("Auto"))\(suffix)"
-        }
-        return "\(routerLocalized("Auto")) · \(resolved)\(suffix)"
-      }
-      return "\(vision.resolvedEngineName ?? vision.resolvedEngine ?? vision.engine ?? routerLocalized("none"))\(suffix)"
+      return vision.resolvedEngineName ?? vision.resolvedEngine ?? routerLocalized("none")
     }
 
     private var hiddenModels: Set<String> {

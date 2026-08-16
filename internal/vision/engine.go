@@ -7,24 +7,18 @@ import (
 	"strings"
 )
 
-// Engine 是一个可读图的引擎（注册表模型 / native GPT / 本地 Ollama）。
+// Engine 是一个可读图的引擎（native GPT：调用方会话里的视觉模型）。
 type Engine struct {
 	Slug          string
 	DisplayName   string
-	GatewayModel  string // registry 引擎的 chat 上游 id；native 引擎 = slug
-	Provider      string // registry 引擎的 provider id；native/local 为空或特指
+	GatewayModel  string // native 引擎 = slug
 	Native        bool
-	Local         bool
 	Priority      int
 	Efforts       []string
 	DefaultEffort string
 	// InputModalities 里含 "image" 是参与候选的先决条件。
 	ImageCapable bool
 }
-
-// Loopback 判定：本地引擎（Ollama/LM Studio）只在操作者显式 pin 时
-// 才可当引擎 —— auto 绝不提名 loopback（服务没开就会让每次贴图失败）。
-func (e Engine) Loopback() bool { return e.Local }
 
 // SupportsImage 按 inputModalities 声明判定。
 func SupportsImage(modalities []string) bool {
@@ -46,81 +40,18 @@ func RankVisionEngines(engines []Engine) []Engine {
 	return ranked
 }
 
-// ResolveEngines 解析读图引擎列表：操作者 pin 优先；auto 只从
-// candidates 排名里取第一个非 loopback；pin 失效时——
-//   - 操作者显式 pin 的失效是操作者可见的问题（返回空表），
-//   - 默认引擎失效（无人选择过）静默落到排名首位。
-//
-// Router 只选一个引擎，不对同一图片自动切换 provider；失败由 Codex
-// 决定是否重试或改选模型。
+// ResolveEngines 解析读图引擎：候选按优先级排序取首位。引擎固定为
+// native（调用方的 ChatGPT 会话）—— 读图不消耗任何付费 provider
+// 配额，也不做同步凭据探测。桥关闭或无候选返回空表。
 func ResolveEngines(candidates []Engine, settings Settings, configured bool) []Engine {
 	if !settings.EffectiveEnabled(configured) {
 		return nil
 	}
-	if settings.Engine == LocalEngineSlug {
-		return []Engine{localEngine(settings)}
-	}
 	ranked := RankVisionEngines(candidates)
-	var primary *Engine
-	if settings.Engine != "" {
-		for i := range ranked {
-			if ranked[i].Slug == settings.Engine {
-				primary = &ranked[i]
-				break
-			}
-		}
-		if primary == nil && !settings.Defaulted {
-			return nil // 显式 pin 失效：操作者可见，不静默换模型
-		}
-	}
-	if primary == nil {
-		for i := range ranked {
-			if !ranked[i].Loopback() {
-				primary = &ranked[i]
-				break
-			}
-		}
-	}
-	if primary == nil {
+	if len(ranked) == 0 {
 		return nil
 	}
-	return []Engine{*primary}
-}
-
-// localEngine 由 pin 设置构造本地引擎（无凭据直连 Ollama 兼容端点）。
-func localEngine(settings Settings) Engine {
-	baseURL := settings.LocalBaseURL
-	if baseURL == "" {
-		baseURL = DefaultLocalVisionBaseURL
-	}
-	model := settings.LocalModel
-	if model == "" {
-		model = DefaultLocalVisionModel
-	}
-	return Engine{
-		Slug:         LocalEngineSlug,
-		DisplayName:  "local (" + model + ")",
-		GatewayModel: model,
-		Local:        true,
-		ImageCapable: true,
-		Priority:     999,
-	}
-}
-
-// LocalBaseURLOf 从 settings 解出本地端点。
-func LocalBaseURLOf(settings Settings) string {
-	if settings.LocalBaseURL != "" {
-		return settings.LocalBaseURL
-	}
-	return DefaultLocalVisionBaseURL
-}
-
-// LocalModelOf 从 settings 解出本地模型。
-func LocalModelOf(settings Settings) string {
-	if settings.LocalModel != "" {
-		return settings.LocalModel
-	}
-	return DefaultLocalVisionModel
+	return []Engine{ranked[0]}
 }
 
 // NativeEnginesFromCatalogFile 从 merged-models.json 提取 listed 的

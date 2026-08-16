@@ -132,8 +132,6 @@ func cmdControl(args []string) error {
 		return controlProbe(st, reg, rest[1:])
 	case len(rest) >= 1 && rest[0] == "vision-bridge":
 		return controlVisionBridge(*stateDir, reg, rest[1:])
-	case len(rest) >= 1 && rest[0] == "local-runtime":
-		return controlLocalRuntime(*stateDir, rest[1:])
 	case len(rest) >= 3 && rest[0] == "presence" && rest[1] == "set":
 		if err := state.SetPresenceMode(st.Dir, rest[2]); err != nil {
 			return err
@@ -173,9 +171,7 @@ func controlUsage() {
   control presence set always|follow-codex
   control account --json | control provider-usage --json
   control probe PROVIDER [MODEL]           upstream behavior probe (models/args-visibility/usage accounting)
-  control vision-bridge on|off | status | engine <slug|local|auto> [effort] | effort <level|default> | local <tag>
-  control vision-bridge pull TAG | pull-status | benchmark [TAG] | catalog
-  control local-runtime status|start|stop
+  control vision-bridge on|off | status | effort <level|default>
 `)
 }
 
