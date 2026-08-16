@@ -114,6 +114,14 @@ func (t *ChatToResponsesSSE) HasContent() bool {
 	return false
 }
 
+// HasToolCalls 报告本流是否出现过任何 tool call item（含未完成）。
+// failLiveStream 在"头已提交 + 中途断流"时据此分流：已有工具调用则
+// 以 response.failed 显式收尾（客户端整轮重试会重复执行工具，副作用
+// 风险不可接受）；纯文本流维持静默截断（重试重建文本无副作用）。
+func (t *ChatToResponsesSSE) HasToolCalls() bool {
+	return len(t.functionCall) > 0
+}
+
 // OutputBuffer 累积 Feed 产出的完整 SSE 块（守卫模式：
 // 选完尝试再整段写出，写流阶段复用同一缓冲）。
 type OutputBuffer struct {

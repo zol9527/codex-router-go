@@ -54,6 +54,51 @@ var entitlementPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)no api access`),
 }
 
+// contextOverflowPatterns 识别上游"输入超窗"错误的各家措辞。
+// 思想来源：opencode v2 packages/llm/src/provider-error.ts 的
+// isContextOverflow 模式库（28 条正则 + 限流排除项，防把限流文案
+// 误判为超窗）——正则集合按本 router 实际触达的供应商措辞整理：
+// OpenAI "context_length_exceeded"、Anthropic "prompt is too long"、
+// Google/DeepSeek "maximum context length"、MiniMax/Z.ai 中英混排。
+// 命中后错误规范化为 OpenAI 官方 code（context_length_exceeded），
+// Codex 客户端对该 code 有本地化处置（提示压缩会话）。
+var contextOverflowPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)context[_\s-]?length[_\s-]?(?:exceeded|is too long)`),
+	regexp.MustCompile(`(?i)context[_\s-]?window.{0,40}(?:exceed|too (?:long|large)|surpass)`),
+	regexp.MustCompile(`(?i)maximum context (?:length|size|window)`),
+	regexp.MustCompile(`(?i)prompt is too long`),
+	regexp.MustCompile(`(?i)(?:input|prompt|request).{0,30}(?:exceeds?|larger than).{0,30}(?:maximum|limit|context|token|window|allowed)`),
+	regexp.MustCompile(`(?i)too many (?:input |total |prompt )?tokens`),
+	regexp.MustCompile(`(?i)(?:input|prompt)[_\s]?tokens?.{0,25}(?:limit|exceed|max)`),
+	regexp.MustCompile(`(?i)exceeds? the (?:maximum|model's|context|token|input)`),
+	regexp.MustCompile(`(?i)reduce (?:the )?(?:prompt|input|length|context|message)`),
+	regexp.MustCompile(`(?i)上下文.{0,12}(?:过长|超出|超限|超过)|超过.{0,12}(?:上下文|长度限制)|(?:输入|提示词).{0,10}过长`),
+	regexp.MustCompile(`(?i)最长.{0,8}输入|token.{0,6}上限`),
+}
+
+// overflowExclusions 是超窗判定的排除项：这些文案命中时是限流而非
+// 超窗（部分厂商的限流错误也带 "tokens" 字样，如 RPM/TPM 限制）。
+var overflowExclusions = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)rate.?limit`),
+	regexp.MustCompile(`(?i)too many requests`),
+	regexp.MustCompile(`(?i)(?:requests per minute|rpm|tokens per minute|tpm)`),
+}
+
+// classifyContextOverflow 判定错误文本是否为输入超窗（先排除限流）。
+func classifyContextOverflow(detail string) bool {
+	for _, pattern := range overflowExclusions {
+		if pattern.MatchString(detail) {
+			return false
+		}
+	}
+	for _, pattern := range contextOverflowPatterns {
+		if pattern.MatchString(detail) {
+			return true
+		}
+	}
+	return false
+}
+
 // parseUpstreamError 从各种 provider 错误形状里挖出人类可读消息。
 func parseUpstreamError(bodyText string) (message string, errType string) {
 	var parsed map[string]any
@@ -140,6 +185,12 @@ func classifyQuota(detail string) string {
 func translateProviderError(status int, bodyText, modelName, providerName, providerID string, retryAfter int) map[string]any {
 	detail := extractUpstreamDetail(bodyText)
 	code := classifyQuota(detail)
+	if code == "" && classifyContextOverflow(detail) {
+		// 超窗规范化为 OpenAI 官方 code：Codex 对 context_length_
+		// exceeded 有本地化处置（提示压缩会话），泛化的
+		// provider_api_error_400 会被当作普通上游错误展示。
+		code = "context_length_exceeded"
+	}
 	if code == "" {
 		code = fmt.Sprintf("provider_api_error_%d", status)
 	}
@@ -149,6 +200,8 @@ func translateProviderError(status int, bodyText, modelName, providerName, provi
 		guidance = " The provider's usage limit is exhausted; top up or wait for the window to reset."
 	case "plan_entitlement_required":
 		guidance = " The current plan does not include API access; no key or setup change can fix this."
+	case "context_length_exceeded":
+		guidance = " The conversation exceeds the model's context window; compact the session (/compact) or trim history before retrying."
 	case "provider_api_error_401", "provider_api_error_403":
 		guidance = " Check the provider credential (codex-router control credential " + providerID + ")."
 	}

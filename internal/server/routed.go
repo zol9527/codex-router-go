@@ -573,7 +573,7 @@ func (s *Server) serveRouted(w http.ResponseWriter, r *http.Request,
 				ToolResultsSpilled: spillStats.ToolResultsSpilled, ToolResultBytesSaved: spillStats.ToolResultBytesSaved})
 			return
 		}
-		s.failLiveStream(w, provider, model, firstErr, relay, started, usage.Event{
+		s.failLiveStream(w, provider, model, firstErr, relay, first.translator, started, usage.Event{
 			Retries:              attemptRetries(first),
 			ToolResultsSpilled:   spillStats.ToolResultsSpilled,
 			ToolResultBytesSaved: spillStats.ToolResultBytesSaved,
@@ -702,11 +702,14 @@ func attemptRetries(outcome *attemptOutcome) int {
 // failLiveStream 处理传输/看门狗类失败的收尾（响应从未给过结论）：
 //   - 头未提交：回 JSON 状态 —— 空闲看门狗 504（Codex 对 5xx 自带
 //     重试接管），其余传输失败 502；
-//   - 头已提交（liveness 后中断）：绝不能再 writeJSON —— 那会触发
-//     superfluous WriteHeader 并把 JSON 追加进 SSE 流。只截断返回，
-//     Codex 按既有语义整轮重试。
+//   - 头已提交且流中出现工具调用：写 response.failed 显式收尾。
+//     静默截断会让 Codex 整轮重试，重试将重复执行已流出的工具调用
+//     （apply_patch/exec 皆是副作用）——对齐 opencode v2 的立场
+//     "已经开始输出的 turn 不重放"，副作用风险优先于自动恢复；
+//   - 头已提交且纯文本流：维持静默截断（重试重建文本无副作用，
+//     保留 Codex 的自动重试恢复路径）。
 func (s *Server) failLiveStream(w http.ResponseWriter, provider *registry.Provider, model *registry.Model,
-	err error, relay *streamRelay, started time.Time, base usage.Event) {
+	err error, relay *streamRelay, translator wire.StreamTranslator, started time.Time, base usage.Event) {
 
 	idle := errors.Is(err, httpx.ErrUpstreamIdle)
 	status := http.StatusBadGateway
@@ -720,8 +723,14 @@ func (s *Server) failLiveStream(w http.ResponseWriter, provider *registry.Provid
 
 	if relay != nil && (relay.headersWritten() || relay.writeErr != nil) {
 		base.StreamAborted = true
-		logf("model=%s provider=%s status=%d duration_ms=%d stream_truncated=true upstream_idle=%v err=%v",
-			model.Slug, provider.ID, status, base.DurationMs, idle, err)
+		if translator != nil && translator.HasToolCalls() {
+			io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"stream_interrupted_after_tool_call\",\"message\":\"The upstream stream died after tool calls had already been delivered. The router closed it with an explicit failure instead of letting the client retry the whole turn, because a retry would re-execute those tool calls.\"}}}\n\n")
+			if flusher, canFlush := w.(http.Flusher); canFlush {
+				flusher.Flush()
+			}
+		}
+		logf("model=%s provider=%s status=%d duration_ms=%d stream_truncated=true upstream_idle=%v tool_calls=%v err=%v",
+			model.Slug, provider.ID, status, base.DurationMs, idle, translator != nil && translator.HasToolCalls(), err)
 		s.recordTurn(base)
 		return
 	}

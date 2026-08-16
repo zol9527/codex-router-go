@@ -55,6 +55,10 @@ type StreamTranslator interface {
 	Created() []byte
 	Feed(data string) []byte
 	HasContent() bool
+	// HasToolCalls 报告本流是否出现过任何 tool call item（含未完成）。
+	// 中途断流时调用方据此判定副作用风险：客户端整轮重试会重复执行
+	// 已见过的工具调用，此时必须以 response.failed 收尾而非静默截断。
+	HasToolCalls() bool
 	PromptTokens() int64
 	OutputTokens() int64
 	TotalTokens() int64
