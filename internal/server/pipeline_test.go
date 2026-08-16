@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/loyd/codex-router/internal/spill"
 	"github.com/loyd/codex-router/internal/usage"
 )
 
@@ -229,8 +230,9 @@ func TestErrorTranslationClassification(t *testing.T) {
 	}
 }
 
-// aging：大工具结果在模型行动之后被截断，frontier 保留。
-func TestAgingInPipeline(t *testing.T) {
+// spill：超阈值工具结果首过境即截断（内容判定，与位置无关），回执带
+// 落盘路径；小结果逐字节保留。
+func TestSpillInPipeline(t *testing.T) {
 	// JSON 字符串内的换行必须转义（裸换行是非法 JSON）。
 	bigOutput := strings.ReplaceAll(strings.Repeat("result-line\n", 5000), "\n", "\\n") // ~55KB
 	var upstreamInput map[string]any
@@ -248,15 +250,15 @@ func TestAgingInPipeline(t *testing.T) {
 	t.Setenv("ZAI_API_KEY", "")
 	callerKey, _ := srv.opt.State.CallerKey()
 
-	// 6 个 tool result：最新 4 个是 frontier（逐字节保留），
-	// 最老的两个里，大文本的那个会被换成回执。
+	// 6 个 tool result：判定只看内容 —— 最新的大结果同样被截，
+	// 所有小结果逐字节保留。
 	var items []string
 	for i := 1; i <= 6; i++ {
 		items = append(items,
 			fmt.Sprintf(`{"type":"function_call","call_id":"c%d","name":"shell","arguments":"{}"}`, i),
 			fmt.Sprintf(`{"type":"function_call_output","call_id":"c%d","output":"small-%d"}`, i, i))
 	}
-	// 第 1 个结果换成大文本（老 + 大 → aging 目标）。
+	// 第 1 个结果换成大文本（≥32KB → spill 目标，无论新旧）。
 	items[1] = fmt.Sprintf(`{"type":"function_call_output","call_id":"c1","output":"%s"}`, bigOutput)
 	items = append(items, `{"type":"message","role":"user","content":[{"type":"input_text","text":"go"}]}`)
 	reqBody := fmt.Sprintf(`{"model":"zai-coding/glm-5.3","input":[%s],"stream":true}`,
@@ -282,13 +284,25 @@ func TestAgingInPipeline(t *testing.T) {
 	if len(toolContents) != 6 {
 		t.Fatalf("expected 6 tool results, got %d", len(toolContents))
 	}
-	// 最老的大结果被截断（回执 + 预览）。
-	if !strings.Contains(toolContents[0], "Older tool result compacted") {
-		t.Errorf("old large result should be aged, got %.80s", toolContents[0])
+	// 超阈值的大结果换成回执：截断声明 + 落盘路径。
+	if !strings.Contains(toolContents[0], "truncated by Model Router on first transit") {
+		t.Errorf("oversized result should be spilled, got %.80s", toolContents[0])
 	}
-	// frontier 内的小结果逐字节保留。
-	if toolContents[5] != "small-6" {
-		t.Errorf("frontier result must stay byte-for-byte, got %q", toolContents[5])
+	if !strings.Contains(toolContents[0], srv.opt.State.Dir+string(os.PathSeparator)+spill.DirName) {
+		t.Errorf("receipt must point into the spill dir, got %.120s", toolContents[0])
+	}
+	// 全部小结果逐字节保留。
+	for i := 1; i <= 5; i++ {
+		if toolContents[i] != fmt.Sprintf("small-%d", i+1) {
+			t.Errorf("small result %d must stay byte-for-byte, got %q", i+1, toolContents[i])
+		}
+	}
+	// 回执指向的落盘文件真实存在。
+	pathIdx := strings.Index(toolContents[0], "Full output saved to: ")
+	spillPath := toolContents[0][pathIdx+len("Full output saved to: "):]
+	spillPath = spillPath[:strings.IndexByte(spillPath, '\n')]
+	if _, err := os.Stat(spillPath); err != nil {
+		t.Errorf("spill file must exist: %v", err)
 	}
 }
 

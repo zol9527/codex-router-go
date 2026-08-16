@@ -59,8 +59,8 @@ func (s *Server) handleRoutedCompaction(w http.ResponseWriter, r *http.Request,
 
 	// 请求构造：整段对话 + 压缩指令，非流式、无工具。
 	// 压缩重放协作条目，agent 载荷解析与普通回合相同（缓存按密文键，
-	// 已解析过的会话零额外成本）；aging 亦与普通回合一致。
-	aging := translate.AgingStats{}
+	// 已解析过的会话零额外成本）；spill 亦与普通回合一致 —— 摘要器
+	// 不需要旧工具输出的中段，回执足够。
 	compactionPayload := map[string]any{}
 	for k, v := range payload {
 		compactionPayload[k] = v
@@ -71,20 +71,17 @@ func (s *Server) handleRoutedCompaction(w http.ResponseWriter, r *http.Request,
 	// 压缩重放整段对话，任何残留图片同样要在到达文本模型前被读掉
 	//（证据已由贴图回合缓存，这里多半免费）。
 	s.bridgeVision(w, r, compactionPayload, model)
+	spillStats := s.applySpill(compactionPayload)
 	if input, ok := compactionPayload["input"].([]any); ok {
-		if aged, stats := translate.AgeToolResults(input); true {
-			_ = aged
-			aging = stats
-			// v1 压缩保留链式结构、v2 过滤触发标记后重放。
-			filtered := make([]any, 0, len(input))
-			for _, raw := range input {
-				if item, ok := raw.(map[string]any); ok && item["type"] == "compaction_trigger" {
-					continue
-				}
-				filtered = append(filtered, raw)
+		// v1 压缩保留链式结构、v2 过滤触发标记后重放。
+		filtered := make([]any, 0, len(input))
+		for _, raw := range input {
+			if item, ok := raw.(map[string]any); ok && item["type"] == "compaction_trigger" {
+				continue
 			}
-			compactionPayload["input"] = append(filtered, userMessageItem(compactPrompt))
+			filtered = append(filtered, raw)
 		}
+		compactionPayload["input"] = append(filtered, userMessageItem(compactPrompt))
 	} else {
 		compactionPayload["input"] = []any{userMessageItem(compactPrompt)}
 	}
@@ -126,8 +123,8 @@ func (s *Server) handleRoutedCompaction(w http.ResponseWriter, r *http.Request,
 		writeJSON(w, http.StatusBadGateway, errBody("provider_api_proxy_error",
 			"The API-provider forwarder could not complete the request."))
 		s.recordTurn(usage.Event{Model: model.Slug, Provider: providerID, Status: 502,
-			DurationMs:      time.Since(started).Milliseconds(),
-			ToolResultsAged: aging.ToolResultsAged, ToolResultBytesSaved: aging.ToolResultBytesSaved})
+			DurationMs:         time.Since(started).Milliseconds(),
+			ToolResultsSpilled: spillStats.ToolResultsSpilled, ToolResultBytesSaved: spillStats.ToolResultBytesSaved})
 		return
 	}
 	defer resp.Body.Close()
@@ -172,7 +169,7 @@ func (s *Server) handleRoutedCompaction(w http.ResponseWriter, r *http.Request,
 		s.recordTurn(usage.Event{Model: model.Slug, Provider: providerID, Status: 200,
 			DurationMs:  time.Since(started).Milliseconds(),
 			InputTokens: usageTokens.prompt, OutputTokens: usageTokens.completion,
-			ToolResultsAged: aging.ToolResultsAged, ToolResultBytesSaved: aging.ToolResultBytesSaved})
+			ToolResultsSpilled: spillStats.ToolResultsSpilled, ToolResultBytesSaved: spillStats.ToolResultBytesSaved})
 		return
 	}
 
@@ -190,7 +187,7 @@ func (s *Server) handleRoutedCompaction(w http.ResponseWriter, r *http.Request,
 	s.recordTurn(usage.Event{Model: model.Slug, Provider: providerID, Status: 200,
 		DurationMs:  time.Since(started).Milliseconds(),
 		InputTokens: usageTokens.prompt, OutputTokens: usageTokens.completion,
-		ToolResultsAged: aging.ToolResultsAged, ToolResultBytesSaved: aging.ToolResultBytesSaved})
+		ToolResultsSpilled: spillStats.ToolResultsSpilled, ToolResultBytesSaved: spillStats.ToolResultBytesSaved})
 }
 
 // userMessageItem 构造一个 user 文本消息 item。

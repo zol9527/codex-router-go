@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,8 +16,8 @@ import (
 
 	"github.com/loyd/codex-router/internal/cred"
 	"github.com/loyd/codex-router/internal/registry"
+	"github.com/loyd/codex-router/internal/spill"
 	"github.com/loyd/codex-router/internal/state"
-	"github.com/loyd/codex-router/internal/translate"
 	"github.com/loyd/codex-router/internal/usage"
 )
 
@@ -57,9 +58,6 @@ type Server struct {
 	lastModel    string
 	lastSession  string
 	errorUntil   time.Time
-
-	agingMu   sync.Mutex
-	lastAging translate.AgingStats
 }
 
 type activityEntry struct {
@@ -93,6 +91,8 @@ func New(opt Options) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	// spill 落盘文件的保留期清理（启动即清一次，之后每小时）。
+	spill.StartJanitor(filepath.Join(opt.State.Dir, spill.DirName))
 	return &Server{
 		opt:       opt,
 		callerKey: callerKey,

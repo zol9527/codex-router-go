@@ -2,7 +2,7 @@ package server
 
 // vision bridge 的 server 集成：引擎候选装配（registry 视觉模型 +
 // native GPT + 本地 Ollama）、三路 DescribeCaller、请求管线的图片
-// 替换。图片替换发生在协作解密之后、aging 之前。
+// 替换。图片替换发生在协作解密之后、spill 之前。
 
 import (
 	"context"
@@ -345,7 +345,7 @@ func parseNativeTranscriptStream(payload []byte) (string, error) {
 }
 
 // parseNativeTranscript 从 native /responses 响应对象提取文本
-//（completed 事件的 response 兜底路径）。
+// （completed 事件的 response 兜底路径）。
 func parseNativeTranscript(payload []byte) (string, error) {
 	var parsed struct {
 		Output []struct {

@@ -30,7 +30,7 @@ type Event struct {
 	StreamAborted          bool   `json:"streamAborted,omitempty"`
 	EmptyCompletion        bool   `json:"emptyCompletion,omitempty"`
 	EmptyCompletionRetried bool   `json:"emptyCompletionRetried,omitempty"`
-	ToolResultsAged        int    `json:"toolResultsAged,omitempty"`
+	ToolResultsSpilled     int    `json:"toolResultsSpilled,omitempty"`
 	ToolResultBytesSaved   int64  `json:"toolResultBytesSaved,omitempty"`
 }
 
@@ -50,7 +50,7 @@ func (r *Recorder) Path() string { return r.path }
 
 // usageRotateBytes 是 usage-events.jsonl 的轮转阈值。Recorder 每次
 // 写入都重新打开文件，重命名发生在两次打开之间是安全的；单代归档
-//（.1 覆盖旧的 .1）。provider-usage 聚合在文件缺失时返回空视图，
+// （.1 覆盖旧的 .1）。provider-usage 聚合在文件缺失时返回空视图，
 // 轮转瞬间不丢正确性。可变以供测试缩小。
 var usageRotateBytes int64 = 8 << 20
 

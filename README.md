@@ -99,7 +99,7 @@ control config init                     生成注释模板
 control reload                          重读配置+刷新 catalog，不重启
 control subagents status|mode|select-all|unselect-all|set|provider
 control picker set <slug> show|hide | provider <id> | all | status
-control tool-result-aging status|on|off
+control tool-result-spill status|on|off|max-bytes <bytes>
 control presence set always|follow-codex
 control account --json | provider-usage --json    配额与用量
 control vision-bridge on|off | status | engine <slug|local|auto> [effort] | effort <level|default> | local <tag>
@@ -113,7 +113,7 @@ control local-runtime status|start|stop
 |---|---|
 | 空补全守卫 | 上游 200 但零 token：按住不发头→同字节静默重试→仍空则如实报错 |
 | Prompt-token 补零 | 上游报 `input_tokens: 0` 时以偏高估算替换，防 Codex 永不压缩上下文 |
-| Tool-result aging | 重发历史时老化巨大的旧工具结果 |
+| Tool-result spill | 超阈值工具结果首过境截断：全文内容寻址落盘+回执带路径，判定是内容纯函数，前缀缓存永不翻转（取代旧 aging） |
 | Namespace 拍平 | Codex 的 `<ns>__<tool>` 展开为真工具，响应精确映射回 |
 | Compaction v1/v2 | 80KB 尾部摘要 / kcr1 base64 压缩 |
 | Subagent relay | Fernet 密文检测，外部模型的子代理载荷经原生端点中继 |

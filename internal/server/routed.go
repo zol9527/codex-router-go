@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -17,6 +18,7 @@ import (
 
 	"github.com/loyd/codex-router/internal/httpx"
 	"github.com/loyd/codex-router/internal/registry"
+	"github.com/loyd/codex-router/internal/spill"
 	"github.com/loyd/codex-router/internal/translate"
 	"github.com/loyd/codex-router/internal/usage"
 	"github.com/loyd/codex-router/internal/wire"
@@ -98,7 +100,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request, route s
 	}
 
 	// 全部路由流量经协议抽象层：provider 声明协议（chat 翻译 / Responses
-	// 直通 / 未来新增），server 管线（守卫、aging、namespace、计量）
+	// 直通 / 未来新增），server 管线（守卫、spill、namespace、计量）
 	// 协议无关。
 	s.serveRouted(w, r, payload, routeModel, provider, credential, started)
 }
@@ -326,22 +328,49 @@ func (s *Server) runChatAttempt(ctx context.Context, target string, headers map[
 	}
 }
 
+// applySpill 对 payload["input"] 执行首过境确定性截断（见 internal/spill），
+// 返回本轮统计（未启用/无 input = 零值）。开关与阈值逐请求读状态文件，
+// 改完下一回合即生效；统计只在"实际发生截断"的回合累计落盘。
+func (s *Server) applySpill(payload map[string]any) spill.Stats {
+	enabled, maxBytes, _ := state.ReadToolResultSpill(s.opt.State.Dir)
+	if !enabled {
+		return spill.Stats{}
+	}
+	input, ok := payload["input"].([]any)
+	if !ok {
+		return spill.Stats{}
+	}
+	spilled, stats, err := spill.Process(input, spill.Options{
+		Dir:      filepath.Join(s.opt.State.Dir, spill.DirName),
+		MaxBytes: maxBytes,
+	})
+	if err != nil {
+		// 部分条目落盘失败：失败的保留原文，其余已截断 —— 请求照常
+		// 进行，只在日志里留痕（写盘恢复后回到一致的回执）。
+		logf("spill: %v (failed items keep their original output this turn)", err)
+	}
+	payload["input"] = spilled
+	if stats.ToolResultsSpilled > 0 {
+		state.RecordSpillStats(s.opt.State.Dir, state.SpillStats{
+			ResultsSpilled:       stats.ToolResultsSpilled,
+			BytesSaved:           stats.ToolResultBytesSaved,
+			EstimatedTokensSaved: stats.ToolResultBytesSaved / 4,
+		})
+	}
+	return stats
+}
+
 // serveChatTranslation：翻译请求发往 chat 上游，把上游 SSE 增量
 // 重组成 Responses 事件流写给 Codex。
 //
-// 管线：tool-result aging（请求方向）→ 翻译 → 上游 → 空补全守卫
-// （整流判定 + 同字节隐形重试一次）→ prompt-token 补零替换
-// （completed 事件内，只落在显式零上）→ usage 计量。
+// 管线：tool-result spill（请求方向，首过境确定性截断）→ 翻译 →
+// 上游 → 空补全守卫（整流判定 + 同字节隐形重试一次）→ prompt-token
+// 补零替换（completed 事件内，只落在显式零上）→ usage 计量。
 func (s *Server) serveRouted(w http.ResponseWriter, r *http.Request,
 	payload map[string]any, model *registry.Model, provider *registry.Provider,
 	credential string, started time.Time) {
 
 	providerID := s.registry().CanonicalProviderID(provider.ID)
-	setAging := func(stats translate.AgingStats) {
-		s.agingMu.Lock()
-		s.lastAging = stats
-		s.agingMu.Unlock()
-	}
 
 	// 协作载荷解密：collab 的 encrypted_content 外部模型读不了，
 	// 先换成明文（native 密文走中继，外部明文直接用，均带缓存）。
@@ -353,25 +382,10 @@ func (s *Server) serveRouted(w http.ResponseWriter, r *http.Request,
 	//（无图 / 桥关 / 无引擎零成本直通；失败降级为 stated failure）。
 	s.bridgeVision(w, r, payload, model)
 
-	// 请求方向 aging：老的大工具结果换回执，最新 frontier 逐字节保留。
-	// 开关读状态文件（与凭证同一模式：改文件即时生效，无需重启）；
-	// 统计只在"实际发生了老化"的回合累计落盘 —— 零老化回合不写盘。
-	aging := translate.AgingStats{}
-	if enabled, _ := state.ReadToolResultAging(s.opt.State.Dir); enabled {
-		if input, ok := payload["input"].([]any); ok {
-			aged, stats := translate.AgeToolResults(input)
-			payload["input"] = aged
-			aging = stats
-			if stats.ToolResultsAged > 0 {
-				state.RecordAgingStats(s.opt.State.Dir, state.AgingStats{
-					ResultsAged:          stats.ToolResultsAged,
-					BytesSaved:           stats.ToolResultBytesSaved,
-					EstimatedTokensSaved: stats.ToolResultBytesSaved / 4,
-				})
-			}
-		}
-	}
-	setAging(aging)
+	// 请求方向 spill：超阈值的工具结果落盘+回执。判定是内容的纯函数，
+	// 同一内容任何请求产出逐字节相同的回执 —— 前缀缓存永不翻转
+	//（旧 aging 的 frontier 滚动会在 turn 内/跨 turn 改写历史）。
+	spillStats := s.applySpill(payload)
 
 	// codex app 工具合并：客户端只发精简 codex_app namespace，快照补全
 	// deferLoading 推迟的部分，让路由模型看到与原生模型相同的工具集。
@@ -500,7 +514,7 @@ func (s *Server) serveRouted(w http.ResponseWriter, r *http.Request,
 			InputTokens: inputTokens, OutputTokens: outputTokens,
 			TotalTokens:          totalTokens,
 			EstimatedInputTokens: int64(substituted),
-			ToolResultsAged:      aging.ToolResultsAged, ToolResultBytesSaved: aging.ToolResultBytesSaved,
+			ToolResultsSpilled:   spillStats.ToolResultsSpilled, ToolResultBytesSaved: spillStats.ToolResultBytesSaved,
 		})
 		return
 	}
@@ -522,7 +536,7 @@ func (s *Server) serveRouted(w http.ResponseWriter, r *http.Request,
 			s.writeUpstreamError(w, provider, model, failure)
 			s.recordTurn(usage.Event{Model: model.Slug, Provider: providerID,
 				Status: failure.status, DurationMs: time.Since(started).Milliseconds(),
-				ToolResultsAged: aging.ToolResultsAged, ToolResultBytesSaved: aging.ToolResultBytesSaved})
+				ToolResultsSpilled: spillStats.ToolResultsSpilled, ToolResultBytesSaved: spillStats.ToolResultBytesSaved})
 			return
 		}
 		writeJSON(w, http.StatusBadGateway, errBody("provider_api_proxy_error",
@@ -555,7 +569,7 @@ func (s *Server) serveRouted(w http.ResponseWriter, r *http.Request,
 					s.recordTurn(usage.Event{Model: model.Slug, Provider: providerID,
 						Status: failure.status, DurationMs: time.Since(started).Milliseconds(),
 						EmptyCompletion: true, EmptyCompletionRetried: true,
-						ToolResultsAged: aging.ToolResultsAged, ToolResultBytesSaved: aging.ToolResultBytesSaved})
+						ToolResultsSpilled: spillStats.ToolResultsSpilled, ToolResultBytesSaved: spillStats.ToolResultBytesSaved})
 					return
 				}
 				writeJSON(w, http.StatusBadGateway, errBody("empty_completion_retry_failed",
@@ -606,7 +620,7 @@ func (s *Server) serveRouted(w http.ResponseWriter, r *http.Request,
 		OutputTokens:         chosen.translator.OutputTokens(),
 		TotalTokens:          chosen.translator.TotalTokens(),
 		EstimatedInputTokens: int64(chosen.translator.SubstitutedInputTokens()),
-		ToolResultsAged:      aging.ToolResultsAged, ToolResultBytesSaved: aging.ToolResultBytesSaved,
+		ToolResultsSpilled:   spillStats.ToolResultsSpilled, ToolResultBytesSaved: spillStats.ToolResultBytesSaved,
 		EmptyCompletion: emptyCompletion, EmptyCompletionRetried: emptyRetried,
 		StreamAborted: unrepairable && false,
 	})

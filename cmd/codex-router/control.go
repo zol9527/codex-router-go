@@ -120,8 +120,8 @@ func cmdControl(args []string) error {
 		return controlSubagents(st, reg, rest[1:])
 	case len(rest) >= 1 && rest[0] == "picker":
 		return controlPicker(st, reg, rest[1:])
-	case len(rest) >= 1 && rest[0] == "tool-result-aging":
-		return controlToolResultAging(st, rest[1:])
+	case len(rest) >= 1 && rest[0] == "tool-result-spill":
+		return controlToolResultSpill(st, rest[1:])
 	case len(rest) >= 1 && rest[0] == "models":
 		return controlModels(st, reg, rest[1:])
 	case len(rest) >= 1 && rest[0] == "reload":
@@ -169,7 +169,7 @@ func controlUsage() {
   control reload                          re-read config + refresh catalog, no restart
   control subagents status|mode <m>|select-all|unselect-all|declare <slug>|undeclare <slug>|set <slug> on|off|provider <id> on|off
   control picker set <slug> show|hide | provider <id> show|hide | all show|hide | status
-  control tool-result-aging status|on|off
+  control tool-result-spill status|on|off|max-bytes <bytes>
   control models sync [PROVIDER]|list|remove <slug>|add PROVIDER <upstream-id>
   control presence set always|follow-codex
   control account --json | control provider-usage --json
@@ -276,7 +276,7 @@ func controlJSON(st *state.State, reg *registry.Registry) error {
 		"modelSettings": map[string]any{
 			"subagents":       state.SubagentSettingsSnapshot(st.Dir),
 			"picker":          state.PickerSnapshot(st.Dir),
-			"toolResultAging": state.ToolResultAgingSnapshot(st.Dir),
+			"toolResultSpill": state.ToolResultSpillSnapshot(st.Dir),
 			// 视觉卡数据源：enabled/engine/effort/引擎列表/下载状态。
 			"visionBridge": visionBridgeSnapshot(st, reg),
 		},
@@ -788,24 +788,34 @@ func controlPicker(st *state.State, reg *registry.Registry, args []string) error
 	return printSnapshot()
 }
 
-// controlToolResultAging：老化开关面（App 设置页的开关走这里）。
-// 开关读的是状态文件、服务端逐请求读取 —— 改完下一回合即生效，
-// 无需重启服务。
-func controlToolResultAging(st *state.State, args []string) error {
-	action := "status"
-	if len(args) > 0 {
-		action = args[0]
-	}
-	switch action {
-	case "status":
-	case "on", "off":
-		if err := state.SetToolResultAgingEnabled(st.Dir, action == "on"); err != nil {
+// controlToolResultSpill：截断开关面（App 设置页的开关走这里）。
+// 开关与阈值读的是状态文件、服务端逐请求读取 —— 改完下一回合即生效，
+// 无需重启服务。max-bytes 调整截断阈值（下限 1024 字节）。
+func controlToolResultSpill(st *state.State, args []string) error {
+	if len(args) >= 2 && args[0] == "max-bytes" {
+		n, err := strconv.Atoi(args[1])
+		if err != nil {
+			return fmt.Errorf("usage: control tool-result-spill max-bytes <bytes>")
+		}
+		if err := state.SetToolResultSpillMaxBytes(st.Dir, n); err != nil {
 			return err
 		}
-	default:
-		return fmt.Errorf("usage: control tool-result-aging status|on|off")
+	} else {
+		action := "status"
+		if len(args) > 0 {
+			action = args[0]
+		}
+		switch action {
+		case "status":
+		case "on", "off":
+			if err := state.SetToolResultSpillEnabled(st.Dir, action == "on"); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("usage: control tool-result-spill status|on|off|max-bytes <bytes>")
+		}
 	}
-	raw, _ := json.MarshalIndent(state.ToolResultAgingSnapshot(st.Dir), "", "  ")
+	raw, _ := json.MarshalIndent(state.ToolResultSpillSnapshot(st.Dir), "", "  ")
 	fmt.Println(string(raw))
 	return nil
 }
