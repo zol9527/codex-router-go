@@ -52,6 +52,9 @@ func (s *Server) bridgeVision(w http.ResponseWriter, r *http.Request,
 		reader.Effort = settings.Effort
 	}
 	images := vision.CollectImages(input)
+	// 会话名是缓存的第一维键；无 X-Codex-Turn-Metadata 的客户端
+	// 由缓存自身判空跳过（不查不写，行为与无缓存时一致）。
+	session := sessionNameFromHeaders(r.Header)
 	evidence := map[string]vision.Evidence{}
 	failures := map[string]string{}
 	sem := make(chan struct{}, visionConcurrency)
@@ -59,6 +62,14 @@ func (s *Server) bridgeVision(w http.ResponseWriter, r *http.Request,
 	var mu sync.Mutex
 	for _, image := range images {
 		image := image
+		key := vision.ImageKey(image.DataURL)
+		// 缓存命中：零成本复用首次转写，不调引擎也不占读图并发额度
+		// （Codex 每轮重发历史图片，这里是重复读图的主要来源）。
+		if cached, ok := s.visionCache.Get(session, key); ok {
+			evidence[key] = cached
+			logf("vision cache hit session=%s image=%s", session, key)
+			continue
+		}
 		wg.Add(1)
 		sem <- struct{}{}
 		go func() {
@@ -68,12 +79,14 @@ func (s *Server) bridgeVision(w http.ResponseWriter, r *http.Request,
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {
-				failures[vision.ImageKey(image.DataURL)] = vision.FailureText(
+				failures[key] = vision.FailureText(
 					engines[0].DisplayName, err)
 				logf("vision read failed engine=%s error=%v", engines[0].Slug, err)
 				return
 			}
-			evidence[vision.ImageKey(image.DataURL)] = result
+			evidence[key] = result
+			// 只缓存成功结果：失败不进缓存，下轮还有机会重试。
+			s.visionCache.Put(session, key, result)
 		}()
 	}
 	wg.Wait()

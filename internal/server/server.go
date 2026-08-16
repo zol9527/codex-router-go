@@ -17,6 +17,7 @@ import (
 	"github.com/loyd/codex-router/internal/registry"
 	"github.com/loyd/codex-router/internal/state"
 	"github.com/loyd/codex-router/internal/usage"
+	"github.com/loyd/codex-router/internal/vision"
 )
 
 // CallerPathPrefix 与 Node 版一致：caller key 以 URL 路径形式出现。
@@ -72,6 +73,10 @@ type Server struct {
 	// 换指针 —— 请求路径只读，RWMutex 足够。
 	regMu sync.RWMutex
 	reg   *registry.Registry
+
+	// visionCache 是会话级读图缓存：Codex 每轮重发完整历史，同一
+	// (session, ImageKey) 只在首次调读图引擎（详见 vision 包注释）。
+	visionCache *vision.SessionCache
 
 	mu           sync.Mutex
 	active       map[int]*activityEntry
@@ -153,6 +158,7 @@ func New(opt Options) (*Server, error) {
 		upstreamIdle:   idleTimeout,
 		wsSilent:       wsSilent,
 		slowRequestLog: slowLog,
+		visionCache:    vision.NewSessionCache(vision.SessionCacheCapacity),
 		client: &http.Client{
 			// 上游思考型模型可能长时间不吐首字节 —— 但"永远不吐"必须
 			// fail-fast：响应头窗口由 ResponseHeaderTimeout 把关（计时
