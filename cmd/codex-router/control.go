@@ -130,6 +130,8 @@ func cmdControl(args []string) error {
 		return controlAccount(*stateDir, reg)
 	case len(rest) >= 1 && rest[0] == "provider-usage":
 		return controlProviderUsage(*stateDir, reg)
+	case len(rest) >= 1 && rest[0] == "probe":
+		return controlProbe(st, reg, rest[1:])
 	case len(rest) >= 1 && rest[0] == "vision-bridge":
 		return controlVisionBridge(*stateDir, reg, rest[1:])
 	case len(rest) >= 1 && rest[0] == "local-runtime":
@@ -173,6 +175,7 @@ func controlUsage() {
   control models sync [PROVIDER]|list|remove <slug>|add PROVIDER <upstream-id>
   control presence set always|follow-codex
   control account --json | control provider-usage --json
+  control probe PROVIDER [MODEL]           upstream behavior probe (models/args-visibility/usage accounting)
   control vision-bridge on|off | status | engine <slug|local|auto> [effort] | effort <level|default> | local <tag>
   control vision-bridge pull TAG | pull-status | benchmark [TAG] | catalog
   control local-runtime status|start|stop
