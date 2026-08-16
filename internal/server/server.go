@@ -51,6 +51,12 @@ type Options struct {
 	// 请求帧而上游此后零回帧超过该窗口 → 主动拆管（调用方重连自愈）。
 	// 跨 turn 空闲不拆。0 = 默认档；负值 = 关闭。
 	WSSilentTimeout time.Duration
+	// SlowRequestLogDelay 是慢请求可见性看门狗：请求在途超过该窗口
+	// 仍无收尾日志时补一行 `slow request pending`（只记录、不拆流）。
+	// 背景：2026-08-16 Surge fake-IP 把 TLS 握手黑洞，请求永久挂死且
+	// 零日志（完成/失败日志都只在收尾打），只能靠 /health 数僵尸定位。
+	// 0 = 默认档；负值 = 关闭。
+	SlowRequestLogDelay time.Duration
 }
 
 // Server 持有全部共享状态。
@@ -63,6 +69,8 @@ type Server struct {
 	upstreamIdle time.Duration
 	// wsSilent 是解析后的 WS 管道看门狗窗口（0=关闭）。
 	wsSilent time.Duration
+	// slowRequestLog 是解析后的慢请求日志窗口（0=关闭）。
+	slowRequestLog time.Duration
 	// reg 是当前生效的注册表；SIGUSR1 热重载（动态注册模型后）整体
 	// 换指针 —— 请求路径只读，RWMutex 足够。
 	regMu sync.RWMutex
@@ -110,6 +118,9 @@ const (
 	// DefaultWSSilentTimeout：上游 response.created 正常 ~1s 内到达，
 	// 60s 极保守 —— 触发即认定上游侧黑洞（见 wsWatchdog）。
 	DefaultWSSilentTimeout = 60 * time.Second
+	// DefaultSlowRequestLogDelay：健康长请求（GLM max effort + 大上下文）
+	// 约 90s 完成，120s 只记真正的悬挂、不误伤慢而正常的流。
+	DefaultSlowRequestLogDelay = 120 * time.Second
 )
 
 // resolveTimeout 把 Options 的三态（0=默认 / 负=关闭 / 正=指定）解析成
@@ -139,12 +150,14 @@ func New(opt Options) (*Server, error) {
 	headerTimeout := resolveTimeout(opt.UpstreamHeaderTimeout, DefaultUpstreamHeaderTimeout)
 	idleTimeout := resolveTimeout(opt.UpstreamIdleTimeout, DefaultUpstreamIdleTimeout)
 	wsSilent := resolveTimeout(opt.WSSilentTimeout, DefaultWSSilentTimeout)
+	slowLog := resolveTimeout(opt.SlowRequestLogDelay, DefaultSlowRequestLogDelay)
 	return &Server{
-		opt:          opt,
-		callerKey:    callerKey,
-		reg:          opt.Registry,
-		upstreamIdle: idleTimeout,
-		wsSilent:     wsSilent,
+		opt:            opt,
+		callerKey:      callerKey,
+		reg:            opt.Registry,
+		upstreamIdle:   idleTimeout,
+		wsSilent:       wsSilent,
+		slowRequestLog: slowLog,
 		client: &http.Client{
 			// 上游思考型模型可能长时间不吐首字节 —— 但"永远不吐"必须
 			// fail-fast：响应头窗口由 ResponseHeaderTimeout 把关（计时
@@ -157,6 +170,13 @@ func New(opt Options) (*Server, error) {
 					Timeout:   30 * time.Second,
 					KeepAlive: 30 * time.Second,
 				}).DialContext,
+				// TLS 握手窗口：经 Surge/Clash 类 TUN 代理时 TCP 在
+				// fake-IP 层秒连（拨号超时不触发），代理节点抖动会把
+				// TLS 握手黑洞成"连接 ESTABLISHED 但永不完成"——此处
+				// 不设超时则请求永久挂死且零日志（2026-08-16 commit
+				// 生成全挂事故：6 个僵尸请求只靠 /health 才数得出来）。
+				// 档位与拨号 30s 同类，固定值、不开 env。
+				TLSHandshakeTimeout:   15 * time.Second,
 				MaxIdleConns:          16,
 				MaxIdleConnsPerHost:   8,
 				IdleConnTimeout:       90 * time.Second,
@@ -317,6 +337,23 @@ func (s *Server) beginRequest() (setRoute func(provider, model, session string),
 	s.active[id] = entry
 	s.mu.Unlock()
 
+	// 慢请求看门狗：完成/失败日志都只在收尾打，挂死请求在 router.log
+	// 里零痕迹（见 SlowRequestLogDelay 的背景注释）。在途超过窗口补
+	// 一行可见性 —— 只记录、不拆流，真正的 fail-fast 由超时闸负责。
+	var watchdog *time.Timer
+	if s.slowRequestLog > 0 {
+		watchdog = time.AfterFunc(s.slowRequestLog, func() {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			if _, pending := s.active[id]; !pending {
+				return // 与 finish 赛跑落败：请求已收尾，不误报
+			}
+			logf("slow request pending id=%s provider=%s model=%s session=%s elapsed_ms=%d",
+				entry.id, entry.provider, entry.model, entry.sessionName,
+				time.Since(entry.startedAt).Milliseconds())
+		})
+	}
+
 	var once sync.Once
 	setRoute = func(provider, model, session string) {
 		if provider == "" {
@@ -337,6 +374,9 @@ func (s *Server) beginRequest() (setRoute func(provider, model, session string),
 	}
 	finish = func(status int) {
 		once.Do(func() {
+			if watchdog != nil {
+				watchdog.Stop()
+			}
 			s.mu.Lock()
 			defer s.mu.Unlock()
 			delete(s.active, id)

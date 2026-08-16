@@ -125,15 +125,18 @@ control local-runtime status|start|stop
 
 ## 上游超时与看门狗
 
-上游可能"接受请求后既不吐字节也不报错也不断开"（2026-08-16 两次实发黑洞：
-zai HTTP 流挂 8 分半、原生 WSS 管道零回帧 10 分钟）。路由器装了三道
-fail-fast 闸，把无限挂起变成可重试的快速失败（Codex 对 5xx 自带重试接管）：
+上游可能"接受请求后既不吐字节也不报错也不断开"（2026-08-16 三次实发黑洞：
+zai HTTP 流挂 8 分半、原生 WSS 管道零回帧 10 分钟、Surge fake-IP 把 TLS
+握手黑洞成连接永不成）。连接建立层装固定档闸（拨号 30s / TLS 握手 15s，
+不开 env），流式层装三道可调 fail-fast 闸，把无限挂起变成可重试的快速失败
+（Codex 对 5xx 自带重试接管）：
 
 | 闸 | 默认 | 语义 | 关闭 |
 |---|---|---|---|
 | 响应头超时 `CODEX_ROUTER_HEADER_TIMEOUT_SEC` | 300 | 上游多久不回响应头判死（502） | 设 `0` |
 | 流空闲看门狗 `CODEX_ROUTER_IDLE_TIMEOUT_SEC` | 180 | SSE 流上多久零字节判死：头未提交回 504 `upstream_idle_timeout`；已提交只截断（调用方整轮重试） | 设 `0` |
 | WS 静默看门狗 `CODEX_ROUTER_WS_SILENT_TIMEOUT_SEC` | 60 | 客户端发过请求帧而上游此后零回帧超窗口 → 主动拆管（跨 turn 空闲不拆） | 设 `0` |
+| 慢请求日志 `CODEX_ROUTER_SLOW_REQUEST_LOG_SEC` | 120 | 请求在途超窗口补一行 `slow request pending`（只记录、不拆流，收尾日志照常）—— 挂死请求不再零痕迹 | 设 `0` |
 
 失败一律落 `router.log`（含 model/provider/status/duration/错误摘要）与
 `usage-events.jsonl`（`upstreamIdle`/`streamAborted`/`retries` 字段）。

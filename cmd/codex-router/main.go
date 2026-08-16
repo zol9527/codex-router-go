@@ -128,12 +128,13 @@ func cmdServe(args []string) error {
 		DisableWebSocketPassthrough: os.Getenv("CODEX_WS_PASSTHROUGH") == "0",
 		Usage:                       usage.NewRecorder(st.Dir),
 		RateLimits:                  usage.NewRateLimitStore(st.Dir),
-		// 上游 fail-fast 三闸（秒；0=默认档，设 0 秒之外的关闭值见
-		// README「上游超时与看门狗」）：响应头超时 / SSE 流空闲看门狗 /
-		// WS 管道方向相关静默看门狗。
+		// 上游 fail-fast 三闸 + 慢请求可见性闸（秒；0=默认档，设 0 秒
+		// 之外的关闭值见 README「上游超时与看门狗」）：响应头超时 /
+		// SSE 流空闲看门狗 / WS 管道方向相关静默看门狗 / 慢请求日志。
 		UpstreamHeaderTimeout: envDurationSec("CODEX_ROUTER_HEADER_TIMEOUT_SEC", server.DefaultUpstreamHeaderTimeout),
 		UpstreamIdleTimeout:   envDurationSec("CODEX_ROUTER_IDLE_TIMEOUT_SEC", server.DefaultUpstreamIdleTimeout),
 		WSSilentTimeout:       envDurationSec("CODEX_ROUTER_WS_SILENT_TIMEOUT_SEC", server.DefaultWSSilentTimeout),
+		SlowRequestLogDelay:   envDurationSec("CODEX_ROUTER_SLOW_REQUEST_LOG_SEC", server.DefaultSlowRequestLogDelay),
 	})
 	if err != nil {
 		return err
