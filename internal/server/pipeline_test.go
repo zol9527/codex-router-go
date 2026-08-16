@@ -291,10 +291,13 @@ func TestSpillInPipeline(t *testing.T) {
 	if !strings.Contains(toolContents[0], srv.opt.State.Dir+string(os.PathSeparator)+spill.DirName) {
 		t.Errorf("receipt must point into the spill dir, got %.120s", toolContents[0])
 	}
-	// 全部小结果逐字节保留。
+	// 全部小结果逐字节保留。zai-coding 走 glm-thinking profile：命令头
+	// 镜像（Z.ai 丢 tool_call arguments 的补偿，见 MirrorToolCallArguments）
+	// 会统一加 "Command (shell).\nResult:\n" 前缀；spill 对小结果仍零改动。
 	for i := 1; i <= 5; i++ {
-		if toolContents[i] != fmt.Sprintf("small-%d", i+1) {
-			t.Errorf("small result %d must stay byte-for-byte, got %q", i+1, toolContents[i])
+		want := fmt.Sprintf("Command (shell).\nResult:\nsmall-%d", i+1)
+		if toolContents[i] != want {
+			t.Errorf("small result %d must stay byte-for-byte (plus mirror header), got %q", i+1, toolContents[i])
 		}
 	}
 	// 回执指向的落盘文件真实存在。

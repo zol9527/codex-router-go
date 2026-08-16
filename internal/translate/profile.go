@@ -77,6 +77,11 @@ func ApplyRequestProfile(body map[string]any, requestedEffort string, model *reg
 		}
 		delete(body, "temperature")
 		delete(body, "top_p")
+		// Z.ai 服务端丢弃 tool_calls 的 arguments（见 MirrorToolCallArguments
+		// 注释），glm-thinking 的 provider 全系中招——镜像进 tool 结果头部
+		// 恢复模型可见性。仅此 profile 启用：参数处理正常的上游（如
+		// opencode-go）里 arguments 本就可见，镜像属于纯冗余。
+		MirrorToolCallArguments(body)
 	case "deepseek-thinking":
 		// opencode 的 DeepSeek thinking 模式要求历史 assistant 回合
 		// 把 reasoning_content 传回 —— fork 出来的协作子代理首轮就带
