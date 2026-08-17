@@ -151,6 +151,56 @@ func TestCustomToolOnlyStreamFlushed(t *testing.T) {
 	}
 }
 
+// 空补全守卫扩展：仅含空载荷 custom 调用的流（GLM-5.3 大上下文退化
+// 形态，2026-08-17 15:55-16:31 实发：单 turn 200+ 次 exec 空调用、
+// Codex needs_follow_up 无限续轮）必须按 empty_completion 失败收尾，
+// 而不是 200 完成放行死循环。
+func TestEmptyCustomToolCallFailsAsEmptyCompletion(t *testing.T) {
+	var calls int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "text/event-stream")
+		// arguments 是字面 "{}"：解不出 input，等价于空载荷。
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"exec\",\"arguments\":\"{}\"}}]}}]}\n\n")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+
+	srv, ts := newTestServer(t)
+	srv.opt.Registry.Providers["zai-coding"].BaseURL = upstream.URL
+	srv.opt.Registry.Providers["zai-coding"].BaseURLEnv = ""
+	t.Setenv("ZAI_API_KEY", "")
+	callerKey, _ := srv.opt.State.CallerKey()
+	recorder := usage.NewRecorder(t.TempDir())
+	srv.opt.Usage = recorder
+
+	req, _ := http.NewRequest(http.MethodPost,
+		ts.URL+CallerPathPrefix+"/"+callerKey+"/v1/responses",
+		strings.NewReader(`{"model":"zai-coding/glm-5.3","input":"hi","stream":true,"tools":[{"type":"custom","name":"exec","description":"run code"}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if calls != 1 {
+		t.Errorf("空载荷调用同样不触发 Router 重放, calls=%d", calls)
+	}
+	body := readAll(t, resp)
+	if !strings.Contains(body, "empty_completion") || !strings.Contains(body, "did not retry") {
+		t.Errorf("空载荷 custom 调用必须按空补全显式失败:\n%s", body)
+	}
+	if strings.Contains(body, "event: response.completed") {
+		t.Errorf("失败收尾不得携带 response.completed:\n%s", body)
+	}
+	raw := readUsageRaw(t, recorder)
+	if !strings.Contains(raw, `"emptyCompletion":true`) {
+		t.Errorf("usage 事件必须记录 emptyCompletion: %s", raw)
+	}
+}
+
 // 补零替换：上游报 prompt_tokens:0 的大请求，completed 事件携带估算。
 func TestZeroPromptTokenSubstitution(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

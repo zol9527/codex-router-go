@@ -520,12 +520,19 @@ func (s *Server) serveRouted(w http.ResponseWriter, r *http.Request,
 	}
 
 	chosen := first
+	// 空补全 = 无任何可行动内容，包括两种形态：整流无内容（纯 reasoning
+	// 或全空），以及仅含空载荷 custom 调用（HasContent 的判定，见
+	// 2026-08-17 GLM-5.3 空参数 exec 死循环事故注释）。
 	emptyCompletion := !first.translator.HasContent()
 	if emptyCompletion {
 		// Router 不重放上游请求。把本次空流明确结束为失败事件，交由
-		// Codex 决定是否重试、何时退避或放弃。
+		// Codex 决定是否重试、何时退避或放弃（有界重试梯子），而不是
+		// 200 完成让调用方无限 follow-up。
 		if !relay.headersWritten() && relay.writeErr == nil && r.Context().Err() == nil {
-			if err := relay.finishFlushWith(first.events.Bytes()); err != nil {
+			// 剥掉翻译器收尾的 response.completed 与 [DONE]：failed
+			// 必须是流的终态，completed 出现在它之前是协议矛盾 ——
+			// 客户端可能在 completed 处按成功收单、忽略失败事件。
+			if err := relay.finishFlushWith(stripTerminalCompletion(first.events.Bytes())); err != nil {
 				s.recordTurn(usage.Event{Model: model.Slug, Provider: providerID, Status: 0,
 					DurationMs: time.Since(started).Milliseconds()})
 				return
@@ -533,6 +540,7 @@ func (s *Server) serveRouted(w http.ResponseWriter, r *http.Request,
 		}
 		if relay.headersWritten() {
 			io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"empty_completion\",\"message\":\"The model returned an empty completion. The router did not retry it.\"}}}\n\n")
+			io.WriteString(w, "data: [DONE]\n\n")
 			if flusher != nil {
 				flusher.Flush()
 			}
@@ -564,10 +572,25 @@ func (s *Server) serveRouted(w http.ResponseWriter, r *http.Request,
 		TotalTokens:          chosen.translator.TotalTokens(),
 		EstimatedInputTokens: int64(chosen.translator.SubstitutedInputTokens()),
 	})
-	logf("model=%s provider=%s status=200 duration_ms=%d in=%d out=%d%s%s",
+	logf("model=%s provider=%s status=200 duration_ms=%d in=%d out=%d%s",
 		model.Slug, provider.ID, time.Since(started).Milliseconds(),
 		chosen.translator.PromptTokens(), chosen.translator.OutputTokens(),
 		boolText(chosen.translator.SubstitutedInputTokens() > 0, " estimated-input=true"))
+}
+
+// stripTerminalCompletion 从守卫缓冲里剥掉翻译器收尾的 response.completed
+// 块与 [DONE] 哨兵，供失败收尾复用其余事件（created/items）。SSE 块由
+// renderEvents 以 "\n\n" 分隔、载荷是紧凑 JSON，块内不会出现空行。
+func stripTerminalCompletion(buf []byte) []byte {
+	blocks := strings.Split(string(buf), "\n\n")
+	kept := blocks[:0]
+	for _, block := range blocks {
+		if block == "data: [DONE]" || strings.HasPrefix(block, "event: response.completed") {
+			continue
+		}
+		kept = append(kept, block)
+	}
+	return []byte(strings.Join(kept, "\n\n"))
 }
 
 // failLiveStream 处理传输/看门狗类失败的收尾（响应从未给过结论）：

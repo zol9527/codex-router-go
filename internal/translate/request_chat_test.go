@@ -422,6 +422,47 @@ func TestCustomToolInputFallbacks(t *testing.T) {
 	}
 }
 
+// 空载荷 custom 调用不算内容（2026-08-17 GLM-5.3 大上下文退化事故：
+// 模型反复发空参数 exec，Codex needs_follow_up 无限续轮 200+ 次）。
+// arguments 缺失、字面 "{}"、"{"input":""}" 三种形态都必须判空。
+func TestEmptyCustomToolCallHasNoContent(t *testing.T) {
+	cases := map[string]string{
+		"missing":     `{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_e","function":{"name":"exec"}}]}}]}`,
+		"empty-obj":   `{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_e","function":{"name":"exec","arguments":"{}"}}]}}]}`,
+		"empty-input": `{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_e","function":{"name":"exec","arguments":"{\"input\":\"\"}"}}]}}]}`,
+		"blank-input": `{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_e","function":{"name":"exec","arguments":"{\"input\":\"  \"}"}}]}}]}`,
+		"whitespace":  `{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_e","function":{"name":"exec","arguments":"   "}}]}}]}`,
+	}
+	for name, chunk := range cases {
+		translator := NewChatToResponsesSSE("", "glm").WithCustomTools([]string{"exec"})
+		translator.Created()
+		translator.Feed(chunk)
+		translator.Feed(`{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`)
+		translator.Feed("[DONE]")
+		if translator.HasContent() {
+			t.Errorf("%s: 空载荷 custom 调用不算内容", name)
+		}
+	}
+
+	// 对照一：非空载荷的 custom 调用照旧算内容。
+	withPayload := NewChatToResponsesSSE("", "glm").WithCustomTools([]string{"exec"})
+	withPayload.Created()
+	withPayload.Feed(`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_f","function":{"name":"exec","arguments":"{\"input\":\"ls\"}"}}]}}]}`)
+	withPayload.Feed("[DONE]")
+	if !withPayload.HasContent() {
+		t.Error("带载荷的 custom 调用必须算内容")
+	}
+
+	// 对照二：普通 function 调用参数为空是合法无参形态，照旧算内容。
+	plain := NewChatToResponsesSSE("", "glm")
+	plain.Created()
+	plain.Feed(`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_g","function":{"name":"shell","arguments":""}}]}}]}`)
+	plain.Feed("[DONE]")
+	if !plain.HasContent() {
+		t.Error("无参 function 调用是合法形态，必须算内容")
+	}
+}
+
 // 非流式路径：custom 调用出现在 completed 的 output 数组里。
 func TestCustomToolCallNonStream(t *testing.T) {
 	body := obj(t, `{

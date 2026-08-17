@@ -101,15 +101,25 @@ func (t *ChatToResponsesSSE) TotalTokens() int64 {
 }
 
 // HasContent 报告本流是否产出过客户端可行动的内容
-// （输出文本或工具调用；纯 reasoning 不算 —— 空补全守卫的判定）。
+// （输出文本或有效工具调用；纯 reasoning 不算 —— 空补全守卫的判定）。
+// custom 工具的调用要求解出的 input 非空：GLM-5.3 在 100k+ 上下文会
+// 退化成反复发空载荷 exec 调用（2026-08-17 15:55-16:31 实发死循环：
+// 每轮仅 out=5 token，Codex 收到空调用后 needs_follow_up 无限续轮，
+// 单个 turn 烧了 200+ 次请求），空载荷在这里不算内容，由守卫按
+// empty_completion 失败收尾；普通 function 调用的参数可为空
+// （无参工具是合法形态），照旧算内容。
 func (t *ChatToResponsesSSE) HasContent() bool {
 	if t.message != nil && t.message.text.Len() > 0 {
 		return true
 	}
 	for _, state := range t.functionCall {
-		if state != nil {
-			return true
+		if state == nil {
+			continue
 		}
+		if state.custom && emptyCustomInput(state.arguments.String()) {
+			continue
+		}
+		return true
 	}
 	return false
 }
@@ -539,6 +549,15 @@ func (t *ChatToResponsesSSE) customToolCallItem(s *itemState, payload string) ma
 		"call_id": orDefault(s.callID, "call_"+s.itemID), "name": s.name,
 		"input": payload, "status": "completed",
 	}
+}
+
+// emptyCustomInput 判定 custom 调用的有效载荷是否为空。模型退化时的
+// 空调用表现为：arguments 缺失、字面 "{}"、或 {"input":""} —— 这些
+// 都不构成可执行的载荷；解不出 input 的乱形状（如 {"cmd":"ls"}）
+// 仍按非空处理，与 customToolInput 的"不丢调用"立场一致。
+func emptyCustomInput(args string) bool {
+	trimmed := strings.TrimSpace(customToolInput(args))
+	return trimmed == "" || trimmed == "{}"
 }
 
 // customToolInput 从模型按伪装 schema 生成的 arguments 里解出自由文本
