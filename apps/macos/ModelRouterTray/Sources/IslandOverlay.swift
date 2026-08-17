@@ -1323,6 +1323,7 @@ private struct LiveOrb: View {
           ThinkingOrbView(
             mode: orbMode,
             reduceMotion: reduceMotion,
+            running: ThinkingOrbView.shouldRunAnimation(state: state),
             size: 18
           )
             .frame(width: 18, height: 18)

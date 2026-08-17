@@ -128,3 +128,14 @@ struct ActivityPollingTests {
     )
   }
 }
+
+@Suite("Thinking Orb energy")
+struct ThinkingOrbEnergyTests {
+  @Test("only generating keeps the animated orb running")
+  func onlyGeneratingRunsAnimation() {
+    #expect(ThinkingOrbView.shouldRunAnimation(state: .generating))
+    #expect(!ThinkingOrbView.shouldRunAnimation(state: .idle))
+    #expect(!ThinkingOrbView.shouldRunAnimation(state: .starting))
+    #expect(!ThinkingOrbView.shouldRunAnimation(state: .error))
+  }
+}

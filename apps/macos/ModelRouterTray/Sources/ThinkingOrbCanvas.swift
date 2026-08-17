@@ -443,6 +443,10 @@ final class ThinkingOrbNSView: NSView {
   private var running = false
   private let redrawLock = NSLock()
   private var redrawScheduled = false
+  // 18px 状态点不需要 ProMotion 的 120fps；12fps 已足够表现“正在思考”，
+  // 同时把 display link 从每帧唤醒主线程降为最多 12 次/秒。
+  private static let frameInterval: Double = 1 / 12
+  private var lastScheduledFrameTime: Double = 0
   private var mode: ThinkingOrbMode = .shaping
   var reduceMotion = false {
     didSet {
@@ -517,8 +521,8 @@ final class ThinkingOrbNSView: NSView {
       link,
       { _, _, _, _, _, userInfo in
         guard let userInfo else { return kCVReturnSuccess }
-        let view = Unmanaged<ThinkingOrbNSView>.fromOpaque(userInfo).takeUnretainedValue()
-        view.scheduleRedraw()
+      let view = Unmanaged<ThinkingOrbNSView>.fromOpaque(userInfo).takeUnretainedValue()
+      view.scheduleRedraw()
         return kCVReturnSuccess
       },
       unmanaged.toOpaque()
@@ -534,6 +538,9 @@ final class ThinkingOrbNSView: NSView {
   }
 
   private func scheduleRedraw() {
+    let now = CACurrentMediaTime()
+    guard now - lastScheduledFrameTime >= Self.frameInterval else { return }
+    lastScheduledFrameTime = now
     redrawLock.lock()
     guard !redrawScheduled else {
       redrawLock.unlock()
@@ -571,19 +578,26 @@ final class ThinkingOrbNSView: NSView {
 struct ThinkingOrbView: NSViewRepresentable {
   var mode: ThinkingOrbMode
   var reduceMotion: Bool
+  /// 只有真正的生成态需要连续动画；idle/error 用静态帧即可，避免
+  /// CVDisplayLink 在空闲时持续唤醒主线程并导致整棵 SwiftUI 树布局。
+  var running: Bool
   var size: CGFloat = 18
+
+  nonisolated static func shouldRunAnimation(state: RouterActivityState) -> Bool {
+    state == .generating
+  }
 
   func makeNSView(context: Context) -> ThinkingOrbNSView {
     let view = ThinkingOrbNSView(size: size)
     view.setMode(mode)
     view.reduceMotion = reduceMotion
-    view.setRunning(true)
+    view.setRunning(running)
     return view
   }
 
   func updateNSView(_ nsView: ThinkingOrbNSView, context: Context) {
     nsView.setMode(mode)
     nsView.reduceMotion = reduceMotion
-    nsView.setRunning(true)
+    nsView.setRunning(running)
   }
 }
