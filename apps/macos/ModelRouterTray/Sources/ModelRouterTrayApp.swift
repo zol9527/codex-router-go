@@ -218,6 +218,7 @@ final class RouterStore: ObservableObject {
   private var latestObservedActivityRequestID: String?
   private var lastObservedSessionID: String?
   private var activityHealthFailureStartedAt: Date?
+
   private var dailyUsageCache: [DailyUsageCacheKey: [DailyUsagePoint]] = [:]
   private var localUsageTotalsCache: [LocalUsageTotalsCacheKey: UsageTotals] = [:]
 
@@ -278,6 +279,21 @@ final class RouterStore: ObservableObject {
     if let storedMode, let mode = IslandMode(rawValue: storedMode) { return mode }
     if let legacyVisible { return legacyVisible ? .notch : .off }
     return hasLaunchedBefore ? .notch : .off
+  }
+
+  // Activity polling drives SwiftUI state, and the old fixed 350ms cadence kept
+  // the main thread laying out views even while nothing was happening. Keep the
+  // fast cadence only while an activity must be watched; idle/hidden states can
+  // discover the next request a little later without visibly changing the UI.
+  nonisolated static func activityPollingInterval(
+    surfacesVisible: Bool,
+    activeRequestCount: Int,
+    activityState: RouterActivityState
+  ) -> UInt64 {
+    if activeRequestCount > 0 || activityState == .generating || activityState == .starting {
+      return 350_000_000
+    }
+    return surfacesVisible ? 1_000_000_000 : 3_000_000_000
   }
 
   init() {
@@ -995,7 +1011,13 @@ final class RouterStore: ObservableObject {
     while !Task.isCancelled {
       await refreshActivity()
       do {
-        try await Task.sleep(nanoseconds: 350_000_000)
+        try await Task.sleep(
+          nanoseconds: Self.activityPollingInterval(
+            surfacesVisible: surfacesVisible,
+            activeRequestCount: activeRequestCount,
+            activityState: activityState
+          )
+        )
       } catch {
         return
       }
