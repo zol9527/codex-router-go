@@ -149,7 +149,6 @@ func (s *Server) handleNativeTurn(w http.ResponseWriter, r *http.Request, route 
 type attemptOutcome struct {
 	translator wire.StreamTranslator
 	events     *translate.OutputBuffer
-	status     int
 }
 
 // upstreamFailure 携带上游错误响应供翻译。
@@ -265,7 +264,7 @@ func (s *Server) runChatAttempt(ctx context.Context, target string, headers map[
 		if ra := resp.Header.Get("Retry-After"); ra != "" {
 			fmt.Sscanf(ra, "%d", &retryAfter)
 		}
-		return &attemptOutcome{status: resp.StatusCode}, &upstreamFailure{
+		return &attemptOutcome{}, &upstreamFailure{
 			status: resp.StatusCode, bodyText: string(raw), retryAfter: retryAfter,
 		}
 	}
@@ -307,8 +306,7 @@ func (s *Server) runChatAttempt(ctx context.Context, target string, headers map[
 			if !errors.Is(readErr, io.EOF) && ctx.Err() == nil {
 				// 错误链原样上抛（含 httpx.ErrUpstreamIdle 哨兵），
 				// 由调用方决定 504/截断/502 的映射。
-				return &attemptOutcome{translator: translator, events: events,
-						status: resp.StatusCode},
+				return &attemptOutcome{translator: translator, events: events},
 					fmt.Errorf("upstream stream ended before completion: %w", readErr)
 			}
 			// EOF 而未见 [DONE] 哨兵（zai 偶发不发）：主动收尾补齐
@@ -322,8 +320,7 @@ func (s *Server) runChatAttempt(ctx context.Context, target string, headers map[
 					relay.emit(closing)
 				}
 			}
-			return &attemptOutcome{translator: translator, events: events,
-				status: resp.StatusCode}, nil
+			return &attemptOutcome{translator: translator, events: events}, nil
 		}
 	}
 }
@@ -566,13 +563,11 @@ func (s *Server) serveRouted(w http.ResponseWriter, r *http.Request,
 		OutputTokens:         chosen.translator.OutputTokens(),
 		TotalTokens:          chosen.translator.TotalTokens(),
 		EstimatedInputTokens: int64(chosen.translator.SubstitutedInputTokens()),
-		EmptyCompletion:      emptyCompletion,
 	})
 	logf("model=%s provider=%s status=200 duration_ms=%d in=%d out=%d%s%s",
 		model.Slug, provider.ID, time.Since(started).Milliseconds(),
 		chosen.translator.PromptTokens(), chosen.translator.OutputTokens(),
-		boolText(chosen.translator.SubstitutedInputTokens() > 0, " estimated-input=true"),
-		boolText(emptyCompletion, " empty-completion=true"))
+		boolText(chosen.translator.SubstitutedInputTokens() > 0, " estimated-input=true"))
 }
 
 // failLiveStream 处理传输/看门狗类失败的收尾（响应从未给过结论）：

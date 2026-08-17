@@ -46,7 +46,7 @@ flowchart LR
 | `internal/wire/responses/` | 上游原生支持 Responses 时的直通协议路径。 |
 | `internal/translate/` | 请求、响应、工具、namespace、Codex App 工具的具体翻译逻辑。 |
 | `internal/cred/` | 供应商凭据解析：环境变量 → `config.toml` → secret 文件 → macOS Keychain。 |
-| `internal/state/` | 管理 `~/.codex-router`：caller/internal secret、配置、模型可见性、子代理设置、spill 统计。 |
+| `internal/state/` | 管理 `~/.codex-router`：caller/internal secret、配置、模型可见性与子代理设置。 |
 | `internal/catalog/` | 合并 Codex 原生模型与注册表路由模型，生成 picker 用的 `merged-models.json`。 |
 | `internal/usage/` | 记录 `usage-events.jsonl`，维护配额、限流、供应商用量统计。 |
 | `internal/vision/` | 图片桥：文本模型无法直接读图时，由本地视觉模型先读图并转成文字描述。 |
@@ -161,13 +161,12 @@ POST /v1/search/...
 1. **解析供应商凭据**：环境变量 → `config.toml` → secret 文件 → macOS Keychain。
 2. **协作输入归一化**：把协作运行时的加密内容转换为外部模型可读形态。
 3. **图片桥**：文本模型无法直接读图且本地视觉模型可用时，先由视觉模型描述图片，再替换为文字描述。
-4. **工具结果 spill**：超过阈值的工具输出确定性截断 / 落盘，并记录统计。
-5. **合并 Codex App 工具**：补全客户端精简版 `codex_app` 工具集。
-6. **Namespace 拍平**：把 namespace 工具展开为 `<ns>__<tool>`，响应方向再还原。
-7. **选择协议适配器**：根据 provider 的 `Protocol` 字段选择 `wire.Protocol`。
-8. **发起上游请求**：通过 `internal/httpx` 单次发送，带响应头超时、SSE 空闲看门狗。
-9. **响应回放**：Chat Completions 响应重组为 Responses 事件流；原生 Responses 响应直通。
-10. **记录 usage**：写入 `usage-events.jsonl`，用于供应商用量、失败率、限流统计。
+4. **合并 Codex App 工具**：补全客户端精简版 `codex_app` 工具集。
+5. **Namespace 拍平**：把 namespace 工具展开为 `<ns>__<tool>`，响应方向再还原。
+6. **选择协议适配器**：根据 provider 的 `Protocol` 字段选择 `wire.Protocol`。
+7. **发起上游请求**：通过 `internal/httpx` 单次发送，带响应头超时、SSE 空闲看门狗。
+8. **响应回放**：Chat Completions 响应重组为 Responses 事件流；原生 Responses 响应直通。
+9. **记录 usage**：写入 `usage-events.jsonl`，用于供应商用量、失败率、限流统计。usage 的 `status` 表示回合结果；空补全虽然以 SSE `response.failed` 收尾，但按失败回合记录为 502。
 
 ## 7. 协议抽象
 
@@ -236,7 +235,6 @@ internal/registry/config/<provider>/<model>.json
 - `user-models.json`：动态模型覆盖层；
 - `merged-models.json`：发布给 Codex 的模型目录；
 - `usage-events.jsonl`：每轮用量事件；
-- `spill/`：工具结果落盘目录；
 - `router.pid`：服务 pidfile。
 
 供应商凭据解析顺序：
