@@ -11,6 +11,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 
 	"time"
 
@@ -325,6 +326,51 @@ func (s *Server) runChatAttempt(ctx context.Context, target string, headers map[
 	}
 }
 
+// logTranslationDegradation 报告翻译期降级：input item / content part
+// 出现了翻译器不认识的类型，被占位符替换或丢弃。这类静默内容损坏
+// 不影响 HTTP 状态（全程 200、usage 正常），没有日志就无迹可循——
+// 2026-08-18 agent_message 任务书被吞的事故因此排查了两轮。
+//
+// 同一签名（模型 + 类型集合）2 秒窗口内只记一次，被抑制的次数
+// 累计进下一条（suppressed=N），信息不丢、风暴不刷屏。写盘本身
+// 无性能压力（标准 log 每行一次缓冲写、无 fsync，实测日均约
+// 4 行/分钟、峰值 12 行/分钟），限流纯粹为了日志可读性。
+var (
+	degradationLogMu         sync.Mutex
+	degradationLogInterval   = 2 * time.Second
+	degradationLogLast       = map[string]time.Time{}
+	degradationLogSuppressed = map[string]int{}
+)
+
+func logTranslationDegradation(prepared *wire.Request, model *registry.Model) {
+	if len(prepared.OmittedItemTypes) == 0 && len(prepared.OmittedPartTypes) == 0 {
+		return
+	}
+	slug := ""
+	if model != nil {
+		slug = model.Slug
+	}
+	signature := fmt.Sprintf("%s|%v|%v", slug, prepared.OmittedItemTypes, prepared.OmittedPartTypes)
+	now := time.Now()
+
+	degradationLogMu.Lock()
+	defer degradationLogMu.Unlock()
+	if last, seen := degradationLogLast[signature]; seen && now.Sub(last) < degradationLogInterval {
+		degradationLogSuppressed[signature]++
+		return
+	}
+	suppressed := degradationLogSuppressed[signature]
+	delete(degradationLogSuppressed, signature)
+	degradationLogLast[signature] = now
+	if suppressed > 0 {
+		logf("chat translation degraded model=%s omitted_item_types=%v omitted_part_types=%v suppressed=%d/2s",
+			slug, prepared.OmittedItemTypes, prepared.OmittedPartTypes, suppressed)
+		return
+	}
+	logf("chat translation degraded model=%s omitted_item_types=%v omitted_part_types=%v",
+		slug, prepared.OmittedItemTypes, prepared.OmittedPartTypes)
+}
+
 // serveChatTranslation：翻译请求发往 chat 上游，把上游 SSE 增量
 // 重组成 Responses 事件流写给 Codex。
 //
@@ -374,6 +420,7 @@ func (s *Server) serveRouted(w http.ResponseWriter, r *http.Request,
 		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", err.Error()))
 		return
 	}
+	logTranslationDegradation(prepared, model)
 	normalized, err := json.Marshal(prepared.Body)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", "Unable to encode request."))

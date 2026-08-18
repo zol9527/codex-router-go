@@ -140,7 +140,10 @@ func replaceAgentPayloadWithPlaintext(item map[string]any, plaintext string) map
 	}
 	rewritten = append(rewritten, map[string]any{
 		"type": "input_text",
-		"text": "Payload:\n" + plaintext,
+		// 信封可见文本必然以 "Payload:" 结尾（extractEncryptedAgentPayload
+		// 的形状识别前提），这里只补换行接明文；再带一个 "Payload:" 标签
+		// 只会重复。
+		"text": "\n" + plaintext,
 	})
 	next["content"] = rewritten
 	return next

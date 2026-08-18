@@ -42,6 +42,9 @@ func (Protocol) Prepare(responsesRequest map[string]any, model *registry.Model) 
 		Accept: accept,
 		// custom 工具名随请求产物下传，响应翻译还原 custom_tool_call。
 		CustomTools: chat.CustomTools,
+		// 翻译期降级形状随请求产物下传，server 层告警。
+		OmittedItemTypes: chat.OmittedItemTypes,
+		OmittedPartTypes: chat.OmittedPartTypes,
 	}, nil
 }
 

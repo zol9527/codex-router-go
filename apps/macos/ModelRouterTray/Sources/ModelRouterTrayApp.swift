@@ -4670,59 +4670,39 @@ func usageResetCaption(_ date: Date) -> String {
 private struct StatusBeacon: View {
   @Environment(\.accessibilityReduceMotion) private var reduceMotion
   let state: RouterActivityState
-  @State private var breathing = false
 
   var body: some View {
     HStack(spacing: 6) {
-      ZStack {
-        Circle()
-          .fill(state.tint.opacity(0.18))
-          .frame(width: 14, height: 14)
-          .scaleEffect((state == .generating || state == .starting) && breathing ? 1.28 : 0.9)
-        Circle()
-          .fill(state.tint)
-          .frame(width: 7, height: 7)
+      // 呼吸点用 TimelineView 显式驱动而非 withAnimation(.repeatForever)：
+      // 隐式动画会以显示刷新率（ProMotion 最高 120fps）持续重算布局，
+      // 而 14px 的光点 12fps 已足够。空闲/错误态 paused 后时间线完全停摆。
+      TimelineView(
+        .animation(
+          minimumInterval: 1 / IslandAnimation.framesPerSecond,
+          paused: !isBreathing
+        )
+      ) { context in
+        let phase = isBreathing
+          ? IslandAnimation.breathPhase(at: context.date, duration: 1.44)
+          : 0
+        ZStack {
+          Circle()
+            .fill(state.tint.opacity(0.18))
+            .frame(width: 14, height: 14)
+            .scaleEffect(0.9 + 0.38 * phase)
+          Circle()
+            .fill(state.tint)
+            .frame(width: 7, height: 7)
+        }
       }
       Text(state.label)
         .font(.system(size: 10, weight: .medium))
     }
     .foregroundStyle(state.tint)
-    .onAppear { animate() }
-    .onChange(of: state) { _ in animate() }
   }
 
-  private func animate() {
-    breathing = false
-    guard state == .generating || state == .starting, !reduceMotion else { return }
-    withAnimation(.easeInOut(duration: 0.72).repeatForever(autoreverses: true)) {
-      breathing = true
-    }
-  }
-}
-
-private struct OperationPulse: View {
-  @Environment(\.accessibilityReduceMotion) private var reduceMotion
-  let tint: Color
-  @State private var pulsing = false
-
-  var body: some View {
-    ZStack {
-      Circle()
-        .stroke(tint.opacity(0.34), lineWidth: 1)
-        .frame(width: 12, height: 12)
-        .scaleEffect(pulsing ? 1.35 : 0.65)
-        .opacity(pulsing ? 0 : 0.9)
-      Circle()
-        .fill(tint)
-        .frame(width: 6, height: 6)
-    }
-    .frame(width: 14, height: 14)
-    .onAppear {
-      guard !reduceMotion else { return }
-      withAnimation(.easeOut(duration: 0.9).repeatForever(autoreverses: false)) {
-        pulsing = true
-      }
-    }
+  private var isBreathing: Bool {
+    IslandAnimation.beaconBreathing(state: state, reduceMotion: reduceMotion)
   }
 }
 

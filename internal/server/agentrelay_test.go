@@ -144,7 +144,8 @@ func TestAgentRelayEndToEnd(t *testing.T) {
 	}
 }
 
-// 非 Fernet 明文载荷：不经中继直接使用。
+// 非 Fernet 明文载荷：不经中继直接使用；信封自带 "Payload:" 标签，
+// 追加的明文 part 不再重复打标签。
 func TestNonFernetPlaintextUsedDirectly(t *testing.T) {
 	srv, _ := newTestServer(t)
 	input := []any{agentPayloadItem("external-model-wrote-this-plaintext")}
@@ -154,6 +155,9 @@ func TestNonFernetPlaintextUsedDirectly(t *testing.T) {
 	last := parts[len(parts)-1].(map[string]any)
 	if !strings.Contains(last["text"].(string), "external-model-wrote-this-plaintext") {
 		t.Errorf("non-Fernet payload must be used as plaintext: %v", last)
+	}
+	if strings.Contains(last["text"].(string), "Payload") {
+		t.Errorf("appended part must not duplicate the envelope Payload label: %v", last)
 	}
 }
 

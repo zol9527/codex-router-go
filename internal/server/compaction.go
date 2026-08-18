@@ -103,6 +103,7 @@ func (s *Server) handleRoutedCompaction(w http.ResponseWriter, r *http.Request,
 		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", err.Error()))
 		return
 	}
+	logTranslationDegradation(prepared, model)
 	prepared.Stream = false
 	prepared.Accept = "application/json"
 	normalized, err := json.Marshal(prepared.Body)

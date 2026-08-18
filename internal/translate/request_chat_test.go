@@ -240,6 +240,25 @@ func TestAgentMessageReplayAndEmptyFallbacks(t *testing.T) {
 	}
 }
 
+// 翻译期降级观测：未知 item / part 类型必须记入 ChatRequest 的
+// Omitted 集合（去重），server 层据此告警——静默占位符没有日志
+// 就无迹可循（2026-08-18 agent_message 事故的教训）。
+func TestOmittedTypesCollected(t *testing.T) {
+	chat, _ := TranslateToChat(obj(t, `{
+		"input": [
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"},{"type":"mystery_part","text":"x"}]},
+			{"type":"mystery_item"},
+			{"type":"mystery_item"}
+		]
+	}`))
+	if len(chat.OmittedItemTypes) != 1 || chat.OmittedItemTypes[0] != "mystery_item" {
+		t.Errorf("OmittedItemTypes = %v, want single deduped mystery_item", chat.OmittedItemTypes)
+	}
+	if len(chat.OmittedPartTypes) != 1 || chat.OmittedPartTypes[0] != "mystery_part" {
+		t.Errorf("OmittedPartTypes = %v, want single mystery_part", chat.OmittedPartTypes)
+	}
+}
+
 // GLM effort 阶梯：请求档钳到模型声明档。
 func TestGLMEffort(t *testing.T) {
 	cases := []struct {
