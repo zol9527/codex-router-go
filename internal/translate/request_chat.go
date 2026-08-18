@@ -299,6 +299,8 @@ func inputItemToMessages(item map[string]any) []map[string]any {
 				"type": "text", "text": summaryPrefix + "\n\n" + summary,
 			}},
 		}}
+	case "agent_message":
+		return agentMessageItemToMessages(item)
 	default:
 		// web_search_call、local_shell_call 等执行记录降级为
 		// 文本占位，保留历史结构可读。
@@ -310,6 +312,54 @@ func inputItemToMessages(item map[string]any) []map[string]any {
 			}},
 		}}
 	}
+}
+
+// agentMessageItemToMessages 把 Codex 多代理协作的跨代理消息
+// （spawn/followup 的 NEW_TASK 任务书、send_message 与 RESULT 回传）
+// 映射为 user 消息。content 的 input_text part 是投递信封，
+// encrypted_content part 承载任务正文——Codex 自产自销的透传载体，
+// 实测为明文（2026-08-18 rollout 取证），无需解密即可收编。
+//
+// 绝不能落入 default 的占位符分支：子代理的整个任务书只有这一个
+// item，占位符会让 explorer 在任务盲状态下空转或臆测任务
+// （2026-08-18 实发：两个 explorer 分别"请求重发任务"和
+// 臆测出 onboardingv2 乱搜两分钟）。历史回放时正文也可能直接
+// 放 message/text 字符串字段，做兜底；全部无可读文本则丢弃，
+// 与空消息策略一致。
+func agentMessageItemToMessages(item map[string]any) []map[string]any {
+	var texts []string
+	if parts, ok := item["content"].([]any); ok {
+		for _, raw := range parts {
+			part, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			var text string
+			switch part["type"] {
+			case "input_text", "output_text", "text":
+				text, _ = part["text"].(string)
+			case "encrypted_content":
+				text, _ = part["encrypted_content"].(string)
+			}
+			if strings.TrimSpace(text) != "" {
+				texts = append(texts, text)
+			}
+		}
+	}
+	if len(texts) == 0 {
+		for _, key := range []string{"message", "text"} {
+			if text, _ := item[key].(string); strings.TrimSpace(text) != "" {
+				texts = append(texts, text)
+			}
+		}
+	}
+	if len(texts) == 0 {
+		return nil
+	}
+	return []map[string]any{{
+		"role":    "user",
+		"content": strings.Join(texts, "\n"),
+	}}
 }
 
 func messageItemToMessages(item map[string]any) []map[string]any {

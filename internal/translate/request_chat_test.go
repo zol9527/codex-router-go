@@ -194,6 +194,52 @@ func TestCompactionItemBecomesUserMessage(t *testing.T) {
 	}
 }
 
+// agent_message（Codex 多代理的 NEW_TASK 任务书 / RESULT 回传）必须
+// 完整翻译成 user 消息：信封 input_text 与明文 encrypted_content 载荷
+// 都要保留。落进 default 占位符分支会让子代理收不到任务
+// （2026-08-18 explorer 任务盲事故的根因）。
+func TestAgentMessageBecomesUserMessage(t *testing.T) {
+	input := obj(t, `{
+		"input": [
+			{"type":"agent_message","id":"amsg_1","author":"/root/repo_compare","recipient":"/root/repo_compare/explore_opencodex_remote",
+			 "content":[
+				{"type":"input_text","text":"Message Type: NEW_TASK\nTask name: /root/repo_compare/explore_opencodex_remote\nSender: /root/repo_compare\nPayload:\n"},
+				{"type":"encrypted_content","encrypted_content":"任务：核实 https://github.com/lidge-jun/opencodex 的依赖与内存占用。"}
+			 ]}
+		]
+	}`)
+	chat, _ := TranslateToChat(input)
+	messages := chat.Body["messages"].([]map[string]any)
+	if len(messages) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(messages))
+	}
+	if messages[0]["role"] != "user" {
+		t.Errorf("agent_message should be a user message, got %v", messages[0]["role"])
+	}
+	text, _ := messages[0]["content"].(string)
+	if !strings.Contains(text, "NEW_TASK") || !strings.Contains(text, "核实 https://github.com/lidge-jun/opencodex") {
+		t.Errorf("agent_message envelope/payload lost: %q", text)
+	}
+}
+
+// 回放兜底：历史形态把正文直接放 message 字符串字段；
+// 全空载荷丢弃而不是生成占位符。
+func TestAgentMessageReplayAndEmptyFallbacks(t *testing.T) {
+	chat, _ := TranslateToChat(obj(t, `{
+		"input": [
+			{"type":"agent_message","message":"我先核对两边的一手证据。"},
+			{"type":"agent_message","content":[{"type":"input_text","text":"   "}]}
+		]
+	}`))
+	messages := chat.Body["messages"].([]map[string]any)
+	if len(messages) != 1 {
+		t.Fatalf("expected 1 message (empty dropped), got %d", len(messages))
+	}
+	if text, _ := messages[0]["content"].(string); !strings.Contains(text, "一手证据") {
+		t.Errorf("replayed agent_message text lost: %q", text)
+	}
+}
+
 // GLM effort 阶梯：请求档钳到模型声明档。
 func TestGLMEffort(t *testing.T) {
 	cases := []struct {
