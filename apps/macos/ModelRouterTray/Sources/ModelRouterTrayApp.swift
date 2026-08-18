@@ -4673,28 +4673,17 @@ private struct StatusBeacon: View {
 
   var body: some View {
     HStack(spacing: 6) {
-      // 呼吸点用 TimelineView 显式驱动而非 withAnimation(.repeatForever)：
-      // 隐式动画会以显示刷新率（ProMotion 最高 120fps）持续重算布局，
-      // 而 14px 的光点 12fps 已足够。空闲/错误态 paused 后时间线完全停摆。
-      TimelineView(
-        .animation(
-          minimumInterval: 1 / IslandAnimation.framesPerSecond,
-          paused: !isBreathing
-        )
-      ) { context in
-        let phase = isBreathing
-          ? IslandAnimation.breathPhase(at: context.date, duration: 1.44)
-          : 0
-        ZStack {
-          Circle()
-            .fill(state.tint.opacity(0.18))
-            .frame(width: 14, height: 14)
-            .scaleEffect(0.9 + 0.38 * phase)
-          Circle()
-            .fill(state.tint)
-            .frame(width: 7, height: 7)
-        }
-      }
+      // 呼吸点走 CALayer 动画而非 SwiftUI 时间线。曾两次尝试 TimelineView
+      // （withAnimation(repeatForever) → .animation(minimumInterval:) →
+      // .periodic）都失败，根因不在 schedule：AppKit 窗口里任何活跃
+      // TimelineView 都会拖 NSHostingView 以显示帧率跑 layout pass
+      // （2026-08-18 实测生成态 16-27% CPU，采样 UpdateCycle →
+      // CA::Transaction::commit → NSHostingView.layout → ViewGraph
+      // render，更新栈直指本视图）。CABasicAnimation 由 WindowServer
+      // 在 render server 进程插值，App 进程零帧成本。
+      BreathingBeaconDot(tint: state.tint, breathing: isBreathing)
+        .frame(width: 14, height: 14)
+        .accessibilityHidden(true)
       Text(state.label)
         .font(.system(size: 10, weight: .medium))
     }
@@ -4703,6 +4692,69 @@ private struct StatusBeacon: View {
 
   private var isBreathing: Bool {
     IslandAnimation.beaconBreathing(state: state, reduceMotion: reduceMotion)
+  }
+}
+
+/// BreathingBeaconDot 的载体视图：14pt 光晕 + 7pt 实心圆两层。
+/// 呼吸 = 光晕层 transform.scale 的 autoreverse 循环动画（0.9→1.28，
+/// 0.72s 单程，与旧 TimelineView 版 1.44s 余弦往返同节拍）。
+@MainActor
+private final class BeaconDotView: NSView {
+  private let halo = CAShapeLayer()
+  private let core = CAShapeLayer()
+  private var isAnimating = false
+
+  override init(frame frameRect: NSRect) {
+    super.init(frame: frameRect)
+    wantsLayer = true
+    halo.path = CGPath(ellipseIn: bounds, transform: nil)
+    core.path = CGPath(
+      ellipseIn: NSRect(x: 3.5, y: 3.5, width: 7, height: 7),
+      transform: nil
+    )
+    layer?.addSublayer(halo)
+    layer?.addSublayer(core)
+  }
+
+  @available(*, unavailable)
+  required init?(coder: NSCoder) {
+    fatalError("BeaconDotView is created in code only")
+  }
+
+  func apply(tint: NSColor, breathing: Bool) {
+    CATransaction.begin()
+    // 结构/颜色变化不做隐式 CA 过渡；动画只由显式 add 的 keyframe 驱动。
+    CATransaction.setDisableActions(true)
+    halo.backgroundColor = tint.withAlphaComponent(0.18).cgColor
+    core.backgroundColor = tint.cgColor
+    if breathing, !isAnimating {
+      let scale = CABasicAnimation(keyPath: "transform.scale")
+      scale.fromValue = 0.9
+      scale.toValue = 1.28
+      scale.duration = 0.72
+      scale.autoreverses = true
+      scale.repeatCount = .infinity
+      scale.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+      halo.add(scale, forKey: "breath")
+      isAnimating = true
+    } else if !breathing, isAnimating {
+      halo.removeAnimation(forKey: "breath")
+      isAnimating = false
+    }
+    CATransaction.commit()
+  }
+}
+
+private struct BreathingBeaconDot: NSViewRepresentable {
+  let tint: Color
+  let breathing: Bool
+
+  func makeNSView(context: Context) -> BeaconDotView {
+    BeaconDotView(frame: NSRect(x: 0, y: 0, width: 14, height: 14))
+  }
+
+  func updateNSView(_ view: BeaconDotView, context: Context) {
+    view.apply(tint: NSColor(tint), breathing: breathing)
   }
 }
 
