@@ -93,6 +93,12 @@ type activityEntry struct {
 	model       string
 	sessionName string
 	startedAt   time.Time
+	// inFlight 非 nil 时（WS 管道这类跨 turn 的长生命周期载体），以
+	// 回调结果决定是否计入 active：管道空闲（无在途 turn）不算请求。
+	// nil（HTTP 单请求路径）恒计入。2026-08-18 实发：Codex 每次对话
+	// 开一条 WS preconnect 且长期不关，管道级 activity 让 state 永远
+	// generating，托盘动画永不回 idle。
+	inFlight func() bool
 }
 
 // New 构造 Server。
@@ -328,13 +334,21 @@ func requireCodexTransport(w http.ResponseWriter, r *http.Request) bool {
 const staleActivity = 15 * time.Minute
 const errorStatusDuration = 8 * time.Second
 
-// beginRequest 登记 activity 并返回结束函数。
+// beginRequest 登记 activity 并返回结束函数（HTTP 单请求路径：
+// 登记即视为在途，直到 finish）。
 func (s *Server) beginRequest() (setRoute func(provider, model, session string), finish func(status int)) {
+	return s.beginActivity(nil)
+}
+
+// beginActivity 登记一条 activity；inFlight 语义见 activityEntry.inFlight。
+// WS 管道路径传入看门狗的在途 turn 判定，把上报窗口从"管道存活"
+// 收窄成"turn 在途"。
+func (s *Server) beginActivity(inFlight func() bool) (setRoute func(provider, model, session string), finish func(status int)) {
 	s.mu.Lock()
 	s.requestSeq++
 	id := s.requestSeq
 	started := time.Now()
-	entry := &activityEntry{id: strconv.Itoa(id), startedAt: started}
+	entry := &activityEntry{id: strconv.Itoa(id), startedAt: started, inFlight: inFlight}
 	s.active[id] = entry
 	s.mu.Unlock()
 
@@ -348,6 +362,9 @@ func (s *Server) beginRequest() (setRoute func(provider, model, session string),
 			defer s.mu.Unlock()
 			if _, pending := s.active[id]; !pending {
 				return // 与 finish 赛跑落败：请求已收尾，不误报
+			}
+			if entry.inFlight != nil && !entry.inFlight() {
+				return // 长连接载体当前无在途 turn：空闲管道不是慢请求
 			}
 			logf("slow request pending id=%s provider=%s model=%s session=%s elapsed_ms=%d",
 				entry.id, entry.provider, entry.model, entry.sessionName,
@@ -394,7 +411,11 @@ func (s *Server) activityPayload() map[string]any {
 	defer s.mu.Unlock()
 	now := time.Now()
 	for id, entry := range s.active {
-		if now.Sub(entry.startedAt) > staleActivity {
+		// 带 inFlight 的条目（WS 管道）生命周期归管道管理（拆管时
+		// finish）；按 startedAt 过期会把仍健康的管道踢出 active，
+		// 之后管道上的新 turn 永远不上报。挂死的管道由 WS 静默看门狗
+		// 拆管收尾，不依赖这里的 stale 兜底。
+		if entry.inFlight == nil && now.Sub(entry.startedAt) > staleActivity {
 			delete(s.active, id)
 		}
 	}
@@ -402,6 +423,9 @@ func (s *Server) activityPayload() map[string]any {
 	for _, entry := range s.active {
 		if entry.provider == "" {
 			continue
+		}
+		if entry.inFlight != nil && !entry.inFlight() {
+			continue // 空闲长连接载体：无在途 turn，不报 generating
 		}
 		item := map[string]any{
 			"id": entry.id, "provider": entry.provider, "startedAt": entry.startedAt.UnixMilli(),
