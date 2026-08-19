@@ -292,7 +292,7 @@ func controlJSON(st *state.State, reg *registry.Registry) error {
 }
 
 func orderedProviderIDs(reg *registry.Registry) []string {
-	return []string{"zai-coding", "opencode-go"}
+	return []string{"zai-coding", "opencode-go", "litellm"}
 }
 
 // controlService：App 化后的服务面 —— 不再经 launchd，直接管进程。
@@ -520,6 +520,9 @@ const configTemplate = `# Model Router 凭证配置（Claude Code 式）。
 
 [opencode-go]
 # api_key = "..."
+
+[litellm]
+# api_key = "sk-..."
 `
 
 // controlConfig：config 子命令。init —— 文件不存在则写模板（0600）

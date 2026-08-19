@@ -173,6 +173,57 @@ func (s *Server) serveWSPipe(client, upstream *websocket.Conn, r *http.Request) 
 		}()
 	}
 
+	// 上游 keepalive ping：跨 turn 空闲是合法状态（看门狗不拆），但链路上
+	// 的中间设备会按空闲超时收割 TCP —— 2026-08-19 实证：上游腿经 Surge
+	// TUN，194 条空闲管道在 ~30 分钟被 1006 unexpected EOF / RST 砍断，
+	// Codex 下一次使用才发现管道已死、亮"正在重新连接"。周期 ping 让链路
+	// 始终有流量，空闲管道不再被收割。客户端腿是本地回环，无中间设备，
+	// 不需要保活。
+	//
+	// 空闲封顶（idle cap）：keepalive 的代价是管道不再被中间设备意外回
+	// 收 —— 若调用方泄漏管道（Codex 桌面端有挂起管道前科），会永久累积。
+	// 连续无数据帧超过封顶窗口的管道主动发 close 1000 干净关闭：调用方
+	// 下次使用按需重连（毫秒级 preconnect），体验不差于被 1006 砍。
+	if s.wsKeepalive > 0 {
+		go func() {
+			ticker := time.NewTicker(s.wsKeepalive)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-wdStop:
+					return
+				case <-ticker.C:
+					// WriteControl 可与搬运协程的 WriteMessage 并发（gorilla
+					// 契约）。写失败 = 上游连接已坏：立即拆管让调用方重连，
+					// 而不是留一条下次使用时才暴露的死管道。
+					if err := upstream.WriteControl(websocket.PingMessage, nil,
+						time.Now().Add(5*time.Second)); err != nil {
+						_ = client.Close()
+						_ = upstream.Close()
+						return
+					}
+					last := wd.lastClientTx.Load()
+					if u := wd.lastUpstream.Load(); u > last {
+						last = u
+					}
+					if last == 0 {
+						last = started.UnixNano() // 建管后从未有过数据帧
+					}
+					if time.Since(time.Unix(0, last)) > s.wsKeepaliveIdleCap {
+						logf("ws pipe idle cap: no data frames for %v; closing cleanly", s.wsKeepaliveIdleCap)
+						deadline := time.Now().Add(time.Second)
+						closeMsg := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "idle")
+						_ = client.WriteControl(websocket.CloseMessage, closeMsg, deadline)
+						_ = upstream.WriteControl(websocket.CloseMessage, closeMsg, deadline)
+						_ = client.Close()
+						_ = upstream.Close()
+						return
+					}
+				}
+			}
+		}()
+	}
+
 	done := make(chan error, 2)
 	go func() {
 		done <- relayFrames(upstream, client, nil, wd.noteUpstreamTurnDone)

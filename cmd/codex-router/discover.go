@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/loyd/codex-router/internal/cred"
@@ -13,6 +14,25 @@ import (
 	"github.com/loyd/codex-router/internal/registry"
 	"github.com/loyd/codex-router/internal/state"
 )
+
+// providerBaseURL 与 server.(*Server).providerBaseURL 同规则：
+// env 覆盖 > config.toml 的 provider 表 base_url > 注册表默认。
+// config 档服务自托管 provider（如 LiteLLM）：注册表不内嵌部署地址。
+func providerBaseURL(st *state.State, p *registry.Provider) string {
+	if p.BaseURLEnv != "" {
+		if v := os.Getenv(p.BaseURLEnv); v != "" {
+			return v
+		}
+	}
+	family := p.ID
+	if p.VariantOf != "" {
+		family = p.VariantOf
+	}
+	if v := strings.TrimSpace(st.ReadConfigBaseURL(family)); v != "" {
+		return v
+	}
+	return p.BaseURL
+}
 
 // cmdDiscover：只读的模型发现 —— 实时请求 provider 的 /v1/models，
 // 打印全量列表并对照注册表（内嵌 + 覆盖层）分类。
@@ -38,7 +58,7 @@ func cmdDiscover(args []string) error {
 	providerID := reg.CanonicalProviderID(rest[0])
 	p := reg.Providers[providerID]
 	if p == nil {
-		return fmt.Errorf("unknown provider %q (known: zai-coding, opencode-go)", rest[0])
+		return fmt.Errorf("unknown provider %q (known: zai-coding, opencode-go, litellm)", rest[0])
 	}
 
 	resolver := cred.New(st)
@@ -46,11 +66,9 @@ func cmdDiscover(args []string) error {
 	if credential == "" {
 		return fmt.Errorf("no credential for %s — set api_key in %s first", p.ID, st.ConfigPath())
 	}
-	baseURL := p.BaseURL
-	if p.BaseURLEnv != "" {
-		if v := os.Getenv(p.BaseURLEnv); v != "" {
-			baseURL = v
-		}
+	baseURL := providerBaseURL(st, p)
+	if baseURL == "" {
+		return fmt.Errorf("no base URL for %s — set base_url in %s or export %s", p.ID, st.ConfigPath(), p.BaseURLEnv)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)

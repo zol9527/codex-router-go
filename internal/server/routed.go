@@ -439,7 +439,7 @@ func (s *Server) serveRouted(w http.ResponseWriter, r *http.Request,
 	headers := translate.UpstreamHeadersFrom(headerMap(r.Header), credential, Version)
 	headers["Content-Type"] = "application/json"
 	headers["Accept"] = prepared.Accept
-	target := strings.TrimSuffix(providerBaseURL(provider), "/") + prepared.Path
+	target := strings.TrimSuffix(s.providerBaseURL(provider), "/") + prepared.Path
 
 	// 直通协议：上游本来就是 Responses，字节原样转发
 	//（守卫/翻译管线只服务需要翻译的协议）。
@@ -732,10 +732,21 @@ func (s *Server) recordTurn(event usage.Event) {
 	}
 }
 
-// providerBaseURL 解析 provider 的上游地址（env 覆盖 > 注册表默认）。
-func providerBaseURL(p *registry.Provider) string {
+// providerBaseURL 解析 provider 的上游地址（env 覆盖 > config base_url >
+// 注册表默认）。config 档服务自托管 provider（如 LiteLLM）：注册表不
+// 内嵌部署地址，运行时从 config.toml 的 provider 表读取。
+func (s *Server) providerBaseURL(p *registry.Provider) string {
 	if p.BaseURLEnv != "" {
 		if v := os.Getenv(p.BaseURLEnv); v != "" {
+			return v
+		}
+	}
+	family := p.ID
+	if p.VariantOf != "" {
+		family = p.VariantOf
+	}
+	if s.opt.State != nil {
+		if v := strings.TrimSpace(s.opt.State.ReadConfigBaseURL(family)); v != "" {
 			return v
 		}
 	}

@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -259,6 +260,55 @@ func TestWSSilentWatchdogTearsDownPipe(t *testing.T) {
 		// 收到帧即意外（黑洞上游不回帧）。
 		t.Fatal("silent upstream must not send frames")
 	}
+}
+
+// startWSPingRecorderUpstream 起一个只数 ping 的黑洞上游：接受升级、
+// 收帧不回（跨 turn 空闲形态），并记录收到的 ping 控制帧数。
+func startWSPingRecorderUpstream(t *testing.T) (*httptest.Server, *atomic.Int32) {
+	t.Helper()
+	var pings atomic.Int32
+	up := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.SetPingHandler(func(string) error {
+			pings.Add(1)
+			return nil
+		})
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	t.Cleanup(ts.Close)
+	return ts, &pings
+}
+
+// keepalive ping：完全空闲的管道上也应周期性向上游发 ping —— 中间设备
+// （NAT/TUN）按空闲超时砍 TCP 时，链路上的周期流量能保住管道。
+func TestWSKeepalivePingsIdleUpstream(t *testing.T) {
+	upstream, pings := startWSPingRecorderUpstream(t)
+	srv, ts := newTestServer(t)
+	srv.opt.NativeBase = upstream.URL
+	srv.wsKeepalive = 40 * time.Millisecond
+
+	callerKey, _ := srv.opt.State.CallerKey()
+	header := http.Header{}
+	header.Set("X-Codex-Routing-Hint", "model=gpt-5.6-sol")
+	conn, _, err := websocket.DefaultDialer.Dial(wsRouterURL(ts, callerKey), header)
+	if err != nil {
+		t.Fatalf("native hint should upgrade: %v", err)
+	}
+	defer conn.Close()
+
+	// 客户端不发任何数据帧：纯空闲管道上 keepalive 应持续到达上游。
+	waitFor(t, "at least 3 keepalive pings on idle pipe", func() bool {
+		return pings.Load() >= 3
+	})
 }
 
 // 看门狗不误杀跨 turn 空闲：一问一答后管道静默超过窗口（无待答请求）

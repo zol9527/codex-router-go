@@ -22,6 +22,9 @@ type Provider struct {
 	OwnedBy     string     `json:"ownedBy"`
 	BaseURL     string     `json:"baseUrl"`
 	BaseURLEnv  string     `json:"baseUrlEnv"`
+	// DefaultContextWindow 只给动态发现使用：未知模型没有元数据命中时，
+	// 用 provider 声明的保守窗口，避免 0 进入 Codex catalog。
+	DefaultContextWindow int        `json:"defaultContextWindow,omitempty"`
 	Protocol    string     `json:"protocol"` // "" = chat completions; "openai-responses"; "anthropic"
 	VariantOf   string     `json:"variantOf"`
 	Credential  Credential `json:"credential"`

@@ -272,6 +272,9 @@ func buildEntry(p *registry.Provider, upstreamID string, clone *registry.Model, 
 		model.InputModalities = clone.InputModalities
 		model.RequestProfile = clone.RequestProfile
 		model.CompHash = clone.CompHash
+	} else if p.DefaultContextWindow > 0 {
+		model.ContextWindow = p.DefaultContextWindow
+		model.AutoCompact = p.DefaultContextWindow * 9 / 10
 	}
 	entry := registry.UserModelEntry{Model: model, Source: "clone", AddedAt: now}
 

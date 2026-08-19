@@ -305,6 +305,26 @@ func (s *State) ReadConfigCredential(table string) (string, bool) {
 	return value, true
 }
 
+// ReadConfigBaseURL reads the optional base_url from the same provider
+// table as api_key. It deliberately follows ReadConfigCredential's fallback
+// rules so the GUI-started service can resolve values from [env].file.
+func (s *State) ReadConfigBaseURL(table string) string {
+	raw, err := os.ReadFile(s.ConfigPath())
+	if err != nil {
+		return ""
+	}
+	doc, err := tomlconf.Parse(string(raw))
+	if err != nil {
+		return ""
+	}
+	value, ok := doc.Get(table, "base_url")
+	if !ok {
+		return ""
+	}
+	fallback := s.envFileFallback(doc)
+	return strings.TrimSpace(tomlconf.ExpandEnvWith(value, fallback))
+}
+
 // envFileFallback 读取 config.toml [env].file 指向的 dotenv 环境文件。
 // 未配置、文件缺失或没有可认识的行都返回 nil —— 兜底只是增强，
 // 绝不能让主解析路径失败。支持 ~ 开头路径。

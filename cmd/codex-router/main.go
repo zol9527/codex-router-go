@@ -132,6 +132,7 @@ func cmdServe(args []string) error {
 		UpstreamHeaderTimeout: envDurationSec("CODEX_ROUTER_HEADER_TIMEOUT_SEC", server.DefaultUpstreamHeaderTimeout),
 		UpstreamIdleTimeout:   envDurationSec("CODEX_ROUTER_IDLE_TIMEOUT_SEC", server.DefaultUpstreamIdleTimeout),
 		WSSilentTimeout:       envDurationSec("CODEX_ROUTER_WS_SILENT_TIMEOUT_SEC", server.DefaultWSSilentTimeout),
+		WSKeepaliveInterval:   envDurationSec("CODEX_ROUTER_WS_KEEPALIVE_SEC", server.DefaultWSKeepaliveInterval),
 		SlowRequestLogDelay:   envDurationSec("CODEX_ROUTER_SLOW_REQUEST_LOG_SEC", server.DefaultSlowRequestLogDelay),
 	})
 	if err != nil {

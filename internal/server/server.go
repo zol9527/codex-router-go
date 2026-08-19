@@ -49,6 +49,10 @@ type Options struct {
 	// 请求帧而上游此后零回帧超过该窗口 → 主动拆管（调用方重连自愈）。
 	// 跨 turn 空闲不拆。0 = 默认档；负值 = 关闭。
 	WSSilentTimeout time.Duration
+	// WSKeepaliveInterval 是上游 WS 管道的 keepalive ping 周期：空闲
+	// 管道周期性向上游发 ping，避免中间设备（NAT/TUN）按空闲超时砍断
+	// （客户端腿是本地回环，不发）。0 = 默认档；负值 = 关闭。
+	WSKeepaliveInterval time.Duration
 	// SlowRequestLogDelay 是慢请求可见性看门狗：请求在途超过该窗口
 	// 仍无收尾日志时补一行 `slow request pending`（只记录、不拆流）。
 	// 背景：2026-08-16 Surge fake-IP 把 TLS 握手黑洞，请求永久挂死且
@@ -67,6 +71,11 @@ type Server struct {
 	upstreamIdle time.Duration
 	// wsSilent 是解析后的 WS 管道看门狗窗口（0=关闭）。
 	wsSilent time.Duration
+	// wsKeepalive 是解析后的上游 keepalive ping 周期（0=关闭）。
+	wsKeepalive time.Duration
+	// wsKeepaliveIdleCap 是空闲管道的保活封顶：连续无数据帧超过该窗口
+	// 的管道主动干净关闭（防调用方泄漏管道时无限累积）。
+	wsKeepaliveIdleCap time.Duration
 	// slowRequestLog 是解析后的慢请求日志窗口（0=关闭）。
 	slowRequestLog time.Duration
 	// reg 是当前生效的注册表；SIGUSR1 热重载（动态注册模型后）整体
@@ -126,6 +135,16 @@ const (
 	// DefaultWSSilentTimeout：上游 response.created 正常 ~1s 内到达，
 	// 60s 极保守 —— 触发即认定上游侧黑洞（见 wsWatchdog）。
 	DefaultWSSilentTimeout = 60 * time.Second
+	// DefaultWSKeepaliveInterval：上游 WS 管道的 keepalive ping 周期。
+	// 2026-08-19 实证：上游腿经 Surge TUN，空闲管道在 ~30.05 分钟被
+	// 中间设备按空闲超时砍断（194 条管道 1006 unexpected EOF / RST），
+	// 下一次使用才发现管道已死。60s ping 让链路始终有流量，远低于
+	// 任何常见 NAT/TUN 空闲窗口。
+	DefaultWSKeepaliveInterval = 60 * time.Second
+	// DefaultWSKeepaliveIdleCap：keepalive 不设无限保活 —— 空闲超过该
+	// 窗口的管道主动干净关闭。正常会话的跨 turn 间隙远短于 2 小时；
+	// 泄漏管道（调用方 bug）2 小时后回收，防无限累积。
+	DefaultWSKeepaliveIdleCap = 2 * time.Hour
 	// DefaultSlowRequestLogDelay：健康长请求（GLM max effort + 大上下文）
 	// 约 90s 完成，120s 只记真正的悬挂、不误伤慢而正常的流。
 	DefaultSlowRequestLogDelay = 120 * time.Second
@@ -156,15 +175,18 @@ func New(opt Options) (*Server, error) {
 	headerTimeout := resolveTimeout(opt.UpstreamHeaderTimeout, DefaultUpstreamHeaderTimeout)
 	idleTimeout := resolveTimeout(opt.UpstreamIdleTimeout, DefaultUpstreamIdleTimeout)
 	wsSilent := resolveTimeout(opt.WSSilentTimeout, DefaultWSSilentTimeout)
+	wsKeepalive := resolveTimeout(opt.WSKeepaliveInterval, DefaultWSKeepaliveInterval)
 	slowLog := resolveTimeout(opt.SlowRequestLogDelay, DefaultSlowRequestLogDelay)
 	return &Server{
-		opt:            opt,
-		callerKey:      callerKey,
-		reg:            opt.Registry,
-		upstreamIdle:   idleTimeout,
-		wsSilent:       wsSilent,
-		slowRequestLog: slowLog,
-		visionCache:    vision.NewSessionCache(vision.SessionCacheCapacity),
+		opt:                opt,
+		callerKey:          callerKey,
+		reg:                opt.Registry,
+		upstreamIdle:       idleTimeout,
+		wsSilent:           wsSilent,
+		wsKeepalive:        wsKeepalive,
+		wsKeepaliveIdleCap: DefaultWSKeepaliveIdleCap,
+		slowRequestLog:     slowLog,
+		visionCache:        vision.NewSessionCache(vision.SessionCacheCapacity),
 		client: &http.Client{
 			// 上游思考型模型可能长时间不吐首字节 —— 但"永远不吐"必须
 			// fail-fast：响应头窗口由 ResponseHeaderTimeout 把关（计时

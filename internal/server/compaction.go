@@ -115,7 +115,7 @@ func (s *Server) handleRoutedCompaction(w http.ResponseWriter, r *http.Request,
 	headers := translate.UpstreamHeadersFrom(headerMap(r.Header), credential, Version)
 	headers["Content-Type"] = "application/json"
 	headers["Accept"] = prepared.Accept
-	target := strings.TrimSuffix(providerBaseURL(provider), "/") + prepared.Path
+	target := strings.TrimSuffix(s.providerBaseURL(provider), "/") + prepared.Path
 
 	resp, err := httpx.Fetch(r.Context(), http.MethodPost, target, headers, normalized, s.client, s.upstreamIdle)
 	if err != nil {

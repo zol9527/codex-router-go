@@ -7,7 +7,7 @@
 > 设计基线与迁移记录见 [GO-REWRITE-PLAN.md](GO-REWRITE-PLAN.md)。
 
 把 Codex（App 与 CLI）接到你自己的模型订阅上：**Z.ai GLM Coding Plan**、
-**opencode Go/Zen**，外加**原生 ChatGPT 订阅直通**。路由器以 Responses API
+**opencode Go/Zen**、自托管 **LiteLLM**，外加**原生 ChatGPT 订阅直通**。路由器以 Responses API
 的身份站在 Codex 背后，把外部模型混入 Codex 原生模型选择器——你在同一个
 picker 里选 `zai-coding/glm-5.3` 和 `gpt-5.6-sol`。
 
@@ -67,6 +67,10 @@ api_key = "sk-..."
 api_key = "..."
 # 也支持环境变量引用：api_key = "{ZAI_API_KEY}"
 # 未设置的变量展开为空（=未配置）；{非变量形状} 按字面量保留
+
+[litellm]
+api_key = "sk-..."
+# base_url = "https://your-litellm.example/v1"  # 必填；也可 export LITELLM_BASE_URL
 
 [env]
 # 可选：dotenv 兜底文件。GUI App 拉起的服务继承 launchd 环境，
@@ -134,6 +138,7 @@ zai HTTP 流挂 8 分半、原生 WSS 管道零回帧 10 分钟、Surge fake-IP 
 | 响应头超时 `CODEX_ROUTER_HEADER_TIMEOUT_SEC` | 300 | 上游多久不回响应头判死（502） | 设 `0` |
 | 流空闲看门狗 `CODEX_ROUTER_IDLE_TIMEOUT_SEC` | 180 | SSE 流上多久零字节判死：头未提交回 504 `upstream_idle_timeout`；已提交只截断（调用方整轮重试） | 设 `0` |
 | WS 静默看门狗 `CODEX_ROUTER_WS_SILENT_TIMEOUT_SEC` | 60 | 客户端发过请求帧而上游此后零回帧超窗口 → 主动拆管（跨 turn 空闲不拆） | 设 `0` |
+| WS keepalive `CODEX_ROUTER_WS_KEEPALIVE_SEC` | 60 | 空闲管道周期向上游发 ping，防中间设备（NAT/TUN）按空闲超时砍断（2026-08-19 实证：经 Surge TUN 的管道空闲 ~30 分钟必死） | 设 `0` |
 | 慢请求日志 `CODEX_ROUTER_SLOW_REQUEST_LOG_SEC` | 120 | 请求在途超窗口补一行 `slow request pending`（只记录、不拆流，收尾日志照常）—— 挂死请求不再零痕迹 | 设 `0` |
 
 失败一律落 `router.log`（含 model/provider/status/duration/错误摘要）与
