@@ -624,6 +624,15 @@ func (t *ChatToResponsesSSE) responseShell(status string) map[string]any {
 // input_tokens: 0 会让 Codex 永不压缩、会话撑爆窗口。替换只落在
 // 显式零上、estimate 只高不低（压缩阈值有 14% 余量），替换事实通过
 // SubstitutedInputTokens 单独暴露 —— telemetry 永远保留 provider 原值。
+//
+// null 防御（2026-08-19 实发）：上游（opencode）会偶发把 usage 字段或
+// details 子项报成 null（deepseek 短输出时 completion_tokens_details.
+// reasoning_tokens=null）。Codex 的 usage 反序列化是非 Option 整数，
+// 任何 null 都会让整个 ResponseCompleted 解析失败，客户端只能整轮
+// 丢弃并全量重试（实发一轮重试 11 次、浪费 ~50 万 input token）。
+// 因此这里非数值（null/字符串）一律不透传：字段缺失对 Codex 无害
+// （补零路径早已在产线省略键），null 则致命。details 只保留数值子项，
+// 全部非数值时整个省略。
 func (t *ChatToResponsesSSE) responsesUsage(usage map[string]any) map[string]any {
 	if usage == nil {
 		return nil
@@ -641,24 +650,41 @@ func (t *ChatToResponsesSSE) responsesUsage(usage map[string]any) map[string]any
 			out["total_tokens"] = float64(t.estimatedInput)
 		}
 	} else {
-		if v, ok := usage["prompt_tokens"]; ok {
+		if v, ok := usage["prompt_tokens"].(float64); ok {
 			out["input_tokens"] = v
 		}
-		if v, ok := usage["completion_tokens"]; ok {
+		if v, ok := usage["completion_tokens"].(float64); ok {
 			out["output_tokens"] = v
 		}
-		if v, ok := usage["total_tokens"]; ok {
+		if v, ok := usage["total_tokens"].(float64); ok {
 			out["total_tokens"] = v
 		}
 	}
-	if details, ok := usage["prompt_tokens_details"].(map[string]any); ok {
+	if details := numericDetails(usage["prompt_tokens_details"]); len(details) > 0 {
 		out["input_tokens_details"] = details
 	}
-	if details, ok := usage["completion_tokens_details"].(map[string]any); ok {
+	if details := numericDetails(usage["completion_tokens_details"]); len(details) > 0 {
 		out["output_tokens_details"] = details
 	}
 	if len(out) == 0 {
 		return nil
+	}
+	return out
+}
+
+// numericDetails 只保留 details map 里的数值子项（cached_tokens/
+// reasoning_tokens 等在 Codex 侧是非 Option 整数，null 会炸掉整个
+// 事件的解析）；非 map 或无数值子项时返回 nil。
+func numericDetails(raw any) map[string]any {
+	details, ok := raw.(map[string]any)
+	if !ok {
+		return nil
+	}
+	out := make(map[string]any, len(details))
+	for k, v := range details {
+		if n, ok := v.(float64); ok {
+			out[k] = n
+		}
 	}
 	return out
 }

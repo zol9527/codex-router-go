@@ -227,3 +227,57 @@ func TestMalformedDataIgnored(t *testing.T) {
 	}
 	_ = json.Marshal
 }
+
+// null 防御（2026-08-19 实发）：上游偶发把 usage 字段或 details 子项
+// 报成 null（deepseek 短输出时 reasoning_tokens=null），null 落进
+// response.completed 会让 Codex 整个事件解析失败并全量重试。
+// 数值照常透传，null 一律丢弃。
+func TestUsageNullDefense(t *testing.T) {
+	// SSE 路径：最终 chunk 携带含 null 的 usage。
+	tr := NewChatToResponsesSSE("", "m")
+	out := feedAll(t, tr,
+		`{"choices":[{"delta":{"content":"hi"}}]}`,
+		`{"usage":{"prompt_tokens":9,"completion_tokens":null,"total_tokens":null,`+
+			`"prompt_tokens_details":{"cached_tokens":null},`+
+			`"completion_tokens_details":{"reasoning_tokens":null,"text_tokens":4}}}`,
+		`[DONE]`)
+	var completed map[string]any
+	for _, block := range strings.Split(string(out), "\n\n") {
+		if strings.Contains(block, "response.completed") {
+			for _, line := range strings.Split(block, "\n") {
+				if strings.HasPrefix(line, "data: ") {
+					completed = obj(t, strings.TrimPrefix(line, "data: "))
+				}
+			}
+		}
+	}
+	usage := completed["response"].(map[string]any)["usage"].(map[string]any)
+	if usage["input_tokens"] != float64(9) {
+		t.Errorf("numeric fields should be preserved: %+v", usage)
+	}
+	for _, bad := range []string{"output_tokens", "total_tokens", "input_tokens_details"} {
+		if _, exists := usage[bad]; exists {
+			t.Errorf("%s must be dropped when null, got: %+v", bad, usage)
+		}
+	}
+	details := usage["output_tokens_details"].(map[string]any)
+	if details["text_tokens"] != float64(4) || len(details) != 1 {
+		t.Errorf("details should keep only numeric subfields, got: %+v", details)
+	}
+
+	// 非流式路径共用 responsesUsage，同样防御；序列化结果不允许出现 null 字面量。
+	body := obj(t, `{"choices":[{"message":{"role":"assistant","content":"x"}}],`+
+		`"usage":{"prompt_tokens":null,"completion_tokens":2,"total_tokens":null}}`)
+	resp := TranslateNonStreamChat(body, "", "m")
+	usage2 := resp["usage"].(map[string]any)
+	if _, exists := usage2["input_tokens"]; exists {
+		t.Errorf("null prompt_tokens must not surface as input_tokens: %+v", usage2)
+	}
+	if usage2["output_tokens"] != float64(2) {
+		t.Errorf("numeric completion_tokens should survive: %+v", usage2)
+	}
+	raw, _ := json.Marshal(usage2)
+	if strings.Contains(string(raw), "null") {
+		t.Errorf("serialized usage must not contain null: %s", raw)
+	}
+}
