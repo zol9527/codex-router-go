@@ -64,7 +64,15 @@ func RoutedModel(template NativeModel, m *registry.Model) NativeModel {
 		modalities = []string{"text"}
 	}
 	next["input_modalities"] = modalities
-	next["comp_hash"] = m.CompHash
+	// comp_hash 刻意删除：克隆源模板（native 条目）自带 comp_hash（如
+	// luna 的 "3000"），而 Codex 只在两侧都有值且不同时把模型切换判定为
+	// 需要交接压缩（CompHashChanged）。子代理 fork 会继承父线程的
+	// previous_turn_settings（native 父模型），与外部模型的 hash 必不同
+	// —— 每次派发都开场白压一次（重放全量上下文，约 20s）。routed 条目
+	// 不声明 compaction 兼容组，任一侧缺失即跳过该压缩（Codex 测试
+	// pre_sampling_compact_skips_when_either_comp_hash_is_missing 覆盖的
+	// 语义）；token 超限与降窗压缩不读该字段，不受影响。
+	delete(next, "comp_hash")
 	next["additional_speed_tiers"] = []any{}
 	next["default_service_tier"] = nil
 	next["supports_reasoning_summaries"] = false
