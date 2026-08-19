@@ -75,6 +75,11 @@ func RoutedModel(template NativeModel, m *registry.Model) NativeModel {
 	delete(next, "comp_hash")
 	next["additional_speed_tiers"] = []any{}
 	next["default_service_tier"] = nil
+	// supports_parallel_tool_calls：桌面端 2026-08-19 起把该字段列为
+	// 必填（serde 无默认），缺失会让整个 model_catalog_json 解析失败、
+	// picker 退回纯原生目录（2026-08-20 实发 "missing field" 全量拒收）。
+	// chat 翻译层对多条 tool_calls 数组透明，按原生行为声明支持。
+	next["supports_parallel_tool_calls"] = true
 	next["supports_reasoning_summaries"] = false
 	next["default_reasoning_summary"] = "none"
 	next["support_verbosity"] = false
@@ -108,6 +113,12 @@ func FetchNative(codexBinary string) ([]NativeModel, error) {
 				continue
 			}
 			seen[slug] = true
+			// 桌面端 2026-08-19 起必填 supports_parallel_tool_calls（见
+			// RoutedModel 同名注释）。codex CLI（0.148）的 debug models 输出
+			// 还没带它 —— 缺失时补 true（GPT 系原生行为），CLI 补齐后透传。
+			if _, ok := model["supports_parallel_tool_calls"]; !ok {
+				model["supports_parallel_tool_calls"] = true
+			}
 			merged = append(merged, model)
 		}
 	}

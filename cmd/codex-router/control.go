@@ -110,6 +110,15 @@ func cmdControl(args []string) error {
 	// providers 形式都按 list 处理。
 	case len(rest) >= 1 && rest[0] == "providers":
 		return controlProvidersList(st, reg, hasJSONFlag(rest))
+	case len(rest) >= 3 && rest[0] == "set" && (rest[2] == "on" || rest[2] == "off"):
+		// 托盘开关协议：`set <id> on|off [--targets codex]`。UI 的开关
+		// 按钮走这条（providers enable 只有追加形态，关不掉）。
+		return controlProvidersSet(st, reg, rest[1], rest[2] == "on")
+	case len(rest) >= 1 && rest[0] == "apply":
+		// 托盘在 set 之后紧跟 `apply --targets codex --activate`：重发布
+		// catalog + config 集成块。等价 reload（幂等，caller key 不变），
+		// 路由强制本身按请求实时判定，不依赖这一步。
+		return controlReload(st, reg)
 	case cutControlCommand(rest) != "":
 		return fmt.Errorf("%s was removed in the go rewrite; this build serves codex routing only", cutControlCommand(rest))
 	case len(rest) >= 1 && rest[0] == "credential" && len(rest) >= 2:
@@ -161,6 +170,8 @@ func controlUsage() {
   control service start|stop|restart|status
   control providers list [--json]
   control providers enable ID [ID...]     (append to selection)
+  control set ID on|off                   (tray toggle path; rewrites selection)
+  control apply                           (republish catalog + config block; = reload)
   control credential PROVIDER             write api_key to config.toml (stdin prompt)
   control credential PROVIDER --remove    remove the provider's config.toml table
   control config init                     write the commented config.toml template
@@ -183,7 +194,7 @@ func cutControlCommand(rest []string) string {
 		return ""
 	}
 	cut := map[string]bool{
-		"apply": true, "doctor": true, "maintenance": true,
+		"doctor": true, "maintenance": true,
 		"auth-mode": true, "signed-routing": true,
 		"login": true, "install-cli": true,
 		"harness": true, "local-models": true,
@@ -466,7 +477,47 @@ func controlProvidersEnable(st *state.State, reg *registry.Registry, ids []strin
 		return err
 	}
 	fmt.Printf("enabled providers: %s\n", strings.Join(current, ", "))
-	fmt.Println("republish the catalog by re-running install")
+	fmt.Println("republish the catalog with `control apply` (tray does this automatically)")
+	return nil
+}
+
+// controlProvidersSet 是托盘开关的写路径：`set <id> on|off`。与
+// controlProvidersEnable（只追加）不同，这里整体重写选择 —— 关闭即从
+// enabled-providers.json 移除。变体 id 归一到家族主 id（协议变体与主
+// provider 一起启停，见 state.ProviderEnabled）。
+func controlProvidersSet(st *state.State, reg *registry.Registry, id string, on bool) error {
+	if reg.Providers[id] == nil {
+		canonical := reg.CanonicalProviderID(id)
+		if reg.Providers[canonical] == nil {
+			return fmt.Errorf("unknown provider %q", id)
+		}
+		id = canonical
+	}
+	current := st.EnabledProviders()
+	next := make([]string, 0, len(current)+1)
+	found := false
+	for _, existing := range current {
+		if existing == id {
+			found = true
+			if on {
+				next = append(next, existing)
+			}
+			continue
+		}
+		next = append(next, existing)
+	}
+	if on && !found {
+		next = append(next, id)
+	}
+	if err := st.SetEnabledProviders(next); err != nil {
+		return err
+	}
+	stateText := "disabled"
+	if on {
+		stateText = "enabled"
+	}
+	fmt.Printf("provider %s: %s (%d selected)\n", id, stateText, len(next))
+	fmt.Println("run `control apply` to republish the catalog (tray does this automatically)")
 	return nil
 }
 
@@ -559,6 +610,13 @@ func controlConfig(st *state.State, args []string) error {
 func controlReload(st *state.State, reg *registry.Registry) error {
 	if err := st.ConfigParseError(); err != nil {
 		return fmt.Errorf("config.toml: %w", err)
+	}
+	// 覆盖层可能在本命令内刚被改写（models add/remove/sync 先写
+	// user-models.json 再走到这里）——重载一次注册表，catalog 重发布
+	// 必须看到最新条目，而不是命令启动时的快照（2026-08-20 实发：
+	// models add litellm 后 catalog 仍 13 条，新模型被静默漏掉）。
+	if fresh, err := registry.LoadWithOverlay(st.Dir, ""); err == nil {
+		reg = fresh
 	}
 	enabled := map[string]bool{}
 	for _, id := range st.EnabledProviders() {
