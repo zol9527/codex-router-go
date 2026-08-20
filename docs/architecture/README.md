@@ -58,7 +58,7 @@ flowchart LR
 | `internal/domain/usage/` | 记录 `usage-events.jsonl`，维护配额、限流、供应商用量统计。 |
 | `internal/domain/vision/` | 图片桥：文本模型无法直接读图时，由本地视觉模型先读图并转成文字描述。 |
 | `internal/lib/httpx/` | HTTP 客户端、压缩、超时、SSE / 流式传输基础设施。 |
-| `apps/macos/ModelRouterTray/` | macOS Swift / SwiftUI App：托盘、主窗口、设置页、服务托管、模型管理。契约解码在 `ControlContract.swift`（与 Go `internal/app/controlplane` 对端），服务生命周期在 `ServiceLifecycle.swift`（App 托管路径 + Codex 桌面重启），control 进程执行在 `ControlClient.swift`（RouterControlClient）。 |
+| `apps/macos/ModelRouterTray/` | macOS Swift / SwiftUI App：托盘、主窗口、设置页、服务托管、模型管理。`Sources/` 与 Go 侧同纪律分层：`App/`（入口+AppDelegate）、`Domain/`（RouterStore 状态机，按 extension 拆分 + 值类型）、`Engine/`（ControlClient 进程执行、ServiceLifecycle 托管）、`Contract/`（ControlContract.swift，与 Go `internal/app/controlplane` 对端）、`Views/`（TrayView/设置/用量 + `Views/Island/` 悬浮岛）、`Lib/`（Localization）。 |
 | `skills/` | 项目相关 Codex 技能说明。 |
 | `docs/` | 研究与架构文档。 |
 | `scripts/` | macOS App / 桌面托盘 / 图标等构建脚本。 |
