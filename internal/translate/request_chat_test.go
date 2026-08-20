@@ -430,6 +430,56 @@ func TestOtherProfilesStripCarry(t *testing.T) {
 	}
 }
 
+// custom_tool_call 回放的 arguments 必须是 JSON 对象字面量：严格上游
+// （volcengine ark，2026-08-20 deepseek-v4-flash 实发）对历史 tool_calls
+// 做 json.loads(...).items()，字符串载荷以 'str' object has no attribute
+// 'items' 400——code-mode exec 的自由文本载荷任何续轮必炸。对象形态与
+// 声明侧伪装 schema 的 {input: string} 一致，customToolInput 按 "input"
+// 键解包，往返闭环自洽。
+func TestCustomToolCallReplayObjectArguments(t *testing.T) {
+	payload := "console.log('hi')\nsecond line \"quoted\""
+	input := map[string]any{
+		"model": "m",
+		"input": []any{
+			map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "go"}}},
+			map[string]any{"type": "custom_tool_call", "call_id": "call_c", "name": "exec", "input": payload},
+			map[string]any{"type": "custom_tool_call_output", "call_id": "call_c", "output": "hi"},
+		},
+		"tools":  []any{map[string]any{"type": "custom", "name": "exec", "description": "Run code.", "format": map[string]any{"type": "text"}}},
+		"stream": true,
+	}
+	chat, err := TranslateToChat(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	messages := chat.Body["messages"].([]map[string]any)
+	var fn map[string]any
+	for _, message := range messages {
+		calls, _ := message["tool_calls"].([]any)
+		for _, raw := range calls {
+			if call, ok := raw.(map[string]any); ok {
+				if f, ok := call["function"].(map[string]any); ok {
+					fn = f
+				}
+			}
+		}
+	}
+	if fn == nil {
+		t.Fatal("custom_tool_call must replay as assistant tool_calls")
+	}
+	args, _ := fn["arguments"].(string)
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(args), &parsed); err != nil {
+		t.Fatalf("arguments must be a JSON object literal, got %q (err %v)", args, err)
+	}
+	if parsed["input"] != payload {
+		t.Errorf("input payload must survive replay, got %q", parsed["input"])
+	}
+	if got := customToolInput(args); got != payload {
+		t.Errorf("customToolInput round trip broken, got %q", got)
+	}
+}
+
 // custom 工具往返：声明翻译成 {input: string} function + 名字收集；
 // 响应侧对这些名字的调用还原成 custom_tool_call（自由文本 input）。
 // 背景（2026-08-15 事故）：catalog 继承了原生模板的

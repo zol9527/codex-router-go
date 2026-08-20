@@ -277,6 +277,14 @@ func inputItemToMessages(item map[string]any, omissions *omissionLog) []map[stri
 		name, _ := item["name"].(string)
 		inputText, _ := item["input"].(string)
 		callID, _ := item["call_id"].(string)
+		// arguments 必须是 JSON 对象字面量（{"input": ...}，与声明侧
+		// 伪装 schema 的单参形态一致）：部分严格上游（volcengine ark，
+		// 2026-08-20 deepseek-v4-flash 实发）对历史回放的 tool_calls 做
+		// json.loads(...).items()，字符串载荷（%q 直包自由文本）会以
+		// 'str' object has no attribute 'items' 400——code-mode exec 的
+		// 载荷就是自由文本，任何续轮必炸。响应侧 customToolInput 优先
+		// 解 {"input": ...}，往返闭环自洽。
+		args, _ := json.Marshal(map[string]any{"input": inputText})
 		return []map[string]any{{
 			"role": "assistant",
 			"tool_calls": []any{map[string]any{
@@ -284,7 +292,7 @@ func inputItemToMessages(item map[string]any, omissions *omissionLog) []map[stri
 				"type": "function",
 				"function": map[string]any{
 					"name":      name,
-					"arguments": fmt.Sprintf("%q", inputText),
+					"arguments": string(args),
 				},
 			}},
 		}}
