@@ -14,14 +14,14 @@ import (
 	"time"
 
 	"context"
-	"github.com/loyd/codex-router/internal/catalog"
-	"github.com/loyd/codex-router/internal/configfile"
-	"github.com/loyd/codex-router/internal/controlplane"
+	"github.com/loyd/codex-router/internal/app/codexconfig"
+	"github.com/loyd/codex-router/internal/app/controlplane"
+	"github.com/loyd/codex-router/internal/engine/catalog"
 
-	"github.com/loyd/codex-router/internal/cred"
-	"github.com/loyd/codex-router/internal/discover"
-	"github.com/loyd/codex-router/internal/registry"
-	"github.com/loyd/codex-router/internal/state"
+	"github.com/loyd/codex-router/internal/domain/cred"
+	"github.com/loyd/codex-router/internal/domain/registry"
+	"github.com/loyd/codex-router/internal/domain/state"
+	"github.com/loyd/codex-router/internal/engine/discover"
 )
 
 // cmdControl：tray 的控制面。子命令集合是旧 bin/control 的核心裁剪：
@@ -206,7 +206,7 @@ func cutControlCommand(rest []string) string {
 }
 
 // controlJSON 是 tray 五分钟轮询的主快照。契约形状归
-// internal/controlplane（类型化 Snapshot，与 Swift RouterSnapshot
+// internal/app/controlplane（类型化 Snapshot，与 Swift RouterSnapshot
 // 解码器锚定）；这里只做依赖装配与 stdout 输出。
 func controlJSON(st *state.State, reg *registry.Registry) error {
 	marshal := func(v any) json.RawMessage {
@@ -238,7 +238,7 @@ func controlJSON(st *state.State, reg *registry.Registry) error {
 // 常态下服务由 Model Router App 作为子进程托管（App 退出它也退出）；
 // 这里的 start 是终端救急路径（分离进程，App 之外存活），stop 对
 // pidfile 里的进程发 SIGTERM —— App 托管的与终端拉起的都一样能停。
-// 生命周期实现归 internal/controlplane；这里只做命令面适配。
+// 生命周期实现归 internal/app/controlplane；这里只做命令面适配。
 func controlService(args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("service requires start|stop|restart|status")
@@ -494,7 +494,7 @@ func controlReload(st *state.State, reg *registry.Registry) error {
 	if err != nil {
 		return err
 	}
-	if err := configfile.Install(codexConfigPath(), configfile.RouterConfig{
+	if err := codexconfig.Install(codexConfigPath(), codexconfig.RouterConfig{
 		BaseURL:     fmt.Sprintf("http://127.0.0.1:%d/_codex-router/%s/v1", defaultPort(), callerKey),
 		CatalogPath: filepath.Join(absState, "merged-models.json"),
 	}); err != nil {

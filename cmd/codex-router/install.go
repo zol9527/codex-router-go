@@ -9,12 +9,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/loyd/codex-router/internal/catalog"
-	"github.com/loyd/codex-router/internal/configfile"
-	"github.com/loyd/codex-router/internal/cred"
-	"github.com/loyd/codex-router/internal/discover"
-	"github.com/loyd/codex-router/internal/registry"
-	"github.com/loyd/codex-router/internal/state"
+	"github.com/loyd/codex-router/internal/app/codexconfig"
+	"github.com/loyd/codex-router/internal/domain/cred"
+	"github.com/loyd/codex-router/internal/domain/registry"
+	"github.com/loyd/codex-router/internal/domain/state"
+	"github.com/loyd/codex-router/internal/engine/catalog"
+	"github.com/loyd/codex-router/internal/engine/discover"
 )
 
 // cmdInstall：secret 生成 → catalog 发布 → config.toml 集成。
@@ -87,7 +87,7 @@ func cmdInstall(args []string) error {
 	if err != nil {
 		return err
 	}
-	routerCfg := configfile.RouterConfig{
+	routerCfg := codexconfig.RouterConfig{
 		BaseURL:     fmt.Sprintf("http://127.0.0.1:%d/_codex-router/%s/v1", *port, callerKey),
 		CatalogPath: filepath.Join(absState, "merged-models.json"),
 	}
@@ -99,7 +99,7 @@ func cmdInstall(args []string) error {
 		fmt.Println("service runs inside the Model Router app (launchd no longer involved)")
 		return nil
 	}
-	if err := configfile.Install(codexConfig, routerCfg); err != nil {
+	if err := codexconfig.Install(codexConfig, routerCfg); err != nil {
 		return err
 	}
 
@@ -138,7 +138,7 @@ func cmdUninstall(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if err := configfile.Uninstall(codexConfigPath()); err != nil {
+	if err := codexconfig.Uninstall(codexConfigPath()); err != nil {
 		return err
 	}
 	if err := uninstallLaunchd(); err != nil {
@@ -167,7 +167,7 @@ func cmdUninstall(args []string) error {
 }
 
 // removeBinaryInstall 清掉安装的工件。二进制可以住在操作者的共享目录
-//（如 ~/bin）里，那里还有人家自己的东西 —— 只删自己放下的三样：二进制
+// （如 ~/bin）里，那里还有人家自己的东西 —— 只删自己放下的三样：二进制
 // 本体、旁边的 config/ 注册表拷贝、bin/control 启动器（bin/ 目录空了
 // 才顺手删）。旧自包含布局（~/.local/share/codex-router-go）整个目录
 // 都是路由器的，整体删除。返回用于状态行的人类可读片段。
@@ -246,7 +246,7 @@ func cmdDoctor(args []string) error {
 	_, statErr := os.Stat(merged)
 	check("catalog present", statErr == nil, merged)
 
-	installed, baseURL, _ := configfile.Status(codexConfigPath())
+	installed, baseURL, _ := codexconfig.Status(codexConfigPath())
 	check("codex config integration", installed, redactURL(baseURL))
 
 	// 坏的 config.toml 会让凭证静默失效（解析失败按无凭证处理），

@@ -31,9 +31,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/loyd/codex-router/internal/cred"
-	"github.com/loyd/codex-router/internal/registry"
-	"github.com/loyd/codex-router/internal/state"
+	"github.com/loyd/codex-router/internal/domain/cred"
+	"github.com/loyd/codex-router/internal/domain/registry"
+	"github.com/loyd/codex-router/internal/domain/state"
 )
 
 // probeNeedle 是可见性测试的密码短语（内容任意，固定以便对照档案）。

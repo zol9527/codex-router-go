@@ -4,7 +4,7 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/loyd/codex-router/internal/state"
+	"github.com/loyd/codex-router/internal/domain/state"
 )
 
 // 托盘开关协议的完整路径（含 dispatch 形状与 --targets 位置参数）：

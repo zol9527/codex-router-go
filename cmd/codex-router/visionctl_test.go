@@ -12,9 +12,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/loyd/codex-router/internal/registry"
-	"github.com/loyd/codex-router/internal/state"
-	"github.com/loyd/codex-router/internal/vision"
+	"github.com/loyd/codex-router/internal/domain/registry"
+	"github.com/loyd/codex-router/internal/domain/state"
+	"github.com/loyd/codex-router/internal/domain/vision"
 )
 
 // captureStdout 捕获被测函数写到 stdout 的内容（printVisionStatus 用）。

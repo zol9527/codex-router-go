@@ -18,11 +18,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/loyd/codex-router/internal/cred"
-	"github.com/loyd/codex-router/internal/registry"
-	"github.com/loyd/codex-router/internal/server"
-	"github.com/loyd/codex-router/internal/state"
-	"github.com/loyd/codex-router/internal/usage"
+	"github.com/loyd/codex-router/internal/app/server"
+	"github.com/loyd/codex-router/internal/domain/cred"
+	"github.com/loyd/codex-router/internal/domain/registry"
+	"github.com/loyd/codex-router/internal/domain/state"
+	"github.com/loyd/codex-router/internal/domain/usage"
 )
 
 // version 在构建时通过 -ldflags 注入。

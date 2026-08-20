@@ -10,11 +10,11 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/loyd/codex-router/internal/controlplane"
-	"github.com/loyd/codex-router/internal/cred"
-	"github.com/loyd/codex-router/internal/registry"
-	"github.com/loyd/codex-router/internal/state"
-	"github.com/loyd/codex-router/internal/usage"
+	"github.com/loyd/codex-router/internal/app/controlplane"
+	"github.com/loyd/codex-router/internal/domain/cred"
+	"github.com/loyd/codex-router/internal/domain/registry"
+	"github.com/loyd/codex-router/internal/domain/state"
+	"github.com/loyd/codex-router/internal/domain/usage"
 )
 
 // controlAccount 读取 ChatGPT 原生订阅的用量窗口（tray 的账号卡片）。

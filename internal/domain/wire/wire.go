@@ -1,0 +1,160 @@
+// Package wire 是协议抽象层：把"Codex 说的 Responses 协议"与
+// "上游说的协议"之间的适配，从 server 请求管线里分离出来。
+//
+// 每条协议路径（chat completions 翻译、Responses 直通、未来的
+// anthropic messages 等）实现 Protocol 接口并注册；provider 在注册表
+// 里用 Protocol 字段声明自己说哪种协议。server 的路由管线只面向
+// wire.Protocol，新增 provider/协议不再触碰请求管线。
+//
+// 目录结构按协议分家：
+//
+//	internal/domain/wire/chatcompletion/   Responses ↔ chat completions 翻译
+//	internal/domain/wire/responses/        Responses 直通（上游原生说 Responses）
+package wire
+
+import (
+	"fmt"
+	"sort"
+	"sync"
+
+	"github.com/loyd/codex-router/internal/domain/registry"
+	"github.com/loyd/codex-router/internal/domain/translate"
+)
+
+// Request 是 Prepare 的产物：发往上游所需的一切。
+type Request struct {
+	// Path 是相对 provider base URL 的路径（"/chat/completions"、"/responses"）。
+	Path string
+	// Body 是已翻译的上游请求体（model 字段已替换为 upstream id）。
+	Body map[string]any
+	// Stream 记录调用方是否要求流式（协议实现翻译后的真实形态）。
+	Stream bool
+	// Accept 是响应协商头（"text/event-stream" / "application/json"）。
+	Accept string
+	// CustomTools 是请求里 custom 工具的名字集合（chat 协议把声明
+	// 伪装成 function，响应翻译需要知道哪些名字要还原成
+	// custom_tool_call）。非 chat 协议为空。
+	CustomTools []string
+	// OmittedItemTypes / OmittedPartTypes：翻译期因类型未知被降级的
+	// input item / content part 类型名（占位符替换或丢弃）。非空说明
+	// 客户端协议形状未被翻译器完全覆盖，内容可能静默丢失——server
+	// 层负责告警日志。非 chat 协议为空。
+	OmittedItemTypes []string
+	OmittedPartTypes []string
+}
+
+// StreamOptions 携带响应翻译所需的会话上下文。
+type StreamOptions struct {
+	// SessionModel 是路由会话的模型 slug（create_thread 注入用）。
+	SessionModel string
+	// EstimateInput 是 prompt-token 补零估算（0 = 不装载）。
+	EstimateInput int
+	// NamespaceIndex 是本请求的 namespace 还原索引（可空）。
+	NamespaceIndex *translate.NamespaceIndex
+	// CustomTools 是本请求的 custom 工具名（可空）—— 来自 Prepare
+	// 的产物，响应侧据此还原 custom_tool_call 形态。
+	CustomTools []string
+}
+
+// StreamTranslator 把上游协议的 SSE 流增量翻译成 Responses 事件。
+type StreamTranslator interface {
+	Created() []byte
+	Feed(data string) []byte
+	HasContent() bool
+	// HasToolCalls 报告本流是否出现过任何 tool call item（含未完成）。
+	// 中途断流时调用方据此判定副作用风险：客户端整轮重试会重复执行
+	// 已见过的工具调用，此时必须以 response.failed 收尾而非静默截断。
+	HasToolCalls() bool
+	PromptTokens() int64
+	OutputTokens() int64
+	TotalTokens() int64
+	SubstitutedInputTokens() int
+}
+
+// Protocol 是一条协议路径的最小完整适配：请求方向。每个协议实现都
+// 能诚实地实现全部方法 —— 画像施加（effort 阶梯、参数清洗）属于
+// Prepare 的私有阶段（作用于上游协议字段），不再外露为接口方法。
+type Protocol interface {
+	// Name 是协议注册名（"chat-completions"、"responses"）。
+	Name() string
+	// Prepare 把 Responses 请求体翻译成上游形态。
+	Prepare(responsesRequest map[string]any, model *registry.Model) (*Request, error)
+	// NeedsResponseTranslation 报告上游响应是否需要转回 Responses：
+	// 直通协议为 false（上游本来就是 Responses，字节原样转发）。
+	NeedsResponseTranslation() bool
+}
+
+// ResponseTranslator 是翻译协议（NeedsResponseTranslation=true）的
+// 响应方向能力。直通协议不实现该接口 —— 上游响应原样转发，不存在
+// "翻译"实现，接口拆分让每个协议只承诺自己做得到的事。
+type ResponseTranslator interface {
+	// NewStreamTranslator 创建上游 SSE → Responses SSE 的流转换器。
+	NewStreamTranslator(model *registry.Model, opts StreamOptions) StreamTranslator
+	// TranslateNonStream 把非流式上游响应整体翻译成 Responses JSON。
+	TranslateNonStream(upstreamBody map[string]any, model *registry.Model, opts StreamOptions) map[string]any
+}
+
+// TranslatorFor 断言协议的响应翻译能力。NeedsResponseTranslation=true
+// 的协议必须同时实现 ResponseTranslator —— 违反即注册期契约错误，
+// 拒绝静默降级。
+func TranslatorFor(p Protocol) (ResponseTranslator, error) {
+	if t, ok := p.(ResponseTranslator); ok {
+		return t, nil
+	}
+	return nil, fmt.Errorf("protocol %q needs response translation but implements no ResponseTranslator", p.Name())
+}
+
+// ---- 注册表 ----
+
+var (
+	registryMu sync.Mutex
+	protocols  = map[string]Protocol{}
+)
+
+// Register 登记一个协议实现（重复名后者覆盖，方便测试注入）。
+func Register(p Protocol) {
+	registryMu.Lock()
+	defer registryMu.Unlock()
+	protocols[p.Name()] = p
+}
+
+// ByName 按注册名取协议。
+func ByName(name string) (Protocol, error) {
+	registryMu.Lock()
+	defer registryMu.Unlock()
+	if p, ok := protocols[name]; ok {
+		return p, nil
+	}
+	return nil, fmt.Errorf("no wire protocol registered as %q", name)
+}
+
+// ProtocolNameForProvider 把注册表的 provider.Protocol 声明映射到协议名。
+// 空声明（绝大多数 provider）= chat completions。
+func ProtocolNameForProvider(p *registry.Provider) string {
+	if p == nil || p.Protocol == "" {
+		return "chat-completions"
+	}
+	switch p.Protocol {
+	case "openai-responses":
+		return "responses"
+	default:
+		return p.Protocol
+	}
+}
+
+// ForProvider 解析 provider 声明的协议实现。
+func ForProvider(p *registry.Provider) (Protocol, error) {
+	return ByName(ProtocolNameForProvider(p))
+}
+
+// Registered 列出已注册协议名（排序稳定，诊断输出用）。
+func Registered() []string {
+	registryMu.Lock()
+	defer registryMu.Unlock()
+	names := make([]string, 0, len(protocols))
+	for name := range protocols {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}

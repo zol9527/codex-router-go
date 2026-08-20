@@ -9,10 +9,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/loyd/codex-router/internal/cred"
-	"github.com/loyd/codex-router/internal/discover"
-	"github.com/loyd/codex-router/internal/registry"
-	"github.com/loyd/codex-router/internal/state"
+	"github.com/loyd/codex-router/internal/domain/cred"
+	"github.com/loyd/codex-router/internal/domain/registry"
+	"github.com/loyd/codex-router/internal/domain/state"
+	"github.com/loyd/codex-router/internal/engine/discover"
 )
 
 // providerBaseURL 与 server.(*Server).providerBaseURL 同规则：
