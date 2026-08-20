@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/loyd/codex-router/internal/domain/usage"
 	"github.com/loyd/codex-router/internal/engine/nativebackend"
 	"github.com/loyd/codex-router/internal/lib/httpx"
+	"github.com/loyd/codex-router/internal/lib/logx"
 )
 
 // nativeUnsupportedParams 是 ChatGPT 后端拒绝的公共 Responses 参数。
@@ -24,8 +26,9 @@ var nativeUnsupportedParams = []string{
 // native 流量不重写请求体（除压缩），不翻译响应 —— 与 Node 版一致。
 func (s *Server) handleNative(w http.ResponseWriter, r *http.Request, route string, defaultModel string) {
 	started := time.Now()
-	setRoute, finish := s.beginRequest()
+	reqID, setRoute, finish := s.beginRequestID()
 	requestedModel := defaultModel
+	log := logx.With("req", reqID)
 	defer func() { finish(wStatus(w)) }()
 
 	if !requireCodexTransport(w, r) {
@@ -69,18 +72,18 @@ func (s *Server) handleNative(w http.ResponseWriter, r *http.Request, route stri
 		Route: route, Body: normalized, Header: r.Header, Compress: true,
 	})
 	if err != nil {
-		logf("native request failed model=%s error=%v", requestedModel, err)
+		log.Error("native request failed", "model", requestedModel, "error", err)
 		writeJSON(w, http.StatusBadGateway, errBody("local_router_error", "The local router could not complete the request."))
 		return
 	}
 	defer resp.Body.Close()
-	s.relayNative(w, resp)
+	s.relayNative(w, resp, log)
 	s.recordTurn(usage.Event{
-		Model: requestedModel, Provider: "openai",
+		Model: requestedModel, Provider: "openai", RequestID: reqID,
 		Status: resp.Status, DurationMs: time.Since(started).Milliseconds(),
 	})
-	logf("model=%s provider=openai status=%d duration_ms=%d",
-		requestedModel, resp.Status, time.Since(started).Milliseconds())
+	log.Info("request done", "model", requestedModel, "provider", "openai",
+		"status", resp.Status, "duration_ms", time.Since(started).Milliseconds())
 }
 
 // normalizeLegacyCustomToolIDs repairs custom-tool items produced by older
@@ -126,7 +129,7 @@ func normalizeLegacyCustomToolItems(raw any) bool {
 }
 
 // relayNative 把 Native Backend 的受限响应适配回 HTTP transport。
-func (s *Server) relayNative(w http.ResponseWriter, resp *nativebackend.RelayResponse) {
+func (s *Server) relayNative(w http.ResponseWriter, resp *nativebackend.RelayResponse, log *slog.Logger) {
 	skip := map[string]bool{
 		"content-length": true, "transfer-encoding": true,
 		"connection": true, "keep-alive": true,
@@ -141,8 +144,11 @@ func (s *Server) relayNative(w http.ResponseWriter, resp *nativebackend.RelayRes
 	}
 	w.WriteHeader(resp.Status)
 	if _, err := io.Copy(w, resp.Body); err != nil {
-		logf("native relay truncated status=%d idle=%v err=%v", resp.Status,
-			errors.Is(err, httpx.ErrUpstreamIdle), err)
+		if log == nil {
+			log = logx.Default()
+		}
+		log.Warn("native relay truncated", "status", resp.Status,
+			"upstream_idle", errors.Is(err, httpx.ErrUpstreamIdle), "error", err)
 	}
 }
 

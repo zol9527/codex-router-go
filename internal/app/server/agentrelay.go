@@ -20,6 +20,7 @@ import (
 	"strings"
 
 	"github.com/loyd/codex-router/internal/engine/nativebackend"
+	"github.com/loyd/codex-router/internal/lib/logx"
 )
 
 const agentPayloadRelayTool = "relay_external_agent_payload"
@@ -113,7 +114,7 @@ func (s *Server) normalizeRoutedAgentInput(ctx context.Context, input []any) []a
 		} else if resolved, err := s.relayAgentPayload(ctx, item, encrypted); err == nil {
 			plaintext = resolved
 		} else {
-			logf("agent payload relay failed: %v", err)
+			logx.Warn("agent payload relay failed", "error", err)
 			out[i] = raw // 保持原样
 			continue
 		}

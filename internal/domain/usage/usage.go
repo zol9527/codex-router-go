@@ -28,6 +28,9 @@ type Event struct {
 	StreamAborted        bool   `json:"streamAborted,omitempty"`
 	UpstreamIdle         bool   `json:"upstreamIdle,omitempty"`
 	EmptyCompletion      bool   `json:"emptyCompletion,omitempty"`
+	// RequestID 与运行时日志的 req 键同源（/activity 的请求 id），
+	// 把计量行与同请求的日志行串成一条轨迹。tray 对多余字段忽略。
+	RequestID string `json:"requestId,omitempty"`
 }
 
 // Recorder 追加写入 JSONL（进程内串行，0600）。

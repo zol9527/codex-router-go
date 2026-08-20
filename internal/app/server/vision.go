@@ -14,6 +14,7 @@ import (
 	"github.com/loyd/codex-router/internal/domain/registry"
 	"github.com/loyd/codex-router/internal/domain/vision"
 	"github.com/loyd/codex-router/internal/engine/nativebackend"
+	"github.com/loyd/codex-router/internal/lib/logx"
 )
 
 // visionConcurrency 是单回合内并发读图的软上限
@@ -64,7 +65,7 @@ func (s *Server) bridgeVision(ctx context.Context, header http.Header,
 		// （Codex 每轮重发历史图片，这里是重复读图的主要来源）。
 		if cached, ok := s.visionCache.Get(session, key); ok {
 			evidence[key] = cached
-			logf("vision cache hit session=%s image=%s", session, key)
+			logx.Debug("vision cache hit", "session", session, "image", key)
 			continue
 		}
 		wg.Add(1)
@@ -78,7 +79,7 @@ func (s *Server) bridgeVision(ctx context.Context, header http.Header,
 			if err != nil {
 				failures[key] = vision.FailureText(
 					engines[0].DisplayName, err)
-				logf("vision read failed engine=%s error=%v", engines[0].Slug, err)
+				logx.Warn("vision read failed", "engine", engines[0].Slug, "error", err)
 				return
 			}
 			evidence[key] = result

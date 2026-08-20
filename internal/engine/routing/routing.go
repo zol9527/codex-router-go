@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"regexp"
@@ -56,7 +57,6 @@ type Runner struct {
 	ProviderBaseURL        func(*registry.Provider) string
 	TranslateProviderError ErrorTranslator
 	LogTranslationDegraded func(*wire.Request, *registry.Model)
-	Logf                   func(string, ...any)
 }
 
 // Request 是一次 Routing Turn 的完整输入。
@@ -70,6 +70,12 @@ type Request struct {
 	Header     http.Header
 	Session    string
 	Started    time.Time
+	// Log 是请求作用域 logger（slog）。nil 时 runner 落回进程默认
+	// （logx.Default）—— 测试语境不注入也不炸。
+	Log *slog.Logger
+	// RequestID 与 /activity 端点及 usage-events 的 requestId 一致，
+	// 把日志行与计量行串成同一条请求轨迹。
+	RequestID string
 }
 
 var aliveEventPattern = regexp.MustCompile(
@@ -84,7 +90,12 @@ func (r *Runner) canonicalProviderID(provider *registry.Provider) string {
 	return provider.ID
 }
 
-func (r *Runner) record(event usage.Event) {
+// record 落一条计量事件：request 的 RequestID 统一在此注入（调用点
+// 不必逐个携带），空值直通（native HTTP 路径在 server 侧自带）。
+func (r *Runner) record(request Request, event usage.Event) {
+	if event.RequestID == "" {
+		event.RequestID = request.RequestID
+	}
 	if r.Recorder == nil {
 		return
 	}

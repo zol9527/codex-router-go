@@ -2,12 +2,13 @@ package server
 
 import (
 	"bytes"
-	"log"
-	"os"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/loyd/codex-router/internal/lib/logx"
 )
 
 // lockedBuffer 是并发安全的日志收集器：看门狗在独立 goroutine 里
@@ -29,14 +30,14 @@ func (b *lockedBuffer) String() string {
 	return b.buf.String()
 }
 
-// captureLog 把全局 logger 接到收集器，测试结束还原。注意必须显式还原
-// 成 os.Stderr —— SetOutput(nil) 会把输出置成 nil Writer，之后任何
-// logf（含 http.Server 的 panic 恢复日志）都是空指针崩溃。
+// captureLog 把进程 logger 换到收集器（text 格式，子串断言友好），
+// 测试结束还原。logx.Swap 同时接管 slog.SetDefault，标准库 log 桥接
+// 输出（http.Server 的 panic 恢复日志等）一并进收集器。
 func captureLog(t *testing.T) *lockedBuffer {
 	t.Helper()
 	buf := &lockedBuffer{}
-	log.SetOutput(buf)
-	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	restore := logx.Swap(slog.New(slog.NewTextHandler(buf, nil)))
+	t.Cleanup(restore)
 	return buf
 }
 

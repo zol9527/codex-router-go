@@ -1,9 +1,6 @@
 package server
 
 import (
-	"bytes"
-	"log"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -25,9 +22,7 @@ func TestDegradationLogRateLimited(t *testing.T) {
 		degradationLogMu.Unlock()
 	}()
 
-	var buf bytes.Buffer
-	log.SetOutput(&buf)
-	defer log.SetOutput(os.Stderr)
+	buf := captureLog(t)
 
 	mystery := &wire.Request{OmittedItemTypes: []string{"mystery_item"}}
 	other := &wire.Request{OmittedPartTypes: []string{"mystery_part"}}
@@ -45,20 +40,18 @@ func TestDegradationLogRateLimited(t *testing.T) {
 	time.Sleep(6 * time.Millisecond)
 	logTranslationDegradation(mystery, model)
 	out := buf.String()
-	if !strings.Contains(out, "suppressed=2/2s") {
+	if !strings.Contains(out, "suppressed=2") {
 		t.Fatalf("suppressed count missing after window: %s", out)
 	}
 }
 
 // 无降级形状时零输出、零记账。
 func TestDegradationLogSilentWhenClean(t *testing.T) {
-	var buf bytes.Buffer
-	log.SetOutput(&buf)
-	defer log.SetOutput(os.Stderr)
+	buf := captureLog(t)
 
 	logTranslationDegradation(&wire.Request{}, &registry.Model{Slug: "test/model"})
 	logTranslationDegradation(&wire.Request{}, nil)
-	if buf.Len() != 0 {
+	if buf.String() != "" {
 		t.Fatalf("clean request must not log: %s", buf.String())
 	}
 }

@@ -25,6 +25,7 @@ import (
 	"github.com/loyd/codex-router/internal/domain/registry"
 	"github.com/loyd/codex-router/internal/domain/state"
 	"github.com/loyd/codex-router/internal/domain/usage"
+	"github.com/loyd/codex-router/internal/lib/logx"
 )
 
 // Main 是二进制的完整入口：分发子命令并持有进程退出语义。
@@ -74,7 +75,11 @@ func Main(version string) {
 		os.Exit(64)
 	}
 	if err != nil {
-		log.Fatalf("[codex-router] fatal: %v", err)
+		// fatal 双写：logx 文件模式下 stderr 无守护（serve 由 supervisor
+		// 拉起时不重定向），退出前的错误必须同时落到 stderr 保留线索。
+		logx.Error("fatal", "error", err)
+		fmt.Fprintf(os.Stderr, "[codex-router] fatal: %v\n", err)
+		os.Exit(1)
 	}
 }
 
@@ -83,6 +88,7 @@ func printUsage() {
 
 Usage:
   codex-router serve [--port N] [--state DIR] [--config DIR]
+                     [--log-file PATH] [--log-level debug|info|warn|error]
   codex-router install [--providers ID,ID] [--dry-run]
   codex-router uninstall [--purge]   (removes plist, binary, config blocks;
                                      --purge also destroys state)
@@ -98,9 +104,19 @@ func cmdServe(args []string, version string) error {
 	port := fs.Int("port", defaultPort(), "listen port")
 	stateDir := fs.String("state", state.DefaultDir(), "state directory")
 	configDir := fs.String("config", "", "registry config directory override (default: embedded registry)")
+	logFile := fs.String("log-file", envOr("CODEX_ROUTER_LOG_FILE", ""),
+		"log file path (JSON lines, 8MB single-generation rotation); empty = stderr text")
+	logLevel := fs.String("log-level", envOr("CODEX_ROUTER_LOG_LEVEL", "info"),
+		"minimum log level: debug|info|warn|error")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	// 日志最先接线：state/registry 的装载错误也要进管道，而不是
+	// 只在 stderr 上一闪而过（supervisor 场景 stderr 无人看）。
+	if err := logx.Setup(logx.Config{Level: *logLevel, File: *logFile}); err != nil {
+		return err
+	}
+	defer logx.Close()
 
 	st, err := state.Open(*stateDir)
 	if err != nil {
@@ -159,9 +175,9 @@ func cmdServe(args []string, version string) error {
 	// 实例的 pidfile。control service stop 靠它找到进程。
 	pidfile := filepath.Join(st.Dir, "router.pid")
 	if err := os.WriteFile(pidfile, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0o644); err != nil {
-		log.Printf("[codex-router] pidfile write failed: %v", err)
+		logx.Error("pidfile write failed", "error", err)
 	}
-	log.Printf("[codex-router] listening on %s (version %s)", listenAddr, version)
+	logx.Info("listening", "addr", listenAddr, "version", version)
 
 	done := make(chan os.Signal, 2)
 	signal.Notify(done, syscall.SIGINT, syscall.SIGTERM)
@@ -179,15 +195,21 @@ func cmdServe(args []string, version string) error {
 		for range usr1 {
 			next, err := registry.LoadWithOverlay(st.Dir, *configDir)
 			if err != nil {
-				log.Printf("[codex-router] registry reload failed: %v (keeping previous)", err)
+				logx.Error("registry reload failed, keeping previous", "error", err)
 				continue
 			}
 			srv.SetRegistry(next)
-			log.Printf("[codex-router] registry reloaded: %d models", len(next.Models))
+			logx.Info("registry reloaded", "models", len(next.Models))
 		}
 	}()
 	err = httpServer.Serve(listener)
 	os.Remove(pidfile)
+	// Shutdown 触发的 ErrServerClosed 是正常停机路径（SIGTERM/SIGINT），
+	// 渲染成 fatal 会把每次正常重启都变成"事故"。
+	if errors.Is(err, http.ErrServerClosed) {
+		logx.Info("server stopped")
+		return nil
+	}
 	return err
 }
 

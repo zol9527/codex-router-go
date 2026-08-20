@@ -6,7 +6,6 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
-	"log"
 	"net"
 	"net/http"
 	"strconv"
@@ -22,6 +21,7 @@ import (
 	"github.com/loyd/codex-router/internal/domain/wire"
 	"github.com/loyd/codex-router/internal/engine/nativebackend"
 	"github.com/loyd/codex-router/internal/engine/routing"
+	"github.com/loyd/codex-router/internal/lib/logx"
 )
 
 // CallerPathPrefix 与 Node 版一致：caller key 以 URL 路径形式出现。
@@ -258,7 +258,6 @@ func New(opt Options) (*Server, error) {
 		LogTranslationDegraded: func(prepared *wire.Request, model *registry.Model) {
 			logTranslationDegradation(prepared, model)
 		},
-		Logf: logf,
 	}
 	return server, nil
 }
@@ -405,16 +404,31 @@ const errorStatusDuration = 8 * time.Second
 // beginRequest 登记 activity 并返回结束函数（HTTP 单请求路径：
 // 登记即视为在途，直到 finish）。
 func (s *Server) beginRequest() (setRoute func(provider, model, session string), finish func(status int)) {
-	return s.beginActivity(nil)
+	_, setRoute, finish = s.beginActivityID(nil)
+	return
+}
+
+// beginRequestID 是 beginRequest 的带 id 形态：返回的请求 id 与
+// /activity 端点看到的完全一致，日志以此做请求级关联（logx 的 req 键）。
+func (s *Server) beginRequestID() (reqID string, setRoute func(provider, model, session string), finish func(status int)) {
+	id, setRoute, finish := s.beginActivityID(nil)
+	return strconv.Itoa(id), setRoute, finish
 }
 
 // beginActivity 登记一条 activity；inFlight 语义见 activityEntry.inFlight。
 // WS 管道路径传入看门狗的在途 turn 判定，把上报窗口从"管道存活"
 // 收窄成"turn 在途"。
 func (s *Server) beginActivity(inFlight func() bool) (setRoute func(provider, model, session string), finish func(status int)) {
+	_, setRoute, finish = s.beginActivityID(inFlight)
+	return
+}
+
+// beginActivityID 是 beginActivity 的带 id 形态（数字 id 直出，日志侧
+// 转字符串）。
+func (s *Server) beginActivityID(inFlight func() bool) (id int, setRoute func(provider, model, session string), finish func(status int)) {
 	s.mu.Lock()
 	s.requestSeq++
-	id := s.requestSeq
+	id = s.requestSeq
 	started := time.Now()
 	entry := &activityEntry{id: strconv.Itoa(id), startedAt: started, inFlight: inFlight}
 	s.active[id] = entry
@@ -434,9 +448,10 @@ func (s *Server) beginActivity(inFlight func() bool) (setRoute func(provider, mo
 			if entry.inFlight != nil && !entry.inFlight() {
 				return // 长连接载体当前无在途 turn：空闲管道不是慢请求
 			}
-			logf("slow request pending id=%s provider=%s model=%s session=%s elapsed_ms=%d",
-				entry.id, entry.provider, entry.model, entry.sessionName,
-				time.Since(entry.startedAt).Milliseconds())
+			logx.Warn("slow request pending",
+				"req", entry.id, "provider", entry.provider, "model", entry.model,
+				"session", entry.sessionName,
+				"elapsed_ms", time.Since(entry.startedAt).Milliseconds())
 		})
 	}
 
@@ -471,7 +486,7 @@ func (s *Server) beginActivity(inFlight func() bool) (setRoute func(provider, mo
 			}
 		})
 	}
-	return setRoute, finish
+	return id, setRoute, finish
 }
 
 func (s *Server) activityPayload() map[string]any {
@@ -587,7 +602,5 @@ func sessionNameFromHeaders(header http.Header) string {
 	return ""
 }
 
-// logf 统一服务日志（时间戳 + 组件前缀，等价 Node 版 console.error）。
-func logf(format string, args ...any) {
-	log.Printf("[codex-router] "+format, args...)
-}
+// logf 已被 logx（slog 门面）取代：本包日志统一走 logx 包级函数
+// 或请求作用域的 logx.With 派生 logger（req 键 = /activity 的请求 id）。

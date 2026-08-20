@@ -187,7 +187,11 @@ final class ServiceSupervisor {
     }
     let task = Process()
     task.executableURL = router.url
-    task.arguments = ["serve", "--state", stateDir]
+    // 日志双轨：serve 的结构化日志（JSON 行）经 --log-file 自管落盘
+    // 与 8MB 单代轮转（与终端救急路径语义一致）；stdout/stderr 仍重定向
+    // 进同一文件，兜住 --log-file 接线前的启动错误与 Go panic 输出。
+    let logPath = (stateDir as NSString).appendingPathComponent("router.log")
+    task.arguments = ["serve", "--state", stateDir, "--log-file", logPath]
     task.standardOutput = appLogFile()
     task.standardError = appLogFile()
     task.terminationHandler = { [weak self] exited in
@@ -251,13 +255,29 @@ final class ServiceSupervisor {
   // router.log 追加句柄。serve 自身的日志（listen/错误）落这里，与
   // 旧 launchd StandardErrorPath 行为一致。
   /// Supervisor 事件落 router.log —— 下次"没拉起服务"不再是无证据
-  /// 悬案（2026-08-15 14:52 那次就查不到原因）。
+  /// 悬案（2026-08-15 14:52 那次就查不到原因）。带时间戳（跨进程对
+  /// 时序必需）；每次写入重新打开 —— serve 侧的运行期轮转会 rename
+  /// 当前文件，持久句柄会继续写进旧 inode（归档文件），低频事件
+  /// 不值得为它做跨进程协调。
   private func supervisorLog(_ message: String) {
-    let line = "[supervisor] \(message)\n"
-    let handle = appLogFile()
-    if handle != FileHandle.nullDevice {
-      _ = try? handle.write(contentsOf: Data(line.utf8))
+    let line = "[supervisor] \(supervisorLogTimestamp()) \(message)\n"
+    let path = (stateDir as NSString).appendingPathComponent("router.log")
+    let fm = FileManager.default
+    if !fm.fileExists(atPath: path) {
+      fm.createFile(atPath: path, contents: nil, attributes: [.posixPermissions: 0o600])
     }
+    guard let handle = FileHandle(forWritingAtPath: path) else { return }
+    _ = try? handle.seekToEnd()
+    _ = try? handle.write(contentsOf: Data(line.utf8))
+    try? handle.close()
+  }
+
+  /// supervisor 行的时间戳，格式贴近 Go 侧日志的秒级粒度。
+  private func supervisorLogTimestamp() -> String {
+    let formatter = DateFormatter()
+    formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+    formatter.timeZone = .current
+    return formatter.string(from: Date())
   }
 
   private var logHandle: FileHandle?
@@ -265,11 +285,11 @@ final class ServiceSupervisor {
     if let logHandle { return logHandle }
     let path = (stateDir as NSString).appendingPathComponent("router.log")
     let fm = FileManager.default
-    // 启动轮转：超过 2MB 归档为 router.log.1（单代，覆盖旧归档）。
-    // 只能在这里做 —— 句柄一旦创建（并被 serve 子进程继承 fd），
-    // 运行中改名会割裂 tray 与 serve 两路写入。首次调用早于 spawn，
-    // 因此每次 App 运行的轮转点必然在子进程接管句柄之前。
-    if let size = (try? fm.attributesOfItem(atPath: path)[.size]) as? Int, size > 2_000_000 {
+    // 启动轮转：超过 8MB 归档为 router.log.1（单代，覆盖旧归档），
+    // 阈值与 serve 侧 logx 的运行期轮转对齐。只能在启动时做 ——
+    // 句柄一旦创建（并被 serve 子进程继承 fd），运行中改名会割裂
+    // stderr 兜底那一路。运行期轮转由 serve 经 --log-file 自管。
+    if let size = (try? fm.attributesOfItem(atPath: path)[.size]) as? Int, size > 8_000_000 {
       try? fm.removeItem(atPath: path + ".1")
       try? fm.moveItem(atPath: path, toPath: path + ".1")
     }

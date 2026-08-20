@@ -51,8 +51,10 @@ func (s Service) ProbeHealth() bool {
 // Running 报告服务是否在答 /health。
 func (s Service) Running() bool { return s.ProbeHealth() }
 
-// StartDetached 分离进程拉起 serve：Setsid 脱离会话，stderr 追加进
-// router.log 保留线索。已在跑时幂等返回。
+// StartDetached 分离进程拉起 serve：Setsid 脱离会话。serve 的日志经
+// --log-file 落 router.log（JSON 行、自带 8MB 单代轮转 —— 终端救急
+// 路径与 App 托管路径的轮转语义由此对齐）；stderr 仍重定向进同一文件，
+// 兜住 --log-file 接线失败前的启动错误与 Go panic 输出。已在跑时幂等返回。
 func (s Service) StartDetached() error {
 	if s.ProbeHealth() {
 		fmt.Fprintln(s.Out, "service: already running")
@@ -62,13 +64,15 @@ func (s Service) StartDetached() error {
 	if err != nil {
 		return err
 	}
-	logFile, err := os.OpenFile(filepath.Join(s.StateDir, "router.log"),
+	logPath := filepath.Join(s.StateDir, "router.log")
+	logFile, err := os.OpenFile(logPath,
 		os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		logFile = nil
 	}
 	cmd := exec.Command(exe, "serve",
-		"--state", s.StateDir, "--port", fmt.Sprintf("%d", s.Port))
+		"--state", s.StateDir, "--port", fmt.Sprintf("%d", s.Port),
+		"--log-file", logPath)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if logFile != nil {
 		cmd.Stdout = logFile

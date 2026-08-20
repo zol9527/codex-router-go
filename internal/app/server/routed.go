@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -16,6 +17,7 @@ import (
 	"github.com/loyd/codex-router/internal/engine/nativebackend"
 	"github.com/loyd/codex-router/internal/engine/routing"
 	"github.com/loyd/codex-router/internal/lib/httpx"
+	"github.com/loyd/codex-router/internal/lib/logx"
 )
 
 // handleResponses 是 /responses 主入口：按 model 分流。
@@ -23,7 +25,10 @@ import (
 // 未命中 → native GPT 流量直连 ChatGPT 后端。
 func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request, route string) {
 	started := time.Now()
-	setRoute, finish := s.beginRequest()
+	reqID, setRoute, finish := s.beginRequestID()
+	// 请求作用域 logger：req 键与 /activity 端点的 id 一致，一个请求的
+	// 降级/转发/收尾日志可跨行串联。
+	log := logx.With("req", reqID)
 	defer func() { finish(wStatus(w)) }()
 
 	if !requireCodexTransport(w, r) {
@@ -59,7 +64,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request, route s
 	}
 	if routeModel == nil {
 		// 未注册模型 = native GPT 流量。
-		s.handleNativeTurn(w, r, route, payload, requestedModel, setRoute, started)
+		s.handleNativeTurn(w, r, route, payload, requestedModel, setRoute, started, reqID, log)
 		return
 	}
 
@@ -104,13 +109,14 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request, route s
 	runner.Run(routing.Request{
 		Context: r.Context(), Payload: payload, Model: routeModel,
 		Provider: provider, Credential: credential, Sink: responseSink{w: w},
-		Header: r.Header, Started: started,
+		Header: r.Header, Started: started, Log: log, RequestID: reqID,
 	})
 }
 
 // handleNativeTurn：未命中注册表的模型按 native 流量直连。
 func (s *Server) handleNativeTurn(w http.ResponseWriter, r *http.Request, route string,
-	payload map[string]any, requestedModel string, setRoute func(string, string, string), started time.Time) {
+	payload map[string]any, requestedModel string, setRoute func(string, string, string),
+	started time.Time, reqID string, log *slog.Logger) {
 
 	setRoute("openai", requestedModel, sessionNameFromHeaders(r.Header))
 	native := payload
@@ -130,18 +136,18 @@ func (s *Server) handleNativeTurn(w http.ResponseWriter, r *http.Request, route 
 		Route: route, Body: normalized, Header: r.Header, Compress: true,
 	})
 	if err != nil {
-		logf("native request failed model=%s error=%v", requestedModel, err)
+		log.Error("native request failed", "model", requestedModel, "error", err)
 		writeJSON(w, http.StatusBadGateway, errBody("local_router_error", "The local router could not complete the request."))
 		return
 	}
 	defer resp.Body.Close()
-	s.relayNative(w, resp)
+	s.relayNative(w, resp, log)
 	s.recordTurn(usage.Event{
-		Model: requestedModel, Provider: "openai",
+		Model: requestedModel, Provider: "openai", RequestID: reqID,
 		Status: resp.Status, DurationMs: time.Since(started).Milliseconds(),
 	})
-	logf("model=%s provider=openai status=%d duration_ms=%d",
-		requestedModel, resp.Status, time.Since(started).Milliseconds())
+	log.Info("request done", "model", requestedModel, "provider", "openai",
+		"status", resp.Status, "duration_ms", time.Since(started).Milliseconds())
 }
 
 // responseSink 把 routing 的流式写回接缝绑定到 net/http。
@@ -209,12 +215,14 @@ func logTranslationDegradation(prepared *wire.Request, model *registry.Model) {
 	delete(degradationLogSuppressed, signature)
 	degradationLogLast[signature] = now
 	if suppressed > 0 {
-		logf("chat translation degraded model=%s omitted_item_types=%v omitted_part_types=%v suppressed=%d/2s",
-			slug, prepared.OmittedItemTypes, prepared.OmittedPartTypes, suppressed)
+		logx.Warn("chat translation degraded",
+			"model", slug, "omitted_item_types", prepared.OmittedItemTypes,
+			"omitted_part_types", prepared.OmittedPartTypes, "suppressed", suppressed)
 		return
 	}
-	logf("chat translation degraded model=%s omitted_item_types=%v omitted_part_types=%v",
-		slug, prepared.OmittedItemTypes, prepared.OmittedPartTypes)
+	logx.Warn("chat translation degraded",
+		"model", slug, "omitted_item_types", prepared.OmittedItemTypes,
+		"omitted_part_types", prepared.OmittedPartTypes)
 }
 
 // recordTurn 是 usage 记录的统一入口（nil-safe）。

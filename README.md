@@ -141,8 +141,31 @@ control vision-bridge on|off | status | effort <level|default>
 | WS keepalive `CODEX_ROUTER_WS_KEEPALIVE_SEC` | 60 | 空闲管道周期向上游发 ping，防中间设备（NAT/TUN）按空闲超时砍断长连接 | 设 `0` |
 | 慢请求日志 `CODEX_ROUTER_SLOW_REQUEST_LOG_SEC` | 120 | 请求在途超窗口补一行 `slow request pending`（只记录、不拆流，收尾日志照常） | 设 `0` |
 
-失败一律落 `router.log`（含 model/provider/status/duration/错误摘要）与
-`usage-events.jsonl`（`upstreamIdle`/`streamAborted` 字段）。
+## 日志
+
+`serve` 的日志由标准库 `slog` 门面（`internal/lib/logx`）统一管理：
+
+```sh
+codex-router serve --log-file ~/.codex-router/router.log --log-level info
+# 等价 env：CODEX_ROUTER_LOG_FILE / CODEX_ROUTER_LOG_LEVEL
+```
+
+- **两种输出形态**：不指定 `--log-file` 时打 stderr（text 格式，前台
+  调试用）；指定后写该文件（JSON 行，`jq`/grep 友好）。文件超 8MB
+  归档为 `.log.1`（单代覆盖）。App 托管与终端救急（`control service
+  start`）两条启动路径都传 `--log-file`，轮转语义一致。
+- **请求关联**：每条请求日志带 `req=<id>`，与 `/health` 活动面板及
+  `usage-events.jsonl` 的 `requestId` 字段同源 —— 一个回合的降级、
+  转发、收尾日志与计量行可串成同一条轨迹。WS 管道日志带 `pipe=<id>`
+  （opened/silent/idle/closed 跨行配对）。
+- **级别**：`--log-level debug|info|warn|error`，默认 `info`。降级翻译、
+  流截断是 `warn`；请求失败是 `error`；vision 缓存命中是 `debug`。
+- 优雅停机（SIGTERM/SIGINT）记 `server stopped`（info），不再渲染成
+  fatal。App 的 supervisor 事件（spawn/crash）以 `[supervisor]` 前缀
+  带时间戳混排在同一文件。
+- 失败事实（model/provider/status/duration/错误摘要）落 `router.log`，
+  计量事实（token、首 token 延迟、`upstreamIdle`/`streamAborted`）落
+  `usage-events.jsonl`（8MB 单代轮转，`requestId` 与日志关联）。
 
 ## 动态模型注册（discover + models.dev）
 

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"github.com/loyd/codex-router/internal/domain/usage"
 	"github.com/loyd/codex-router/internal/domain/wire"
 	"github.com/loyd/codex-router/internal/lib/httpx"
+	"github.com/loyd/codex-router/internal/lib/logx"
 )
 
 const compactPrompt = `You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another language model that will resume the task.
@@ -176,7 +178,7 @@ func (r *Runner) RunCompaction(request Request) (CompactionResult, bool) {
 	if err != nil {
 		request.Sink.WriteJSON(http.StatusBadGateway, errBody("provider_api_proxy_error",
 			"The API-provider forwarder could not complete the request."))
-		r.record(usage.Event{Model: request.Model.Slug, Provider: providerID, Status: 502,
+		r.record(request, usage.Event{Model: request.Model.Slug, Provider: providerID, Status: 502,
 			DurationMs: time.Since(started).Milliseconds()})
 		return CompactionResult{}, false
 	}
@@ -191,20 +193,20 @@ func (r *Runner) RunCompaction(request Request) (CompactionResult, bool) {
 			errType, message = "upstream_idle_timeout", "The upstream produced no data within the idle window while the compaction response was being read."
 		}
 		request.Sink.WriteJSON(status, errBody(errType, message))
-		r.record(usage.Event{Model: request.Model.Slug, Provider: providerID, Status: status,
+		r.record(request, usage.Event{Model: request.Model.Slug, Provider: providerID, Status: status,
 			DurationMs: time.Since(started).Milliseconds(), UpstreamIdle: idle})
 		return CompactionResult{}, false
 	}
 	if int64(len(raw)) > 32<<20 {
 		request.Sink.WriteJSON(http.StatusBadGateway, errBody("provider_api_proxy_error", "Compact response is too large."))
-		r.record(usage.Event{Model: request.Model.Slug, Provider: providerID, Status: http.StatusBadGateway,
+		r.record(request, usage.Event{Model: request.Model.Slug, Provider: providerID, Status: http.StatusBadGateway,
 			DurationMs: time.Since(started).Milliseconds()})
 		return CompactionResult{}, false
 	}
 	if resp.StatusCode >= 400 {
 		r.writeUpstreamError(request, &UpstreamFailure{Status: resp.StatusCode,
 			BodyText: string(raw), RetryAfter: retryAfter(resp.Header)}, started)
-		r.record(usage.Event{Model: request.Model.Slug, Provider: providerID,
+		r.record(request, usage.Event{Model: request.Model.Slug, Provider: providerID,
 			Status: resp.StatusCode, DurationMs: time.Since(started).Milliseconds()})
 		return CompactionResult{}, false
 	}
@@ -212,7 +214,7 @@ func (r *Runner) RunCompaction(request Request) (CompactionResult, bool) {
 	if err := json.Unmarshal(raw, &upstreamBody); err != nil {
 		request.Sink.WriteJSON(http.StatusBadGateway, errBody("provider_api_proxy_error",
 			"The upstream compaction response was not valid JSON."))
-		r.record(usage.Event{Model: request.Model.Slug, Provider: providerID, Status: http.StatusBadGateway,
+		r.record(request, usage.Event{Model: request.Model.Slug, Provider: providerID, Status: http.StatusBadGateway,
 			DurationMs: time.Since(started).Milliseconds()})
 		return CompactionResult{}, false
 	}
@@ -303,21 +305,38 @@ func (r *Runner) client() *http.Client {
 	return http.DefaultClient
 }
 
-func (r *Runner) logf(format string, args ...any) {
-	if r.Logf != nil {
-		r.Logf(format, args...)
+// logInfo/logError 打请求作用域日志：request.Log 预置了 req 键（与
+// /activity 及 usage-events 的 requestId 同源），nil 时落回进程默认
+// （测试语境不注入也不炸）。
+func (r *Runner) logInfo(request Request, msg string, kv ...any) {
+	r.logAt(request, slog.LevelInfo, msg, kv...)
+}
+
+func (r *Runner) logWarn(request Request, msg string, kv ...any) {
+	r.logAt(request, slog.LevelWarn, msg, kv...)
+}
+
+func (r *Runner) logError(request Request, msg string, kv ...any) {
+	r.logAt(request, slog.LevelError, msg, kv...)
+}
+
+func (r *Runner) logAt(request Request, level slog.Level, msg string, kv ...any) {
+	logger := request.Log
+	if logger == nil {
+		logger = logx.Default()
 	}
+	logger.Log(context.Background(), level, msg, kv...)
 }
 
 func (r *Runner) runDirect(request Request, target string, headers map[string]string,
 	body []byte, providerID string, started time.Time) {
 	resp, err := httpx.Fetch(request.Context, http.MethodPost, target, headers, body, r.client(), r.Idle)
 	if err != nil {
-		r.logf("model=%s provider=%s status=502 duration_ms=%d protocol=responses err=%v",
-			request.Model.Slug, request.Provider.ID, time.Since(started).Milliseconds(), err)
+		r.logError(request, "request failed", "model", request.Model.Slug, "provider", request.Provider.ID,
+			"status", 502, "duration_ms", time.Since(started).Milliseconds(), "protocol", "responses", "error", err)
 		request.Sink.WriteJSON(http.StatusBadGateway, errBody("provider_api_proxy_error",
 			"The API-provider forwarder could not complete the request."))
-		r.record(usage.Event{Model: request.Model.Slug, Provider: providerID, Status: 502,
+		r.record(request, usage.Event{Model: request.Model.Slug, Provider: providerID, Status: 502,
 			DurationMs: time.Since(started).Milliseconds()})
 		return
 	}
@@ -325,15 +344,15 @@ func (r *Runner) runDirect(request Request, target string, headers map[string]st
 	if resp.StatusCode >= 400 {
 		r.writeUpstreamError(request, &UpstreamFailure{Status: resp.StatusCode,
 			BodyText: readBody(resp.Body, 1<<20), RetryAfter: retryAfter(resp.Header)}, started)
-		r.record(usage.Event{Model: request.Model.Slug, Provider: providerID,
+		r.record(request, usage.Event{Model: request.Model.Slug, Provider: providerID,
 			Status: resp.StatusCode, DurationMs: time.Since(started).Milliseconds()})
 		return
 	}
-	r.relayResponse(request.Sink, resp)
-	r.record(usage.Event{Model: request.Model.Slug, Provider: providerID,
+	r.relayResponse(request, request.Sink, resp)
+	r.record(request, usage.Event{Model: request.Model.Slug, Provider: providerID,
 		Status: resp.StatusCode, DurationMs: time.Since(started).Milliseconds()})
-	r.logf("model=%s provider=%s protocol=responses status=%d duration_ms=%d",
-		request.Model.Slug, request.Provider.ID, resp.StatusCode, time.Since(started).Milliseconds())
+	r.logInfo(request, "request done", "model", request.Model.Slug, "provider", request.Provider.ID,
+		"protocol", "responses", "status", resp.StatusCode, "duration_ms", time.Since(started).Milliseconds())
 }
 
 func (r *Runner) runNonStream(request Request, target string, headers map[string]string,
@@ -341,11 +360,11 @@ func (r *Runner) runNonStream(request Request, target string, headers map[string
 	estimate int, providerID string, started time.Time) {
 	resp, err := httpx.Fetch(request.Context, http.MethodPost, target, headers, body, r.client(), r.Idle)
 	if err != nil {
-		r.logf("model=%s provider=%s status=502 duration_ms=%d err=%v",
-			request.Model.Slug, request.Provider.ID, time.Since(started).Milliseconds(), err)
+		r.logError(request, "request failed", "model", request.Model.Slug, "provider", request.Provider.ID,
+			"status", 502, "duration_ms", time.Since(started).Milliseconds(), "error", err)
 		request.Sink.WriteJSON(http.StatusBadGateway, errBody("provider_api_proxy_error",
 			"The API-provider forwarder could not complete the request."))
-		r.record(usage.Event{Model: request.Model.Slug, Provider: providerID, Status: 502,
+		r.record(request, usage.Event{Model: request.Model.Slug, Provider: providerID, Status: 502,
 			DurationMs: time.Since(started).Milliseconds()})
 		return
 	}
@@ -359,23 +378,23 @@ func (r *Runner) runNonStream(request Request, target string, headers map[string
 			status = http.StatusGatewayTimeout
 			errType, message = "upstream_idle_timeout", "The upstream produced no data within the idle window while the response was being read."
 		}
-		r.logf("model=%s provider=%s status=%d duration_ms=%d upstream_idle=%v err=%v",
-			request.Model.Slug, request.Provider.ID, status, time.Since(started).Milliseconds(), idle, readErr)
+		r.logError(request, "upstream read failed", "model", request.Model.Slug, "provider", request.Provider.ID,
+			"status", status, "duration_ms", time.Since(started).Milliseconds(), "upstream_idle", idle, "error", readErr)
 		request.Sink.WriteJSON(status, errBody(errType, message))
-		r.record(usage.Event{Model: request.Model.Slug, Provider: providerID, Status: status,
+		r.record(request, usage.Event{Model: request.Model.Slug, Provider: providerID, Status: status,
 			DurationMs: time.Since(started).Milliseconds(), UpstreamIdle: idle})
 		return
 	}
 	if resp.StatusCode >= 400 {
 		r.writeUpstreamError(request, &UpstreamFailure{Status: resp.StatusCode,
 			BodyText: string(raw), RetryAfter: retryAfter(resp.Header)}, started)
-		r.record(usage.Event{Model: request.Model.Slug, Provider: providerID,
+		r.record(request, usage.Event{Model: request.Model.Slug, Provider: providerID,
 			Status: resp.StatusCode, DurationMs: time.Since(started).Milliseconds()})
 		return
 	}
 	if tooLarge {
 		request.Sink.WriteJSON(http.StatusBadGateway, errBody("provider_api_proxy_error", "The upstream response is too large."))
-		r.record(usage.Event{Model: request.Model.Slug, Provider: providerID, Status: http.StatusBadGateway,
+		r.record(request, usage.Event{Model: request.Model.Slug, Provider: providerID, Status: http.StatusBadGateway,
 			DurationMs: time.Since(started).Milliseconds()})
 		return
 	}
@@ -386,7 +405,7 @@ func (r *Runner) runNonStream(request Request, target string, headers map[string
 	if err := json.Unmarshal(raw, &upstreamBody); err != nil {
 		request.Sink.WriteJSON(http.StatusBadGateway, errBody("provider_api_proxy_error",
 			"The upstream response was not valid JSON."))
-		r.record(usage.Event{Model: request.Model.Slug, Provider: providerID, Status: http.StatusBadGateway,
+		r.record(request, usage.Event{Model: request.Model.Slug, Provider: providerID, Status: http.StatusBadGateway,
 			DurationMs: time.Since(started).Milliseconds()})
 		return
 	}
@@ -396,7 +415,7 @@ func (r *Runner) runNonStream(request Request, target string, headers map[string
 	})
 	request.Sink.WriteJSON(http.StatusOK, response)
 	inputTokens, outputTokens, totalTokens, substituted := usageFromResponsesJSON(response)
-	r.record(usage.Event{Model: request.Model.Slug, Provider: providerID, Status: 200,
+	r.record(request, usage.Event{Model: request.Model.Slug, Provider: providerID, Status: 200,
 		DurationMs: time.Since(started).Milliseconds(), InputTokens: inputTokens,
 		OutputTokens: outputTokens, TotalTokens: totalTokens,
 		EstimatedInputTokens: int64(substituted)})
@@ -413,7 +432,7 @@ func (r *Runner) runStream(request Request, target string, headers map[string]st
 		var failure *UpstreamFailure
 		if errors.As(firstErr, &failure) {
 			r.writeUpstreamError(request, failure, started)
-			r.record(usage.Event{Model: request.Model.Slug, Provider: providerID,
+			r.record(request, usage.Event{Model: request.Model.Slug, Provider: providerID,
 				Status: failure.Status, DurationMs: time.Since(started).Milliseconds()})
 			return
 		}
@@ -424,7 +443,7 @@ func (r *Runner) runStream(request Request, target string, headers map[string]st
 	if !first.Translator.HasContent() {
 		if !relay.HeadersWritten() && !relay.HasWriteError() && request.Context.Err() == nil {
 			if err := relay.FinishFlushWith(stripTerminalCompletion(first.Events.Bytes())); err != nil {
-				r.record(usage.Event{Model: request.Model.Slug, Provider: providerID,
+				r.record(request, usage.Event{Model: request.Model.Slug, Provider: providerID,
 					Status: 0, DurationMs: time.Since(started).Milliseconds()})
 				return
 			}
@@ -434,26 +453,26 @@ func (r *Runner) runStream(request Request, target string, headers map[string]st
 			_ = request.Sink.Write([]byte("data: [DONE]\n\n"))
 			request.Sink.Flush()
 		}
-		r.record(usage.Event{Model: request.Model.Slug, Provider: providerID,
+		r.record(request, usage.Event{Model: request.Model.Slug, Provider: providerID,
 			Status: http.StatusBadGateway, DurationMs: time.Since(started).Milliseconds(), EmptyCompletion: true})
 		return
 	}
 
 	if !relay.HeadersWritten() && !relay.HasWriteError() && request.Context.Err() == nil {
 		if err := relay.FinishFlushWith(first.Events.Bytes()); err != nil {
-			r.record(usage.Event{Model: request.Model.Slug, Provider: providerID,
+			r.record(request, usage.Event{Model: request.Model.Slug, Provider: providerID,
 				Status: 0, DurationMs: time.Since(started).Milliseconds()})
 			return
 		}
 	}
-	r.record(usage.Event{Model: request.Model.Slug, Provider: providerID, Status: 200,
+	r.record(request, usage.Event{Model: request.Model.Slug, Provider: providerID, Status: 200,
 		DurationMs: time.Since(started).Milliseconds(), InputTokens: first.Translator.PromptTokens(),
 		OutputTokens: first.Translator.OutputTokens(), TotalTokens: first.Translator.TotalTokens(),
 		EstimatedInputTokens: int64(first.Translator.SubstitutedInputTokens())})
-	r.logf("model=%s provider=%s status=200 duration_ms=%d in=%d out=%d%s",
-		request.Model.Slug, request.Provider.ID, time.Since(started).Milliseconds(),
-		first.Translator.PromptTokens(), first.Translator.OutputTokens(),
-		boolText(first.Translator.SubstitutedInputTokens() > 0, " estimated-input=true"))
+	r.logInfo(request, "request done", "model", request.Model.Slug, "provider", request.Provider.ID,
+		"status", 200, "duration_ms", time.Since(started).Milliseconds(),
+		"in", first.Translator.PromptTokens(), "out", first.Translator.OutputTokens(),
+		"estimated_input", first.Translator.SubstitutedInputTokens() > 0)
 }
 
 func (r *Runner) failLiveStream(request Request, err error, relay *StreamRelay,
@@ -473,10 +492,10 @@ func (r *Runner) failLiveStream(request Request, err error, relay *StreamRelay,
 			_ = request.Sink.Write([]byte("event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"stream_interrupted_after_tool_call\",\"message\":\"The upstream stream died after tool calls had already been delivered. The router closed it with an explicit failure instead of letting the client retry the whole turn, because a retry would re-execute those tool calls.\"}}}\n\n"))
 			request.Sink.Flush()
 		}
-		r.logf("model=%s provider=%s status=%d duration_ms=%d stream_truncated=true upstream_idle=%v tool_calls=%v err=%v",
-			request.Model.Slug, request.Provider.ID, status, base.DurationMs, idle,
-			translator != nil && translator.HasToolCalls(), err)
-		r.record(base)
+		r.logError(request, "stream truncated", "model", request.Model.Slug, "provider", request.Provider.ID,
+			"status", status, "duration_ms", base.DurationMs, "upstream_idle", idle,
+			"tool_calls", translator != nil && translator.HasToolCalls(), "error", err)
+		r.record(request, base)
 		return
 	}
 	if idle {
@@ -486,15 +505,19 @@ func (r *Runner) failLiveStream(request Request, err error, relay *StreamRelay,
 		request.Sink.WriteJSON(status, errBody("provider_api_proxy_error",
 			"The API-provider forwarder could not complete the request."))
 	}
-	r.logf("model=%s provider=%s status=%d duration_ms=%d upstream_idle=%v err=%v",
-		request.Model.Slug, request.Provider.ID, status, base.DurationMs, idle, err)
-	r.record(base)
+	r.logError(request, "request failed", "model", request.Model.Slug, "provider", request.Provider.ID,
+		"status", status, "duration_ms", base.DurationMs, "upstream_idle", idle, "error", err)
+	r.record(request, base)
 }
 
 func (r *Runner) writeUpstreamError(request Request, failure *UpstreamFailure, started time.Time) {
-	r.logf("model=%s provider=%s status=%d duration_ms=%d upstream_error=%.200s",
-		request.Model.Slug, request.Provider.ID, failure.Status,
-		time.Since(started).Milliseconds(), failure.BodyText)
+	truncated := failure.BodyText
+	if len(truncated) > 200 {
+		truncated = truncated[:200]
+	}
+	r.logWarn(request, "upstream error", "model", request.Model.Slug, "provider", request.Provider.ID,
+		"status", failure.Status, "duration_ms", time.Since(started).Milliseconds(),
+		"upstream_error", truncated)
 	if failure.RetryAfter > 0 {
 		request.Sink.SetHeader("Retry-After", fmt.Sprintf("%d", failure.RetryAfter))
 	}
@@ -506,7 +529,7 @@ func (r *Runner) writeUpstreamError(request Request, failure *UpstreamFailure, s
 	request.Sink.WriteJSON(failure.Status, payload)
 }
 
-func (r *Runner) relayResponse(sink Sink, resp *http.Response) {
+func (r *Runner) relayResponse(request Request, sink Sink, resp *http.Response) {
 	skip := map[string]bool{"content-length": true, "transfer-encoding": true,
 		"connection": true, "keep-alive": true}
 	header := make(http.Header)
@@ -530,7 +553,8 @@ func (r *Runner) relayResponse(sink Sink, resp *http.Response) {
 		}
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
-				r.logf("relay truncated status=%d idle=%v err=%v", resp.StatusCode, errors.Is(err, httpx.ErrUpstreamIdle), err)
+				r.logWarn(request, "relay truncated", "status", resp.StatusCode,
+					"upstream_idle", errors.Is(err, httpx.ErrUpstreamIdle), "error", err)
 			}
 			return
 		}
@@ -579,11 +603,4 @@ func usageFromResponsesJSON(response map[string]any) (int64, int64, int64, int) 
 		return 0
 	}
 	return read("input_tokens"), read("output_tokens"), read("total_tokens"), 0
-}
-
-func boolText(cond bool, text string) string {
-	if cond {
-		return text
-	}
-	return ""
 }

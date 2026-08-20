@@ -26,6 +26,8 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+
+	"github.com/loyd/codex-router/internal/lib/logx"
 )
 
 // wsMaxFrameBytes：单帧上限。Responses 请求含完整 instructions/tools，
@@ -123,7 +125,7 @@ func (s *Server) handleResponsesWebSocket(w http.ResponseWriter, r *http.Request
 		if resp != nil {
 			resp.Body.Close()
 		}
-		logf("ws upstream dial failed host=%s err=%v", hostOf(target), err)
+		logx.Error("ws upstream dial failed", "host", hostOf(target), "error", err)
 		// 上游不可达/拒绝升级 → 426 回退，而不是建立一条死管道。
 		writeWebSocketUnsupported(w)
 		return
@@ -132,7 +134,7 @@ func (s *Server) handleResponsesWebSocket(w http.ResponseWriter, r *http.Request
 	if err != nil {
 		upstream.Close()
 		// Upgrade 已向调用方写出错误响应，无需再回 426。
-		logf("ws client upgrade failed err=%v", err)
+		logx.Error("ws client upgrade failed", "error", err)
 		return
 	}
 	s.serveWSPipe(client, upstream, r)
@@ -145,10 +147,13 @@ func (s *Server) serveWSPipe(client, upstream *websocket.Conn, r *http.Request) 
 	// 仍是管道级（拆管时 finish），但上报窗口收窄成"turn 在途"——空闲
 	// 管道不计入 generating。
 	wd := &wsWatchdog{timeout: s.wsSilent}
-	setRoute, finish := s.beginActivity(wd.inFlight)
+	pipeID, setRoute, finish := s.beginActivityID(wd.inFlight)
 	session := sessionNameFromHeaders(r.Header)
 	started := time.Now()
-	logf("ws pipe opened")
+	// 管道作用域 logger：pipe 键 = activity 数字 id，一条管道的
+	// opened/silent/idle/closed 日志跨行串联。
+	log := logx.With("pipe", strconv.Itoa(pipeID))
+	log.Info("ws pipe opened")
 
 	// 上游静默看门狗：待答请求超窗口无上游帧 → 拆管让调用方重连。
 	wdStop := make(chan struct{})
@@ -163,7 +168,7 @@ func (s *Server) serveWSPipe(client, upstream *websocket.Conn, r *http.Request) 
 					return
 				case now := <-ticker.C:
 					if wd.check(now) {
-						logf("ws upstream silent: no upstream frames %v after client request; tearing pipe down", wd.timeout)
+						log.Warn("ws upstream silent: no upstream frames after client request; tearing pipe down", "timeout", wd.timeout)
 						_ = client.Close()
 						_ = upstream.Close()
 						return
@@ -210,7 +215,7 @@ func (s *Server) serveWSPipe(client, upstream *websocket.Conn, r *http.Request) 
 						last = started.UnixNano() // 建管后从未有过数据帧
 					}
 					if time.Since(time.Unix(0, last)) > s.wsKeepaliveIdleCap {
-						logf("ws pipe idle cap: no data frames for %v; closing cleanly", s.wsKeepaliveIdleCap)
+						log.Warn("ws pipe idle cap: no data frames; closing cleanly", "idle_cap", s.wsKeepaliveIdleCap)
 						deadline := time.Now().Add(time.Second)
 						closeMsg := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "idle")
 						_ = client.WriteControl(websocket.CloseMessage, closeMsg, deadline)
@@ -251,8 +256,7 @@ func (s *Server) serveWSPipe(client, upstream *websocket.Conn, r *http.Request) 
 	if wd.tripped.Load() {
 		cause = fmt.Sprintf("upstream silent watchdog (%v without upstream frames after client request)", wd.timeout)
 	}
-	logf("ws pipe closed duration_ms=%d cause=%s",
-		time.Since(started).Milliseconds(), cause)
+	log.Info("ws pipe closed", "duration_ms", time.Since(started).Milliseconds(), "cause", cause)
 }
 
 // noteUpstream/noteClient 由两侧搬运协程在读到帧时回调（看门狗指纹）。
