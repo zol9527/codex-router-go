@@ -305,8 +305,14 @@ private struct IslandOverlayView: View {
   var body: some View {
     VStack(spacing: 0) {
       ZStack {
+        // 毛玻璃岛：真材质采样窗外内容，深色 tint 压在材质之上保住
+        // 亮色文字的可读性（纯透明材质在浅色桌面会洗白正文）。
         IslandSilhouette()
-          .fill(islandBezel.opacity(0.998))
+          .fill(.ultraThinMaterial)
+          .overlay {
+            IslandSilhouette()
+              .fill(islandBezel.opacity(0.9))
+          }
           .overlay {
             IslandSilhouette()
               .fill(
@@ -1809,7 +1815,11 @@ private struct DesktopPanelView: View {
     .padding(16)
     .background(
       RoundedRectangle(cornerRadius: 20, style: .continuous)
-        .fill(islandBezel.opacity(0.97))
+        .fill(.ultraThinMaterial)
+    )
+    .overlay(
+      RoundedRectangle(cornerRadius: 20, style: .continuous)
+        .fill(islandBezel.opacity(0.88))
     )
     .overlay(
       RoundedRectangle(cornerRadius: 20, style: .continuous)

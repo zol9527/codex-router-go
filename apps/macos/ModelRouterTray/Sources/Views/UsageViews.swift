@@ -206,7 +206,7 @@ struct CurrentUsageLimitCard: View {
     }
     .padding(10)
     .frame(maxWidth: .infinity, minHeight: 65, alignment: .leading)
-    .background(Color.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+    .glassCard(in: RoundedRectangle(cornerRadius: 10, style: .continuous))
   }
 
   var metricText: String {
@@ -386,7 +386,7 @@ struct AllProviderUsageCard: View {
       }
       .padding(10)
       .frame(maxWidth: .infinity, minHeight: 98, alignment: .leading)
-      .background(Color.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+      .glassCard(in: RoundedRectangle(cornerRadius: 10, style: .continuous))
       .overlay(
         RoundedRectangle(cornerRadius: 10, style: .continuous)
           .stroke(
@@ -497,7 +497,7 @@ struct UsageRangePicker: View {
       }
     }
     .padding(2)
-    .background(Color.primary.opacity(0.045), in: Capsule())
+    .glassCard(in: Capsule())
   }
 }
 
@@ -522,7 +522,7 @@ struct TokenDisplayUnitPicker: View {
       }
     }
     .padding(2)
-    .background(Color.primary.opacity(0.045), in: Capsule())
+    .glassCard(in: Capsule())
     .accessibilityLabel(routerLocalized("Token unit"))
   }
 }

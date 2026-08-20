@@ -429,10 +429,7 @@ struct AccordionPanel<Content: View>: View {
             .padding(.bottom, 10)
         }
       }
-      .background(
-        Color.primary.opacity(0.045),
-        in: RoundedRectangle(cornerRadius: 10, style: .continuous)
-      )
+      .glassCard(in: RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
   }
 

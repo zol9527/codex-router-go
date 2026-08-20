@@ -84,7 +84,7 @@ struct ProviderSetupRow: View {
               .font(.system(size: 11, design: .monospaced))
               .padding(.horizontal, 9)
               .padding(.vertical, 7)
-              .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 6))
+              .glassCard(in: RoundedRectangle(cornerRadius: 6, style: .continuous))
             Button(routerLocalized("Save")) {
               let key = apiKey
               apiKey = ""

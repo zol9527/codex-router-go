@@ -88,7 +88,8 @@ struct TrayView: View {
 
   var body: some View {
     ZStack {
-      VisualEffectBlur()
+      // 毛玻璃基底：主窗口 .sidebar（App 级磨砂），菜单栏弹出 .popover。
+      VisualEffectBlur(material: presentation == .window ? .sidebar : .popover)
         .ignoresSafeArea()
       VStack(spacing: 0) {
         header
@@ -224,10 +225,7 @@ struct TrayView: View {
         .monospacedDigit()
     }
     .padding(9)
-    .background(
-      Color.primary.opacity(0.045),
-      in: RoundedRectangle(cornerRadius: 9, style: .continuous)
-    )
+    .glassCard(in: RoundedRectangle(cornerRadius: 9, style: .continuous))
     // Issue #182: the card above tracks the active model only, so a second
     // model's speed was unknowable without switching to it and waiting.
     if store.recentModelSpeeds.count > 1 {
@@ -254,10 +252,7 @@ struct TrayView: View {
         }
       }
       .padding(.vertical, 2)
-      .background(
-        Color.primary.opacity(0.03),
-        in: RoundedRectangle(cornerRadius: 9, style: .continuous)
-      )
+      .glassCard(in: RoundedRectangle(cornerRadius: 9, style: .continuous))
     }
 
     sectionLabel(

@@ -241,14 +241,33 @@ struct AccentButtonStyle: ButtonStyle {
   }
 }
 
+/// 全窗毛玻璃底。主窗口用 `.sidebar`（更通透的 App 级磨砂），菜单栏
+/// 弹出保持 `.popover`（系统弹层语义）。behindWindow + active 让材质
+/// 实时采样窗口后方的内容 —— 这是整套毛玻璃风格的基底。
 struct VisualEffectBlur: NSViewRepresentable {
+  var material: NSVisualEffectView.Material = .popover
+
   func makeNSView(context: Context) -> NSVisualEffectView {
     let view = NSVisualEffectView()
-    view.material = .popover
+    view.material = material
     view.blendingMode = .behindWindow
     view.state = .active
     return view
   }
 
-  func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
+  func updateNSView(_ nsView: NSVisualEffectView, context: Context) {
+    nsView.material = material
+  }
+}
+
+extension View {
+  /// 统一毛玻璃卡片：材质底 + 发丝描边（Apple 磨砂语言）。替代散落
+  /// 各处的 `Color.primary.opacity(0.03~0.06)` 手写卡片 —— 一处定义，
+  /// 全 app 同款；描边不透明度可按需微调。
+  func glassCard<S: InsettableShape>(in shape: S, strokeOpacity: Double = 0.08) -> some View {
+    background(.ultraThinMaterial, in: shape)
+      .overlay(
+        shape.strokeBorder(.white.opacity(strokeOpacity), lineWidth: 0.5)
+      )
+  }
 }
