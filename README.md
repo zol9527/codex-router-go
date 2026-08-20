@@ -1,10 +1,7 @@
 # Model Router
 
-> 本仓库是 [duolahypercho/codex-router](https://github.com/duolahypercho/codex-router)
-> 的 **Go 重写版（fork）**：砍掉 Node.js 运行时与 LiteLLM Python 网关，
-> 换成**单个自包含 Go 二进制 + 一个原生 macOS App**。原项目的完整说明与
-> 历史见 `git log -- README.md` 与 `CHANGELOG.md`；归属说明见 `NOTICE.md`。
-> 设计基线与迁移记录见 [GO-REWRITE-PLAN.md](GO-REWRITE-PLAN.md)。
+> 基于 [duolahypercho/codex-router](https://github.com/duolahypercho/codex-router)；
+> 归属与许可说明见 [NOTICE.md](NOTICE.md)。
 
 把 Codex（App 与 CLI）接到你自己的模型订阅上：**Z.ai GLM Coding Plan**、
 **opencode Go/Zen**、自托管 **LiteLLM**，外加**原生 ChatGPT 订阅直通**。路由器以 Responses API
@@ -37,15 +34,19 @@ Codex ──► 127.0.0.1:4202/_codex-router/<caller-key>/v1/responses
 前置：macOS、Go 1.22+、Xcode command line tools（构建 App 用）。
 
 ```sh
-# 1. 构建 App（自动把 Go 二进制编进 bundle）
+# 1. 构建 App（默认直接产出 ~/Applications/Model Router.app，
+#    Go 服务二进制内嵌在 bundle 里）
 ./scripts/build-macos-tray-app.sh
 open ~/Applications/"Model Router.app"      # 服务随 App 启动
 
-# 2. 发布到 Codex（写 config.toml 标记块 + 模型 catalog，幂等）
-./codex-router install
+# 2. CLI 工具（产物统一落 dist/）
+make cli
 
-# 3. 填凭证（见下一节），然后体检
-./codex-router doctor
+# 3. 发布到 Codex（写 config.toml 标记块 + 模型 catalog，幂等）
+./dist/codex-router install
+
+# 4. 填凭证（见下一节），然后体检
+./dist/codex-router doctor
 ```
 
 完全退出并重开 Codex，新建任务，picker 里选路由模型。
@@ -79,40 +80,41 @@ api_key = "sk-..."
 file = "~/.secrets/env"
 ```
 
-- 生成带注释模板：`./codex-router control config init`
+- 生成带注释模板：`./dist/codex-router control config init`
 - App 设置页「凭证配置 → 打开配置」直达编辑
 - 解析顺序：**环境变量 > config.toml > `*.secret` 文件 > macOS Keychain**
-  （后两者是原项目的历史来源，保留兼容）
-- 命令行写入（隐藏输入）：`./codex-router control credential zai-coding`
+- 命令行写入（隐藏输入）：`./dist/codex-router control credential zai-coding`
 - 坏文件 fail-closed：解析不了的配置按"未配置"处理，`doctor` 与
   `control reload` 会给出带行号的错误
-- 刷新 catalog 与集成块而不重启服务：`./codex-router control reload`
+- 刷新 catalog 与集成块而不重启服务：`./dist/codex-router control reload`
 
 ## control 命令面
 
-App 的每个按钮背后就是这些命令（`./codex-router control …`）：
+App 的每个按钮背后就是这些命令（`./dist/codex-router control …`）：
 
 ```
 control --json                          tray 快照（providers/models/presence）
 control service start|stop|restart|status
 control providers list [--json]         provider 与凭证状态
 control providers enable ID [ID...]     追加启用
+control set ID on|off                   托盘开关路径（整体重写选择）
+control apply                           重发布 catalog + 集成块（= reload）
 control credential PROVIDER             stdin 写入 api_key 到 config.toml
 control credential PROVIDER --remove    删除对应表
 control config init                     生成注释模板
 control reload                          重读配置+刷新 catalog，不重启
-control subagents status|mode|select-all|unselect-all|set|provider
-control picker set <slug> show|hide | provider <id> | all | status
+control subagents status|mode <m>|select-all|unselect-all|declare <slug>|undeclare <slug>|set <slug> on|off|provider <id> on|off
+control picker set <slug> show|hide | provider <id> show|hide | all show|hide | status
+control models sync [PROVIDER]|list|remove <slug>|add PROVIDER <upstream-id> [--efforts a,b] [--default-effort x] [--context-window N]
 control presence set always|follow-codex
 control account --json | provider-usage --json    配额与用量
-control vision-bridge on|off | status | engine <slug|local|auto> [effort] | effort <level|default> | local <tag>
-control vision-bridge pull TAG | pull-status | benchmark | catalog
-control local-runtime status|start|stop
+control probe PROVIDER [MODEL]          上游行为探针（models / args 可见性 / 计数口径）
+control vision-bridge on|off | status | effort <level|default>
 ```
 
-## 管线功能（全部保留自原项目）
+## 管线能力
 
-| 功能 | 说明 |
+| 能力 | 说明 |
 |---|---|
 | 空补全守卫 | 上游 200 但零 token：按住响应头，结束时返回明确失败；是否重试交给 Codex |
 | Prompt-token 补零 | 上游报 `input_tokens: 0` 时以偏高估算替换，防 Codex 永不压缩上下文 |
@@ -127,28 +129,68 @@ control local-runtime status|start|stop
 
 ## 上游超时与看门狗
 
-上游可能"接受请求后既不吐字节也不报错也不断开"（2026-08-16 三次实发黑洞：
-zai HTTP 流挂 8 分半、原生 WSS 管道零回帧 10 分钟、Surge fake-IP 把 TLS
-握手黑洞成连接永不成）。连接建立层装固定档闸（拨号 30s / TLS 握手 15s，
-不开 env），流式层装三道可调 fail-fast 闸，把无限挂起变成可重试的快速失败
-（Codex 对 5xx 自带重试接管）：
+上游可能"接受请求后既不吐字节也不报错也不断开"。连接建立层装固定档闸
+（拨号 30s / TLS 握手 15s，不开 env），流式层装三道可调 fail-fast 闸，把
+无限挂起变成可重试的快速失败（Codex 对 5xx 自带重试接管）：
 
 | 闸 | 默认 | 语义 | 关闭 |
 |---|---|---|---|
 | 响应头超时 `CODEX_ROUTER_HEADER_TIMEOUT_SEC` | 300 | 上游多久不回响应头判死（502） | 设 `0` |
 | 流空闲看门狗 `CODEX_ROUTER_IDLE_TIMEOUT_SEC` | 180 | SSE 流上多久零字节判死：头未提交回 504 `upstream_idle_timeout`；已提交只截断（调用方整轮重试） | 设 `0` |
 | WS 静默看门狗 `CODEX_ROUTER_WS_SILENT_TIMEOUT_SEC` | 60 | 客户端发过请求帧而上游此后零回帧超窗口 → 主动拆管（跨 turn 空闲不拆） | 设 `0` |
-| WS keepalive `CODEX_ROUTER_WS_KEEPALIVE_SEC` | 60 | 空闲管道周期向上游发 ping，防中间设备（NAT/TUN）按空闲超时砍断（2026-08-19 实证：经 Surge TUN 的管道空闲 ~30 分钟必死） | 设 `0` |
-| 慢请求日志 `CODEX_ROUTER_SLOW_REQUEST_LOG_SEC` | 120 | 请求在途超窗口补一行 `slow request pending`（只记录、不拆流，收尾日志照常）—— 挂死请求不再零痕迹 | 设 `0` |
+| WS keepalive `CODEX_ROUTER_WS_KEEPALIVE_SEC` | 60 | 空闲管道周期向上游发 ping，防中间设备（NAT/TUN）按空闲超时砍断长连接 | 设 `0` |
+| 慢请求日志 `CODEX_ROUTER_SLOW_REQUEST_LOG_SEC` | 120 | 请求在途超窗口补一行 `slow request pending`（只记录、不拆流，收尾日志照常） | 设 `0` |
 
-失败一律落 `router.log`（含 model/provider/status/duration/错误摘要）与
-`usage-events.jsonl`（`upstreamIdle`/`streamAborted` 字段）。
+## 日志
 
+`serve` 的日志由标准库 `slog` 门面（`internal/lib/logx`）统一管理：
+
+```sh
+codex-router serve --log-file ~/.codex-router/router.log --log-level info
+# 等价 env：CODEX_ROUTER_LOG_FILE / CODEX_ROUTER_LOG_LEVEL
+```
+
+- **两种输出形态**：不指定 `--log-file` 时打 stderr（text 格式，前台
+  调试用）；指定后写该文件（JSON 行，`jq`/grep 友好）。文件超 8MB
+  归档为 `.log.1`（单代覆盖）。App 托管与终端救急（`control service
+  start`）两条启动路径都传 `--log-file`，轮转语义一致。
+- **请求关联**：每条请求日志带 `req=<id>`，与 `/health` 活动面板及
+  `usage-events.jsonl` 的 `requestId` 字段同源 —— 一个回合的降级、
+  转发、收尾日志与计量行可串成同一条轨迹。WS 管道日志带 `pipe=<id>`
+  （opened/silent/idle/closed 跨行配对）。
+- **级别**：`--log-level debug|info|warn|error`，默认 `info`。降级翻译、
+  流截断是 `warn`；请求失败是 `error`；vision 缓存命中是 `debug`。
+- 优雅停机（SIGTERM/SIGINT）记 `server stopped`（info），不再渲染成
+  fatal。App 的 supervisor 事件（spawn/crash）以 `[supervisor]` 前缀
+  带时间戳混排在同一文件。
+- 失败事实（model/provider/status/duration/错误摘要）落 `router.log`，
+  计量事实（token、首 token 延迟、`upstreamIdle`/`streamAborted`）落
+  `usage-events.jsonl`（8MB 单代轮转，`requestId` 与日志关联）。
+
+## 动态模型注册（discover + models.dev）
+
+```sh
+./dist/codex-router discover zai-coding       # 只读：实时拉 provider /v1/models 全量列表
+./dist/codex-router control models sync       # 发现 + 自动注册新模型（install 也会自动跑）
+./dist/codex-router control models list       # 查看动态注册的模型（user-models.json）
+./dist/codex-router control models remove <slug>
+./dist/codex-router control models add PROVIDER <upstream-id> \
+    [--efforts minimal,high] [--default-effort high] [--context-window 1048576]
+```
+
+- 参数来自 **models.dev** 开源库（上下文窗口/推理/视觉/描述，精确值），
+  未收录的模型回落同家族克隆（effort 档位始终来自家族）；
+  `models add` 采信上游自报元数据，拉不到再回落本地猜测链
+- 写入 `~/.codex-router/user-models.json` 覆盖层 —— 升级二进制不丢；
+  与内嵌注册表撞车时内嵌优先（正式收录永远赢）
+- 注册后向服务进程发 SIGUSR1 **热重载注册表**，即时可路由；
+  picker 显示需重开 Codex
+- App 设置页「模型同步 → 立即同步」是同一件事的按钮入口
 
 ## 扩展协议
 
-provider 在注册表里声明协议（`internal/registry/config/`），
-`internal/wire/` 是协议抽象层：**新协议 = 新增一个包实现
+provider 在注册表里声明协议（`internal/domain/registry/config/`），
+`internal/domain/wire/` 是协议抽象层：**新协议 = 新增一个包实现
 `wire.Protocol` 接口 + 注册**，服务端零改动。内置两种：
 
 - `chat-completions`（默认）：Responses ↔ chat-completions 双向翻译
@@ -164,28 +206,11 @@ provider 在注册表里声明协议（`internal/registry/config/`），
   输出一律打码
 - 详见 [SECURITY.md](SECURITY.md)
 
-## 动态模型注册（discover + models.dev）
-
-```sh
-./codex-router discover zai-coding       # 只读：实时拉 provider /v1/models 全量列表
-./codex-router control models sync       # 发现 + 自动注册新模型（install 也会自动跑）
-./codex-router control models list       # 查看动态注册的模型（user-models.json）
-./codex-router control models remove <slug>
-```
-
-- 参数来自 **models.dev** 开源库（上下文窗口/推理/视觉/描述，精确值），
-  未收录的模型回落同家族克隆（effort 档位始终来自家族）
-- 写入 `~/.codex-router/user-models.json` 覆盖层 —— 升级二进制不丢；
-  与内嵌注册表撞车时内嵌优先（正式收录永远赢）
-- 注册后向服务进程发 SIGUSR1 **热重载注册表**，即时可路由；
-  picker 显示需重开 Codex
-- App 设置页「模型同步 → 立即同步」是同一件事的按钮入口
-
 ## 卸载
 
 ```sh
-./codex-router uninstall          # 还原 config.toml、清 CLI 工件；状态保留
-./codex-router uninstall --purge  # 连凭证与用量历史一起销毁（显式选择）
+./dist/codex-router uninstall          # 还原 config.toml、清 CLI 工件；状态保留
+./dist/codex-router uninstall --purge  # 连凭证与用量历史一起销毁（显式选择）
 ```
 
 App 本体（`~/Applications/Model Router.app`）由你手动拖出删除。
@@ -193,15 +218,25 @@ App 本体（`~/Applications/Model Router.app`）由你手动拖出删除。
 ## 开发
 
 ```sh
-go build ./... && go test ./...          # Go 侧（12 个测试包）
-./scripts/build-macos-tray-app.sh        # 重建 App（含内嵌 Go 二进制）
+make help        # 全部目标一览
+make cli         # 编译 CLI → dist/codex-router
+make app         # 构建 App → dist/Model Router.app
+make test        # Go 全量测试（含 internal/arch 分层车道护栏）
+make test-app    # Swift 包测试
+make install-cli # 原子替换 ~/bin/codex-router（部署）
+make install-app # App 换到 ~/Applications（部署；App 在跑会拒绝）
 ```
 
-目录：`cmd/codex-router/`（CLI 入口）· `internal/wire/`（协议层）·
-`internal/translate/`（纯翻译库）· `internal/server/`（HTTP 服务）·
-`internal/registry/`（注册表 + 内嵌 config）· `internal/state/`、
-`internal/cred/`、`internal/tomlconf/`、`internal/usage/`、`internal/vision/` ·
-`apps/macos/ModelRouterTray/`（Swift App）。
+`internal/` 按语义四层组织（ADR-0005，依赖边只朝下，`internal/arch`
+测试钉住）：`cmd/codex-router/`（薄入口）+ `internal/app/cli/`（命令
+实现）· `app/`（server、controlplane、codexconfig —— 对外表面）·
+`engine/`（routing、nativebackend、catalog、discover —— 任务执行）·
+`domain/`（registry、translate、wire、state、cred、usage、vision ——
+领域数据与接缝）· `lib/`（httpx、tomlconf、modelmeta —— 共享实现
+单点归宿）· `apps/macos/ModelRouterTray/`（Swift App）。
 
-状态目录 `~/.codex-router`；`GO-REWRITE-PLAN.md` 是设计与迁移的
-权威记录。
+深入阅读：[docs/architecture/README.md](docs/architecture/README.md)
+（架构调研与请求生命周期）· [docs/adr/](docs/adr/)（架构决策记录）·
+[SECURITY.md](SECURITY.md)（安全模型）· [NOTICE.md](NOTICE.md)（归属）。
+
+状态目录 `~/.codex-router`。

@@ -1,0 +1,807 @@
+package translate
+
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+	"sync"
+	"time"
+)
+
+// ChatToResponsesSSE 把 chat-completions 上游的 SSE 流增量翻译成
+// Codex 期望的 Responses 事件流。
+//
+// 事件序列合同（Codex 端解析器要求）：
+//
+//	response.created
+//	[reasoning item] output_item.added → reasoning_summary_part.added →
+//	  reasoning_summary_text.delta* → …done → output_item.done
+//	[message item]   output_item.added → content_part.added →
+//	  output_text.delta* → output_text.done → content_part.done → output_item.done
+//	[function_call]  output_item.added → function_call_arguments.delta* →
+//	  function_call_arguments.done → output_item.done
+//	response.completed（带完整 output 与 usage）
+//	data: [DONE]
+type ChatToResponsesSSE struct {
+	responseID string
+	model      string
+
+	reasoning    *itemState
+	message      *itemState
+	functionCall map[int]*itemState
+	nextIndex    int
+
+	usage map[string]any
+	done  bool
+
+	// 补零替换的状态（见 responsesUsage）。
+	estimatedInput       int
+	substitutedInput     int
+	observedPromptTokens int64
+
+	// namespace 回写：模型发出的扁平 `<ns>__<tool>` 调用名还原为客户端
+	// 派发的 {name, namespace} 形态（含 spawn_agent 白名单清洗、
+	// create_thread 会话模型注入、整数 token 修复）。
+	namespaceIndex *NamespaceIndex
+	sessionModel   string
+
+	// customTools 是请求侧以 custom 形态声明的工具名：对这些名字的
+	// function 调用要还原成 custom_tool_call item（自由文本 input），
+	// 否则 Codex 的 custom 规格工具收到 function 载荷即
+	// "invoked with incompatible payload"。
+	customTools map[string]bool
+}
+
+// WithCustomTools 装载请求声明的 custom 工具名（空切片 = 无）。
+func (t *ChatToResponsesSSE) WithCustomTools(names []string) *ChatToResponsesSSE {
+	if len(names) == 0 {
+		return t
+	}
+	t.customTools = make(map[string]bool, len(names))
+	for _, name := range names {
+		t.customTools[name] = true
+	}
+	return t
+}
+
+// WithNamespaceIndex 装载 namespace 还原索引（请求时 FlattenNamespaceTools
+// 的产物；nil 表示该请求没有 namespace 工具，回写为空操作）。
+func (t *ChatToResponsesSSE) WithNamespaceIndex(index *NamespaceIndex, sessionModel string) *ChatToResponsesSSE {
+	t.namespaceIndex = index
+	t.sessionModel = sessionModel
+	return t
+}
+
+// WithEstimatedInputTokens 装载补零估算（仅大请求装载：小请求的零
+// 无关紧要 —— 原实现的 "do not bother" 下限）。
+func (t *ChatToResponsesSSE) WithEstimatedInputTokens(estimate int) *ChatToResponsesSSE {
+	t.estimatedInput = estimate
+	return t
+}
+
+// SubstitutedInputTokens 返回被替换进响应的估算值（0 = provider 自报）。
+func (t *ChatToResponsesSSE) SubstitutedInputTokens() int { return t.substitutedInput }
+
+// PromptTokens 返回 provider 报告的 prompt 数。
+func (t *ChatToResponsesSSE) PromptTokens() int64 { return t.observedPromptTokens }
+
+// OutputTokens / TotalTokens 从 usage 提取计量（usage 缺失为 0）。
+func (t *ChatToResponsesSSE) OutputTokens() int64 {
+	if v, ok := t.usage["completion_tokens"].(float64); ok {
+		return int64(v)
+	}
+	return 0
+}
+
+func (t *ChatToResponsesSSE) TotalTokens() int64 {
+	if v, ok := t.usage["total_tokens"].(float64); ok {
+		return int64(v)
+	}
+	return 0
+}
+
+// HasContent 报告本流是否产出过客户端可行动的内容
+// （输出文本或有效工具调用；纯 reasoning 不算 —— 空补全守卫的判定）。
+// custom 工具的调用要求解出的 input 非空：GLM-5.3 在 100k+ 上下文会
+// 退化成反复发空载荷 exec 调用（2026-08-17 15:55-16:31 实发死循环：
+// 每轮仅 out=5 token，Codex 收到空调用后 needs_follow_up 无限续轮，
+// 单个 turn 烧了 200+ 次请求），空载荷在这里不算内容，由守卫按
+// empty_completion 失败收尾；普通 function 调用的参数可为空
+// （无参工具是合法形态），照旧算内容。
+func (t *ChatToResponsesSSE) HasContent() bool {
+	if t.message != nil && t.message.text.Len() > 0 {
+		return true
+	}
+	for _, state := range t.functionCall {
+		if state == nil {
+			continue
+		}
+		if state.custom && emptyCustomInput(state.arguments.String()) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// HasToolCalls 报告本流是否出现过任何 tool call item（含未完成）。
+// failLiveStream 在"头已提交 + 中途断流"时据此分流：已有工具调用则
+// 以 response.failed 显式收尾（客户端整轮重试会重复执行工具，副作用
+// 风险不可接受）；纯文本流维持静默截断（重试重建文本无副作用）。
+func (t *ChatToResponsesSSE) HasToolCalls() bool {
+	return len(t.functionCall) > 0
+}
+
+// OutputBuffer 累积 Feed 产出的完整 SSE 块（守卫模式：
+// 选完尝试再整段写出，写流阶段复用同一缓冲）。
+type OutputBuffer struct {
+	buf []byte
+}
+
+// Write 记录一段翻译输出。
+func (e *OutputBuffer) Write(chunk []byte) { e.buf = append(e.buf, chunk...) }
+
+// Bytes 返回累积的全部字节。
+func (e *OutputBuffer) Bytes() []byte { return e.buf }
+
+// TranslateNonStreamChatWith 用现成翻译器处理非流式响应
+// （estimate 已在翻译器上装载）。
+func TranslateNonStreamChatWith(body map[string]any, t *ChatToResponsesSSE) map[string]any {
+	if id, ok := body["id"].(string); ok && id != "" {
+		t.responseID = id
+	}
+	choices, _ := body["choices"].([]any)
+	for _, raw := range choices {
+		choice, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if message, ok := choice["message"].(map[string]any); ok {
+			t.feedDelta(message)
+		}
+	}
+	if usage, ok := body["usage"].(map[string]any); ok {
+		t.usage = usage
+	}
+	t.close()
+	response := t.responseShell("completed")
+	response["output"] = t.completedOutput()
+	response["usage"] = t.responsesUsage(t.usage)
+	return response
+}
+
+type itemState struct {
+	kind        string // "reasoning" | "message" | "function_call" | "custom_tool_call"
+	itemID      string
+	callID      string
+	name        string
+	outputIndex int
+	arguments   strings.Builder
+	text        strings.Builder
+	added       bool
+	closed      bool
+	// custom 标记：该调用属于请求声明的 custom 工具，收尾时发
+	// custom_tool_call item 而不是 function_call。
+	custom bool
+}
+
+var nowFunc = time.Now().Unix
+var idMu sync.Mutex
+var idCounter int64
+
+// randomID 生成进程内唯一的短 id（事件 id 只需唯一，不需不可预测）。
+func randomID() string {
+	idMu.Lock()
+	idCounter++
+	n := idCounter
+	idMu.Unlock()
+	return fmt.Sprintf("%x%x", nowFunc(), n)
+}
+
+// NewChatToResponsesSSE 创建翻译器。
+func NewChatToResponsesSSE(responseID, model string) *ChatToResponsesSSE {
+	return &ChatToResponsesSSE{
+		responseID:   orDefault(responseID, "resp_"+randomID()),
+		model:        model,
+		functionCall: map[int]*itemState{},
+	}
+}
+
+// Created 返回流开头的 response.created 事件块。
+func (t *ChatToResponsesSSE) Created() []byte {
+	return renderEvents([]string{eventJSON("response.created", map[string]any{
+		"response": t.responseShell("in_progress"),
+	})})
+}
+
+// Feed 处理上游 SSE 的一个 data 载荷（不含 "data: " 前缀），
+// 返回需要立即写给 Codex 的完整 SSE 块。"[DONE]" 触发收尾。
+func (t *ChatToResponsesSSE) Feed(data string) []byte {
+	if data == "[DONE]" {
+		return t.close()
+	}
+	var chunk map[string]any
+	if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+		return nil // 非 JSON 的 data 行丢弃
+	}
+	if usage, ok := chunk["usage"].(map[string]any); ok {
+		t.usage = usage
+	}
+	choices, _ := chunk["choices"].([]any)
+	var payloads []string
+	for _, raw := range choices {
+		choice, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		delta, _ := choice["delta"].(map[string]any)
+		if delta == nil {
+			if message, ok := choice["message"].(map[string]any); ok {
+				delta = message
+			} else {
+				continue
+			}
+		}
+		payloads = append(payloads, t.feedDelta(delta)...)
+	}
+	return renderEvents(payloads)
+}
+
+// TranslateNonStreamChat 把一整个非流式 chat 响应翻译成 Responses JSON。
+func TranslateNonStreamChat(body map[string]any, responseID, model string) map[string]any {
+	t := NewChatToResponsesSSE(responseID, model)
+	if id, ok := body["id"].(string); ok && id != "" {
+		t.responseID = id
+	}
+	choices, _ := body["choices"].([]any)
+	for _, raw := range choices {
+		choice, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if message, ok := choice["message"].(map[string]any); ok {
+			t.feedDelta(message)
+		}
+	}
+	if usage, ok := body["usage"].(map[string]any); ok {
+		t.usage = usage
+	}
+	t.close()
+	response := t.responseShell("completed")
+	response["output"] = t.completedOutput()
+	response["usage"] = t.responsesUsage(t.usage)
+	return response
+}
+
+// feedDelta 消费一个 chat delta（或非流式 message），返回增量事件载荷。
+func (t *ChatToResponsesSSE) feedDelta(delta map[string]any) []string {
+	var payloads []string
+
+	// 思维链：GLM 系用 reasoning_content，部分转售商用 reasoning。
+	reasoning := deltaText(delta["reasoning_content"])
+	if reasoning == "" {
+		reasoning = deltaText(delta["reasoning"])
+	}
+	if reasoning != "" {
+		if t.reasoning == nil {
+			t.reasoning = t.newItem("reasoning")
+			payloads = append(payloads,
+				eventJSON("response.output_item.added", map[string]any{
+					"output_index": t.reasoning.outputIndex,
+					"item":         t.reasoning.reasoningItem(),
+				}),
+				eventJSON("response.reasoning_summary_part.added", map[string]any{
+					"item_id":       t.reasoning.itemID,
+					"output_index":  t.reasoning.outputIndex,
+					"summary_index": 0,
+					"part":          map[string]any{"type": "summary_text", "text": ""},
+				}))
+		}
+		t.reasoning.text.WriteString(reasoning)
+		payloads = append(payloads, eventJSON("response.reasoning_summary_text.delta", map[string]any{
+			"item_id":       t.reasoning.itemID,
+			"output_index":  t.reasoning.outputIndex,
+			"summary_index": 0,
+			"delta":         reasoning,
+		}))
+	}
+
+	// 可见文本。
+	if content := deltaText(delta["content"]); content != "" {
+		if t.message == nil {
+			t.message = t.newItem("message")
+			payloads = append(payloads,
+				eventJSON("response.output_item.added", map[string]any{
+					"output_index": t.message.outputIndex,
+					"item":         t.message.messageItem(),
+				}),
+				eventJSON("response.content_part.added", map[string]any{
+					"item_id":       t.message.itemID,
+					"output_index":  t.message.outputIndex,
+					"content_index": 0,
+					"part":          map[string]any{"type": "output_text", "text": ""},
+				}))
+		}
+		t.message.text.WriteString(content)
+		payloads = append(payloads, eventJSON("response.output_text.delta", map[string]any{
+			"item_id":       t.message.itemID,
+			"output_index":  t.message.outputIndex,
+			"content_index": 0,
+			"delta":         content,
+		}))
+	}
+
+	// 工具调用：按 chat tool_calls[].index 维持多个并行 item。
+	if calls, ok := delta["tool_calls"].([]any); ok {
+		for _, raw := range calls {
+			call, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			chatIndex := 0
+			if v, ok := call["index"].(float64); ok {
+				chatIndex = int(v)
+			}
+			fn, _ := call["function"].(map[string]any)
+			name, _ := fn["name"].(string)
+			state := t.functionCall[chatIndex]
+			if state == nil {
+				kind := "function_call"
+				if t.customTools[name] {
+					kind = "custom_tool_call"
+				}
+				state = t.newItem(kind)
+				t.functionCall[chatIndex] = state
+			}
+			if id, ok := call["id"].(string); ok && id != "" && state.callID == "" {
+				state.callID = id
+			}
+			if fn == nil {
+				continue
+			}
+			if name != "" && state.name == "" {
+				state.name = name
+				// custom 工具的调用按其真实形态回传（custom_tool_call）。
+				if t.customTools[name] {
+					t.promoteCustomToolCall(state)
+				}
+			}
+			if args, ok := fn["arguments"].(string); ok && args != "" {
+				if !state.added {
+					payloads = append(payloads, eventJSON("response.output_item.added", map[string]any{
+						"output_index": state.outputIndex,
+						"item":         t.callItemForState(state, ""),
+					}))
+					state.added = true
+				}
+				state.arguments.WriteString(args)
+				// custom 调用不发 function_call_arguments 增量：
+				// 形态不匹配，Codex 从 output_item.done 取完整载荷。
+				if !state.custom {
+					payloads = append(payloads, eventJSON("response.function_call_arguments.delta", map[string]any{
+						"item_id":      state.itemID,
+						"output_index": state.outputIndex,
+						"delta":        args,
+					}))
+				}
+			}
+		}
+	}
+	return payloads
+}
+
+// newItem 分配 output index 与 item id。
+// callID 不在此预设：chat 上游的 tool_calls[].id 通常随首个增量到达，
+// 预设的占位值会挡住它 —— 真实 id 优先，缺失才在 item 构造时派生。
+func (t *ChatToResponsesSSE) newItem(kind string) *itemState {
+	prefix := map[string]string{
+		"reasoning": "rs_", "message": "msg_", "function_call": "fc_", "custom_tool_call": "ctc_",
+	}[kind]
+	state := &itemState{
+		kind:        kind,
+		itemID:      prefix + randomID(),
+		outputIndex: t.nextIndex,
+		added:       kind != "function_call" && kind != "custom_tool_call",
+	}
+	t.nextIndex++
+	return state
+}
+
+// promoteCustomToolCall 把尚未发送 added 事件的自定义工具调用切换为
+// Responses 规定的 ctc_ item ID。历史实现先按 function_call 建立状态，
+// 因为工具名可能晚一个 delta 到达；只要还没对客户端发出 item，就可以
+// 无损完成类型和 ID 的升级。
+func (t *ChatToResponsesSSE) promoteCustomToolCall(s *itemState) {
+	s.custom = true
+	if !s.added && strings.HasPrefix(s.itemID, "fc_") {
+		s.itemID = "ctc_" + strings.TrimPrefix(s.itemID, "fc_")
+	}
+}
+
+// close 关闭全部进行中 items，产出 response.completed 与 [DONE]。
+func (t *ChatToResponsesSSE) close() []byte {
+	if t.done {
+		return nil
+	}
+	t.done = true
+	var payloads []string
+	payloads = append(payloads, t.closeReasoning()...)
+	payloads = append(payloads, t.closeMessage()...)
+	for i := 0; i < len(t.functionCall); i++ {
+		payloads = append(payloads, t.closeFunctionCall(i)...)
+	}
+	response := t.responseShell("completed")
+	response["output"] = t.completedOutput()
+	response["usage"] = t.responsesUsage(t.usage)
+	payloads = append(payloads, eventJSON("response.completed", map[string]any{
+		"response": response,
+	}))
+	return renderEvents(append(payloads, "[DONE]"))
+}
+
+func (t *ChatToResponsesSSE) closeReasoning() []string {
+	s := t.reasoning
+	if s == nil || s.closed {
+		return nil
+	}
+	s.closed = true
+	text := s.text.String()
+	return []string{
+		eventJSON("response.reasoning_summary_text.done", map[string]any{
+			"item_id":       s.itemID,
+			"output_index":  s.outputIndex,
+			"summary_index": 0,
+			"text":          text,
+		}),
+		eventJSON("response.reasoning_summary_part.done", map[string]any{
+			"item_id":       s.itemID,
+			"output_index":  s.outputIndex,
+			"summary_index": 0,
+			"part":          map[string]any{"type": "summary_text", "text": text},
+		}),
+		eventJSON("response.output_item.done", map[string]any{
+			"output_index": s.outputIndex,
+			"item":         s.reasoningDoneItem(text),
+		}),
+	}
+}
+
+func (t *ChatToResponsesSSE) closeMessage() []string {
+	s := t.message
+	if s == nil || s.closed {
+		return nil
+	}
+	s.closed = true
+	text := s.text.String()
+	if text == "" {
+		return nil // 从未产出文本的 message item 不进 output
+	}
+	return []string{
+		eventJSON("response.output_text.done", map[string]any{
+			"item_id":       s.itemID,
+			"output_index":  s.outputIndex,
+			"content_index": 0,
+			"text":          text,
+		}),
+		eventJSON("response.content_part.done", map[string]any{
+			"item_id":       s.itemID,
+			"output_index":  s.outputIndex,
+			"content_index": 0,
+			"part":          map[string]any{"type": "output_text", "text": text},
+		}),
+		eventJSON("response.output_item.done", map[string]any{
+			"output_index": s.outputIndex,
+			"item":         s.messageDoneItem(text),
+		}),
+	}
+}
+
+func (t *ChatToResponsesSSE) closeFunctionCall(chatIndex int) []string {
+	s := t.functionCall[chatIndex]
+	if s == nil || s.closed {
+		return nil
+	}
+	s.closed = true
+	args := s.arguments.String()
+	if args == "" {
+		args = "{}"
+	}
+	if s.custom {
+		return t.closeCustomToolCall(s, args)
+	}
+	var payloads []string
+	if !s.added {
+		payloads = append(payloads, eventJSON("response.output_item.added", map[string]any{
+			"output_index": s.outputIndex,
+			"item":         t.functionCallItem(s, ""),
+		}))
+	}
+	payloads = append(payloads,
+		eventJSON("response.function_call_arguments.done", map[string]any{
+			"item_id":      s.itemID,
+			"output_index": s.outputIndex,
+			"arguments":    args,
+		}),
+		eventJSON("response.output_item.done", map[string]any{
+			"output_index": s.outputIndex,
+			"item":         t.functionCallItem(s, args),
+		}))
+	return payloads
+}
+
+// callItemForState 按调用形态构造 added/done 用的 item：custom 工具
+// 用 custom_tool_call（input 自由文本），其余用 function_call。
+func (t *ChatToResponsesSSE) callItemForState(s *itemState, payload string) map[string]any {
+	if s.custom {
+		return t.customToolCallItem(s, payload)
+	}
+	return t.functionCallItem(s, payload)
+}
+
+// closeCustomToolCall 把 custom 工具的 function 调用收尾成
+// custom_tool_call item：input 是自由文本载荷（从伪装 schema 的
+// input 参数解出）。Codex 的解析器从 output_item.done 取完整 item，
+// 不依赖增量事件。
+func (t *ChatToResponsesSSE) closeCustomToolCall(s *itemState, args string) []string {
+	input := customToolInput(args)
+	payloads := []string{}
+	if !s.added {
+		payloads = append(payloads, eventJSON("response.output_item.added", map[string]any{
+			"output_index": s.outputIndex,
+			"item":         t.customToolCallItem(s, ""),
+		}))
+	}
+	payloads = append(payloads, eventJSON("response.output_item.done", map[string]any{
+		"output_index": s.outputIndex,
+		"item":         t.customToolCallItem(s, input),
+	}))
+	return payloads
+}
+
+// customToolCallItem 构造 custom_tool_call item。
+func (t *ChatToResponsesSSE) customToolCallItem(s *itemState, payload string) map[string]any {
+	return map[string]any{
+		"type": "custom_tool_call", "id": s.itemID,
+		"call_id": orDefault(s.callID, "call_"+s.itemID), "name": s.name,
+		"input": payload, "status": "completed",
+	}
+}
+
+// emptyCustomInput 判定 custom 调用的有效载荷是否为空。模型退化时的
+// 空调用表现为：arguments 缺失、字面 "{}"、或 {"input":""} —— 这些
+// 都不构成可执行的载荷；解不出 input 的乱形状（如 {"cmd":"ls"}）
+// 仍按非空处理，与 customToolInput 的"不丢调用"立场一致。
+func emptyCustomInput(args string) bool {
+	trimmed := strings.TrimSpace(customToolInput(args))
+	return trimmed == "" || trimmed == "{}"
+}
+
+// customToolInput 从模型按伪装 schema 生成的 arguments 里解出自由文本
+// 载荷：{"input": "..."} 优先；整体是 JSON 字符串字面量则取字面量；
+// 都不是就把原始 arguments 当载荷（模型没按 schema 来时不至于丢调用）。
+func customToolInput(args string) string {
+	trimmed := strings.TrimSpace(args)
+	var asMap map[string]any
+	if err := json.Unmarshal([]byte(trimmed), &asMap); err == nil {
+		if input, ok := asMap["input"].(string); ok {
+			return input
+		}
+	}
+	var asString string
+	if err := json.Unmarshal([]byte(trimmed), &asString); err == nil {
+		return asString
+	}
+	return args
+}
+
+// completedOutput 汇总完整 output 数组（completed 事件与非流式响应共用）。
+func (t *ChatToResponsesSSE) completedOutput() []any {
+	var output []any
+	if t.reasoning != nil && t.reasoning.text.Len() > 0 {
+		output = append(output, t.reasoning.reasoningDoneItem(t.reasoning.text.String()))
+	}
+	if t.message != nil && t.message.text.Len() > 0 {
+		output = append(output, t.message.messageDoneItem(t.message.text.String()))
+	}
+	for i := 0; i < len(t.functionCall); i++ {
+		if s := t.functionCall[i]; s != nil {
+			args := s.arguments.String()
+			if args == "" {
+				args = "{}"
+			}
+			if s.custom {
+				callID := orDefault(s.callID, "call_"+s.itemID)
+				output = append(output, map[string]any{
+					"type": "custom_tool_call", "id": s.itemID,
+					"call_id": callID, "name": s.name,
+					"input": customToolInput(args), "status": "completed",
+				})
+				continue
+			}
+			output = append(output, t.functionCallItem(s, args))
+		}
+	}
+	return output
+}
+
+func (t *ChatToResponsesSSE) responseShell(status string) map[string]any {
+	return map[string]any{
+		"id":         t.responseID,
+		"object":     "response",
+		"created_at": nowFunc(),
+		"status":     status,
+		"model":      t.model,
+		"output":     []any{},
+	}
+}
+
+// responsesUsage 把 chat usage 字段名换成 Responses 字段名。
+// Prompt-token 补零替换（#95）在此生效：上游对大 prompt 报
+// input_tokens: 0 会让 Codex 永不压缩、会话撑爆窗口。替换只落在
+// 显式零上、estimate 只高不低（压缩阈值有 14% 余量），替换事实通过
+// SubstitutedInputTokens 单独暴露 —— telemetry 永远保留 provider 原值。
+//
+// null 防御（2026-08-19 实发）：上游（opencode）会偶发把 usage 字段或
+// details 子项报成 null（deepseek 短输出时 completion_tokens_details.
+// reasoning_tokens=null）。Codex 的 usage 反序列化是非 Option 整数，
+// 任何 null 都会让整个 ResponseCompleted 解析失败，客户端只能整轮
+// 丢弃并全量重试（实发一轮重试 11 次、浪费 ~50 万 input token）。
+// 因此这里非数值（null/字符串）一律不透传：字段缺失对 Codex 无害
+// （补零路径早已在产线省略键），null 则致命。details 只保留数值子项，
+// 全部非数值时整个省略。
+func (t *ChatToResponsesSSE) responsesUsage(usage map[string]any) map[string]any {
+	if usage == nil {
+		return nil
+	}
+	out := map[string]any{}
+	promptTokens, _ := usage["prompt_tokens"].(float64)
+	t.observedPromptTokens = int64(promptTokens)
+	if promptTokens == 0 && t.estimatedInput > 0 {
+		out["input_tokens"] = t.estimatedInput
+		t.substitutedInput = t.estimatedInput
+		if completion, ok := usage["completion_tokens"].(float64); ok {
+			out["output_tokens"] = completion
+			out["total_tokens"] = float64(t.estimatedInput) + completion
+		} else {
+			out["total_tokens"] = float64(t.estimatedInput)
+		}
+	} else {
+		if v, ok := usage["prompt_tokens"].(float64); ok {
+			out["input_tokens"] = v
+		}
+		if v, ok := usage["completion_tokens"].(float64); ok {
+			out["output_tokens"] = v
+		}
+		if v, ok := usage["total_tokens"].(float64); ok {
+			out["total_tokens"] = v
+		}
+	}
+	if details := numericDetails(usage["prompt_tokens_details"]); len(details) > 0 {
+		out["input_tokens_details"] = details
+	}
+	if details := numericDetails(usage["completion_tokens_details"]); len(details) > 0 {
+		out["output_tokens_details"] = details
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// numericDetails 只保留 details map 里的数值子项（cached_tokens/
+// reasoning_tokens 等在 Codex 侧是非 Option 整数，null 会炸掉整个
+// 事件的解析）；非 map 或无数值子项时返回 nil。
+func numericDetails(raw any) map[string]any {
+	details, ok := raw.(map[string]any)
+	if !ok {
+		return nil
+	}
+	out := make(map[string]any, len(details))
+	for k, v := range details {
+		if n, ok := v.(float64); ok {
+			out[k] = n
+		}
+	}
+	return out
+}
+
+// ---- item 形状构造 ----
+
+func (s *itemState) reasoningItem() map[string]any {
+	return map[string]any{"type": "reasoning", "id": s.itemID, "summary": []any{}}
+}
+
+func (s *itemState) reasoningDoneItem(text string) map[string]any {
+	return map[string]any{
+		"type": "reasoning", "id": s.itemID,
+		"summary": []any{map[string]any{"type": "summary_text", "text": text}},
+	}
+}
+
+func (s *itemState) messageItem() map[string]any {
+	return map[string]any{
+		"type": "message", "id": s.itemID, "role": "assistant", "content": []any{},
+	}
+}
+
+func (s *itemState) messageDoneItem(text string) map[string]any {
+	return map[string]any{
+		"type": "message", "id": s.itemID, "role": "assistant", "status": "completed",
+		"content": []any{map[string]any{"type": "output_text", "text": text}},
+	}
+}
+
+func (t *ChatToResponsesSSE) functionCallItem(s *itemState, args string) map[string]any {
+	item := map[string]any{
+		"type": "function_call", "id": s.itemID,
+		"call_id":   orDefault(s.callID, "call_"+s.itemID),
+		"name":      s.name,
+		"arguments": args, "status": "completed",
+	}
+	if t.namespaceIndex != nil {
+		if rewritten := t.namespaceIndex.RewriteFunctionCallItem(item, t.sessionModel); rewritten != nil {
+			return rewritten
+		}
+	}
+	return item
+}
+
+// ---- SSE 基础设施 ----
+
+// eventJSON 序列化一个事件载荷（自动带 type 字段）。
+func eventJSON(eventType string, payload map[string]any) string {
+	payload["type"] = eventType
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return ""
+	}
+	return string(raw)
+}
+
+// renderEvents 把载荷列表渲染成完整 SSE 块字节。
+func renderEvents(payloads []string) []byte {
+	var buf strings.Builder
+	for _, payload := range payloads {
+		if payload == "" {
+			continue
+		}
+		if payload == "[DONE]" {
+			buf.WriteString("data: [DONE]\n\n")
+			continue
+		}
+		// event: 行从载荷的 type 提取 —— Codex 按 data 解析，
+		// 规范双写对其他客户端更稳。
+		eventType := ""
+		var probe map[string]any
+		if json.Unmarshal([]byte(payload), &probe) == nil {
+			if t, ok := probe["type"].(string); ok {
+				eventType = t
+			}
+		}
+		if eventType != "" {
+			buf.WriteString("event: " + eventType + "\n")
+		}
+		buf.WriteString("data: " + payload + "\n\n")
+	}
+	return []byte(buf.String())
+}
+
+// deltaText 提取字符串形态的 delta 文本（部分网关发数组形态，一并处理）。
+func deltaText(value any) string {
+	switch v := value.(type) {
+	case string:
+		return v
+	case []any:
+		var buf strings.Builder
+		for _, raw := range v {
+			if part, ok := raw.(map[string]any); ok {
+				if text, ok := part["text"].(string); ok {
+					buf.WriteString(text)
+				}
+			}
+		}
+		return buf.String()
+	default:
+		return ""
+	}
+}

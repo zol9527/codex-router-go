@@ -5,7 +5,7 @@
 > 方法：router 侧事实来自本仓库源码与运维记录；opencode 侧只采信一手来源（sst/opencode dev 分支源码，commit `976c1851`，与 opencode.ai 官方文档），逐条附出处。
 > 落点：`docs/research/`（既有调研笔记目录约定）。
 >
-> **历史快照说明（2026-08-17）**：本文记录的是调研当日的实现基线。后续 Router 已删除上游自动重试、协作/视觉缓存和 tool-result spill；涉及这些机制的“现状”描述不再代表当前代码。
+> **历史快照说明（2026-08-17）**：本文记录的是调研当日的实现基线。后续 Router 已删除上游自动重试、协作/视觉缓存和 tool-result spill；涉及这些机制的“现状”描述不再代表当前代码。2026-08-20 起 internal/ 已按 ADR-0005 四层重组（如 `internal/server/routed.go` → `internal/app/server/routed.go`），文中旧路径按快照理解。
 
 ## 1. 背景与问题定义
 
