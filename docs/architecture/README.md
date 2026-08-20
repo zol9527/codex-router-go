@@ -36,26 +36,29 @@ flowchart LR
 
 ## 3. 文件架构
 
+`internal/` 按语义四层组织（ADR-0005），依赖边只允许朝下（或留在层内），由 `internal/arch` 测试钉住：`lib/` 工具（共享实现单点归宿）、`domain/` 抽象（系统知道什么）、`engine/` 操作（系统做什么）、`app/` 语义（对外表面与契约）。
+
 | 路径 | 职责 |
 | --- | --- |
-| `cmd/codex-router/` | CLI 入口：`serve`、`install`、`uninstall`、`discover`、`doctor`、`control`、`shim` 等子命令；control 是薄适配，契约与生命周期归 `internal/controlplane`。 |
-| `internal/server/` | HTTP transport：路由、认证、Responses 分流、WS 代理、错误翻译、usage 记录，以及把 HTTP 响应绑定到 routing 接缝。 |
-| `internal/controlplane/` | tray 控制面契约与服务生命周期：`control --json` 的类型化 Snapshot（与 Swift `ControlContract.swift` 解码器锚定）、provider 展示顺序、detached 启动与 pidfile 停止。 |
-| `internal/routing/` | 一次 routed turn 的完整编排：输入归一化、视觉桥、工具/namespace 适配、wire 调用、流式守卫、错误收尾与 usage 计量。 |
-| `internal/nativebackend/` | 原生 ChatGPT/Codex 后端适配：白名单请求头、会话凭据兜底、响应转发和图片描述。 |
-| `internal/registry/` | 内嵌供应商与模型注册表；加载 `config/` 目录并建立 `slug` / `gatewayModel` 索引。 |
-| `internal/registry/config/` | 各供应商与模型的 JSON 注册表片段，通过 `go:embed` 打进二进制。 |
-| `internal/wire/` | 协议抽象层：把“Codex 说 Responses”与“上游供应商协议”解耦。 |
-| `internal/wire/chatcompletion/` | Responses ↔ Chat Completions 翻译路径。 |
-| `internal/wire/responses/` | 上游原生支持 Responses 时的直通协议路径。 |
-| `internal/translate/` | 请求、响应、工具、namespace、Codex App 工具的具体翻译逻辑。 |
-| `internal/cred/` | 供应商凭据解析：环境变量 → `config.toml` → secret 文件 → macOS Keychain。 |
-| `internal/state/` | 管理 `~/.codex-router`：caller/internal secret、配置、模型可见性与子代理设置。 |
-| `internal/catalog/` | 合并 Codex 原生模型与注册表路由模型，生成 picker 用的 `merged-models.json`。 |
-| `internal/usage/` | 记录 `usage-events.jsonl`，维护配额、限流、供应商用量统计。 |
-| `internal/vision/` | 图片桥：文本模型无法直接读图时，由本地视觉模型先读图并转成文字描述。 |
-| `internal/httpx/` | HTTP 客户端、压缩、超时、SSE / 流式传输基础设施。 |
-| `apps/macos/ModelRouterTray/` | macOS Swift / SwiftUI App：托盘、主窗口、设置页、服务托管、模型管理。契约解码在 `ControlContract.swift`（与 Go `internal/controlplane` 对端），服务生命周期在 `ServiceLifecycle.swift`（App 托管路径 + Codex 桌面重启），control 进程执行在 `ControlClient.swift`（RouterControlClient）。 |
+| `cmd/codex-router/` | 薄入口：版本注入（`-X main.version`）与进程入口；命令实现与分发在 `internal/app/cli`。 |
+| `internal/app/cli/` | 全部 CLI 子命令实现（`serve`、`install`、`uninstall`、`discover`、`doctor`、`control`、`shim`）；`cli.Main(version)` 唯一导出面，持有退出语义。 |
+| `internal/app/server/` | HTTP transport：路由、认证、Responses 分流、WS 代理、错误翻译、usage 记录，以及把 HTTP 响应绑定到 routing 接缝。 |
+| `internal/app/controlplane/` | tray 控制面契约与服务生命周期：`control --json` 的类型化 Snapshot（与 Swift `ControlContract.swift` 解码器锚定）、provider 展示顺序、detached 启动与 pidfile 停止。 |
+| `internal/engine/routing/` | 一次 routed turn 的完整编排：输入归一化、视觉桥、工具/namespace 适配、wire 调用、流式守卫、错误收尾与 usage 计量。 |
+| `internal/engine/nativebackend/` | 原生 ChatGPT/Codex 后端适配：白名单请求头、会话凭据兜底、响应转发和图片描述。 |
+| `internal/domain/registry/` | 内嵌供应商与模型注册表；加载 `config/` 目录并建立 `slug` / `gatewayModel` 索引。 |
+| `internal/domain/registry/config/` | 各供应商与模型的 JSON 注册表片段，通过 `go:embed` 打进二进制。 |
+| `internal/domain/wire/` | 协议抽象层：把“Codex 说 Responses”与“上游供应商协议”解耦。 |
+| `internal/domain/wire/chatcompletion/` | Responses ↔ Chat Completions 翻译路径。 |
+| `internal/domain/wire/responses/` | 上游原生支持 Responses 时的直通协议路径。 |
+| `internal/domain/translate/` | 请求、响应、工具、namespace、Codex App 工具的具体翻译逻辑。 |
+| `internal/domain/cred/` | 供应商凭据解析：环境变量 → `config.toml` → secret 文件 → macOS Keychain。 |
+| `internal/domain/state/` | 管理 `~/.codex-router`：caller/internal secret、配置、模型可见性与子代理设置。 |
+| `internal/engine/catalog/` | 合并 Codex 原生模型与注册表路由模型，生成 picker 用的 `merged-models.json`。 |
+| `internal/domain/usage/` | 记录 `usage-events.jsonl`，维护配额、限流、供应商用量统计。 |
+| `internal/domain/vision/` | 图片桥：文本模型无法直接读图时，由本地视觉模型先读图并转成文字描述。 |
+| `internal/lib/httpx/` | HTTP 客户端、压缩、超时、SSE / 流式传输基础设施。 |
+| `apps/macos/ModelRouterTray/` | macOS Swift / SwiftUI App：托盘、主窗口、设置页、服务托管、模型管理。契约解码在 `ControlContract.swift`（与 Go `internal/app/controlplane` 对端），服务生命周期在 `ServiceLifecycle.swift`（App 托管路径 + Codex 桌面重启），control 进程执行在 `ControlClient.swift`（RouterControlClient）。 |
 | `skills/` | 项目相关 Codex 技能说明。 |
 | `docs/` | 研究与架构文档。 |
 | `scripts/` | macOS App / 桌面托盘 / 图标等构建脚本。 |
@@ -168,15 +171,15 @@ POST /v1/search/...
 4. **合并 Codex App 工具**：补全客户端精简版 `codex_app` 工具集。
 5. **Namespace 拍平**：把 namespace 工具展开为 `<ns>__<tool>`，响应方向再还原。
 6. **选择协议适配器**：根据 provider 的 `Protocol` 字段选择 `wire.Protocol`。
-7. **发起上游请求**：通过 `internal/httpx` 单次发送，带响应头超时、SSE 空闲看门狗。
+7. **发起上游请求**：通过 `internal/lib/httpx` 单次发送，带响应头超时、SSE 空闲看门狗。
 8. **响应回放**：Chat Completions 响应重组为 Responses 事件流；原生 Responses 响应直通。
 9. **记录 usage**：写入 `usage-events.jsonl`，用于供应商用量、失败率、限流统计。usage 的 `status` 表示回合结果；空补全虽然以 SSE `response.failed` 收尾，但按失败回合记录为 502。
 
-压缩请求复用同一个 `Runner.RunCompaction` 上游编排；v1/v2 的最终响应外形仍由 `internal/server/compaction.go` 负责，因为它们分别需要 JSON 输出和合成 SSE 输出。
+压缩请求复用同一个 `Runner.RunCompaction` 上游编排；v1/v2 的最终响应外形仍由 `internal/app/server/compaction.go` 负责，因为它们分别需要 JSON 输出和合成 SSE 输出。
 
 ## 7. 协议抽象
 
-`internal/wire` 是协议扩展点。每个协议实现 `wire.Protocol`（请求方向：`Name` / `Prepare` / `NeedsResponseTranslation`）并在 `init()` 中注册；`routing.Runner` 只面向接口，不感知具体供应商协议。响应方向按能力拆分：需要把上游响应翻译回 Responses 的协议额外实现 `wire.ResponseTranslator`（流式 + 非流式翻译），直通协议不实现 —— 每个协议只承诺自己做得到的事，没有 panic 占位。请求画像（effort 阶梯、参数清洗）是 `Prepare` 的私有阶段，不出现在接口上。
+`internal/domain/wire` 是协议扩展点。每个协议实现 `wire.Protocol`（请求方向：`Name` / `Prepare` / `NeedsResponseTranslation`）并在 `init()` 中注册；`routing.Runner` 只面向接口，不感知具体供应商协议。响应方向按能力拆分：需要把上游响应翻译回 Responses 的协议额外实现 `wire.ResponseTranslator`（流式 + 非流式翻译），直通协议不实现 —— 每个协议只承诺自己做得到的事，没有 panic 占位。请求画像（effort 阶梯、参数清洗）是 `Prepare` 的私有阶段，不出现在接口上。
 
 当前有两条协议路径：
 
@@ -197,7 +200,7 @@ POST /v1/search/...
 配置源位于：
 
 ```text
-internal/registry/config/<provider>/<model>.json
+internal/domain/registry/config/<provider>/<model>.json
 ```
 
 并通过 `go:embed` 打进二进制。发行形态不需要额外携带配置目录。
@@ -212,7 +215,7 @@ internal/registry/config/<provider>/<model>.json
 
 ## 9. 模型目录与 Picker
 
-`internal/catalog` 负责生成 Codex picker 使用的模型目录：
+`internal/engine/catalog` 负责生成 Codex picker 使用的模型目录：
 
 1. 调用 `codex debug models` 抓取原生模型；
 2. 读取注册表中的路由模型；
@@ -305,21 +308,21 @@ make install-app
 
 | 主题 | 位置 |
 | --- | --- |
-| CLI 分发与 `serve` 入口 | `cmd/codex-router/main.go` |
+| CLI 分发与 `serve` 入口 | `internal/app/cli/cli.go`（进程入口 `cmd/codex-router/main.go`） |
 | App 托管服务生命周期 | `apps/macos/ModelRouterTray/Sources/ModelRouterTrayApp.swift` |
-| HTTP 路由与认证 | `internal/server/server.go` |
-| Responses 分流 | `internal/server/routed.go` |
-| 原生透传与请求头白名单 | `internal/server/native.go` |
-| WebSocket 代理 | `internal/server/wsproxy.go` |
-| 协议抽象 | `internal/wire/wire.go` |
-| Chat Completions 翻译 | `internal/wire/chatcompletion/chatcompletion.go` |
-| Responses 直通 | `internal/wire/responses/responses.go` |
-| 注册表加载与内嵌 | `internal/registry/registry.go` |
-| 用户覆盖层 | `internal/registry/overlay.go` |
-| 凭据解析 | `internal/cred/cred.go` |
-| 状态目录 | `internal/state/state.go` |
-| 模型目录合并 | `internal/catalog/catalog.go` |
-| 图片桥 | `internal/vision/vision.go` |
-| HTTP 单次转发与看门狗 | `internal/httpx/httpx.go` |
-| 用量事件 | `internal/usage/usage.go` |
-| Codex 配置受管块 | `internal/configfile/configfile.go` |
+| HTTP 路由与认证 | `internal/app/server/server.go` |
+| Responses 分流 | `internal/app/server/routed.go` |
+| 原生透传与请求头白名单 | `internal/app/server/native.go` |
+| WebSocket 代理 | `internal/app/server/wsproxy.go` |
+| 协议抽象 | `internal/domain/wire/wire.go` |
+| Chat Completions 翻译 | `internal/domain/wire/chatcompletion/chatcompletion.go` |
+| Responses 直通 | `internal/domain/wire/responses/responses.go` |
+| 注册表加载与内嵌 | `internal/domain/registry/registry.go` |
+| 用户覆盖层 | `internal/domain/registry/overlay.go` |
+| 凭据解析 | `internal/domain/cred/cred.go` |
+| 状态目录 | `internal/domain/state/state.go` |
+| 模型目录合并 | `internal/engine/catalog/catalog.go` |
+| 图片桥 | `internal/domain/vision/vision.go` |
+| HTTP 单次转发与看门狗 | `internal/lib/httpx/httpx.go` |
+| 用量事件 | `internal/domain/usage/usage.go` |
+| Codex 配置受管块 | `internal/app/codexconfig/codexconfig.go` |

@@ -21,3 +21,9 @@ catalog 近 180 天 10 次变更，低于候选 1-3 的热点（21-122 次），
   2. 原生抓取需要第二个 source（如离线 fixture 回放）进入测试；
   3. catalog 相关变更开始跨越 refresh/sync 两个以上调用方反复修改。
 - 在此之前，改动 catalog 一律在 Refresh 内部深化，不引入新目录。
+
+## 注记（2026-08-20）
+
+ADR-0005 把 catalog 整包迁至 `internal/engine/catalog`。这不属于本 ADR
+禁止的"引入新目录"——该措辞的意图是阻止 Build/publisher/source 概念
+拆分；整包搬家零行为变更，Refresh 内部深化的纪律不变。
