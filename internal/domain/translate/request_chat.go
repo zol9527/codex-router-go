@@ -73,6 +73,16 @@ func TranslateToChat(responses map[string]any) (*ChatRequest, error) {
 		chat.HasStream = s
 	}
 
+	// service_tier 值域收紧：Codex Fast mode（/fast，旧名 priority
+	// processing）会把 service_tier 下发为 "priority"，但该档位语义只
+	// 存在于 OpenAI 官方后端——native 直通路径不经此翻译器，不受影响；
+	// chat 上游里 zai 静默忽略，volcengine ark 严格校验、收到即 400
+	// 整轮失败（2026-08-20 实发两次）。auto/default 全平台通收，其余
+	// 值（priority/flex 及未来新档）一律降级为 default。
+	if tier, ok := out["service_tier"].(string); ok && tier != "auto" && tier != "default" {
+		out["service_tier"] = "default"
+	}
+
 	// Codex 专属标记，严格上游会拒绝未知字段。
 	delete(out, "client_metadata")
 	// Responses 专属字段在 chat-completions 上没有对应物。

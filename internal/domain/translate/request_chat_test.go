@@ -109,6 +109,34 @@ func TestTranslateToChatRoundTrip(t *testing.T) {
 	}
 }
 
+// service_tier：Fast mode 下发的 priority/flex 会把严格校验的上游
+// （volcengine ark 只认 auto/default）打成 400，翻译层统一钳到
+// 全平台通收的值域；不带字段时保持不带。
+func TestServiceTierClampedToDefault(t *testing.T) {
+	base := `{"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],"service_tier":%q}`
+	for _, tc := range []struct{ in, want string }{
+		{"priority", "default"},
+		{"flex", "default"},
+		{"auto", "auto"},
+		{"default", "default"},
+	} {
+		chat, err := TranslateToChat(obj(t, fmt.Sprintf(base, tc.in)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if chat.Body["service_tier"] != tc.want {
+			t.Errorf("service_tier %q should clamp to %q, got %v", tc.in, tc.want, chat.Body["service_tier"])
+		}
+	}
+	chat, err := TranslateToChat(obj(t, `{"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := chat.Body["service_tier"]; ok {
+		t.Error("absent service_tier must stay absent")
+	}
+}
+
 // 空 text part 与空消息：上游拒绝空 content part，必须剔除。
 func TestTranslateDropsEmptyParts(t *testing.T) {
 	input := obj(t, `{
