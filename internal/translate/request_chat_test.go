@@ -531,11 +531,29 @@ func TestCustomToolCallRoundTripStream(t *testing.T) {
 	if !strings.Contains(text, `"type":"custom_tool_call"`) {
 		t.Errorf("custom tool call must emit custom_tool_call items:\n%s", text)
 	}
+	if !strings.Contains(text, `"id":"ctc_`) {
+		t.Errorf("custom tool call id must use ctc_ prefix:\n%s", text)
+	}
 	if !strings.Contains(text, "const x = 1;") {
 		t.Errorf("custom_tool_call input must carry the payload text:\n%s", text)
 	}
 	if strings.Contains(text, `"type":"function_call"`) {
 		t.Errorf("custom tool call must not emit function_call items:\n%s", text)
+	}
+}
+
+// 工具名与 arguments 分属不同 delta 时，首次输出 item 仍必须是 ctc_。
+func TestCustomToolCallSplitDeltasUseCTCID(t *testing.T) {
+	translator := NewChatToResponsesSSE("", "deepseek").WithCustomTools([]string{"exec"})
+	translator.Created()
+	translator.Feed(`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_split","function":{"name":"exec"}}]}}]}`)
+	chunk := `{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"input\":\"ls\"}"}}]}}]}`
+	text := string(translator.Feed(chunk))
+	if !strings.Contains(text, `"type":"custom_tool_call"`) {
+		t.Fatalf("split custom call must emit custom_tool_call, got %s", text)
+	}
+	if !strings.Contains(text, `"id":"ctc_`) {
+		t.Fatalf("split custom call id must use ctc_ prefix, got %s", text)
 	}
 }
 
@@ -607,6 +625,9 @@ func TestCustomToolCallNonStream(t *testing.T) {
 	item := output[0].(map[string]any)
 	if item["type"] != "custom_tool_call" {
 		t.Fatalf("non-stream custom call must be custom_tool_call, got %v", item["type"])
+	}
+	if id, _ := item["id"].(string); !strings.HasPrefix(id, "ctc_") {
+		t.Errorf("non-stream custom tool call id = %q, want ctc_ prefix", id)
 	}
 	if item["input"] != "await tools.read('/x')" {
 		t.Errorf("custom_tool_call input wrong: %v", item["input"])

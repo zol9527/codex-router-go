@@ -45,7 +45,7 @@ func TestVisionBridgeEndToEnd(t *testing.T) {
 	srv, ts := newTestServer(t)
 	srv.opt.Registry.Providers["zai-coding"].BaseURL = chatUpstream.URL
 	srv.opt.Registry.Providers["zai-coding"].BaseURLEnv = ""
-	srv.opt.NativeBase = nativeDescribe.URL
+	srv.setNativeBase(nativeDescribe.URL)
 	t.Setenv("ZAI_API_KEY", "")
 	callerKey, _ := srv.opt.State.CallerKey()
 
@@ -187,7 +187,7 @@ func TestVisionSessionCacheSecondTurnHits(t *testing.T) {
 	srv, ts := newTestServer(t)
 	srv.opt.Registry.Providers["zai-coding"].BaseURL = chatUpstream.URL
 	srv.opt.Registry.Providers["zai-coding"].BaseURLEnv = ""
-	srv.opt.NativeBase = nativeDescribe.URL
+	srv.setNativeBase(nativeDescribe.URL)
 	t.Setenv("ZAI_API_KEY", "")
 	callerKey, _ := srv.opt.State.CallerKey()
 

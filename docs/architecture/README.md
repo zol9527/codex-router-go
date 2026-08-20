@@ -24,9 +24,10 @@ flowchart LR
 
     R --> P1["凭据解析<br/>env / config.toml / secret / Keychain"]
     R --> P2["协作输入归一化 / Vision bridge / Spill / Namespace flatten"]
-    R --> P3["wire 协议适配"]
-    P3 --> U1["Chat Completions 供应商"]
-    P3 --> U2["原生 Responses 供应商"]
+    R --> P3["routing.Runner<br/>单回合编排"]
+    P3 --> P4["wire 协议适配"]
+    P4 --> U1["Chat Completions 供应商"]
+    P4 --> U2["原生 Responses 供应商"]
 
     S --> U["状态目录 / usage-events.jsonl / rate limit"]
 ```
@@ -38,7 +39,9 @@ flowchart LR
 | 路径 | 职责 |
 | --- | --- |
 | `cmd/codex-router/` | CLI 入口：`serve`、`install`、`uninstall`、`discover`、`doctor`、`control`、`shim` 等子命令。 |
-| `internal/server/` | HTTP 服务主体：路由、认证、Responses 分流、原生透传、WS 代理、视觉桥、错误翻译、usage 记录。 |
+| `internal/server/` | HTTP transport：路由、认证、Responses 分流、WS 代理、错误翻译、usage 记录，以及把 HTTP 响应绑定到 routing 接缝。 |
+| `internal/routing/` | 一次 routed turn 的完整编排：输入归一化、视觉桥、工具/namespace 适配、wire 调用、流式守卫、错误收尾与 usage 计量。 |
+| `internal/nativebackend/` | 原生 ChatGPT/Codex 后端适配：白名单请求头、会话凭据兜底、响应转发和图片描述。 |
 | `internal/registry/` | 内嵌供应商与模型注册表；加载 `config/` 目录并建立 `slug` / `gatewayModel` 索引。 |
 | `internal/registry/config/` | 各供应商与模型的 JSON 注册表片段，通过 `go:embed` 打进二进制。 |
 | `internal/wire/` | 协议抽象层：把“Codex 说 Responses”与“上游供应商协议”解耦。 |
@@ -156,7 +159,7 @@ POST /v1/search/...
 
 ### 6.5 外部路由管线
 
-命中注册表后，`serveRouted` 按以下顺序处理：
+命中注册表后，`server.handleResponses` 把认证后的请求元数据交给 `routing.Runner.Run`，按以下顺序处理：
 
 1. **解析供应商凭据**：环境变量 → `config.toml` → secret 文件 → macOS Keychain。
 2. **协作输入归一化**：把协作运行时的加密内容转换为外部模型可读形态。
@@ -168,9 +171,11 @@ POST /v1/search/...
 8. **响应回放**：Chat Completions 响应重组为 Responses 事件流；原生 Responses 响应直通。
 9. **记录 usage**：写入 `usage-events.jsonl`，用于供应商用量、失败率、限流统计。usage 的 `status` 表示回合结果；空补全虽然以 SSE `response.failed` 收尾，但按失败回合记录为 502。
 
+压缩请求复用同一个 `Runner.RunCompaction` 上游编排；v1/v2 的最终响应外形仍由 `internal/server/compaction.go` 负责，因为它们分别需要 JSON 输出和合成 SSE 输出。
+
 ## 7. 协议抽象
 
-`internal/wire` 是协议扩展点。每个协议实现 `wire.Protocol` 并在 `init()` 中注册；server 请求管线只面向接口，不感知具体供应商协议。
+`internal/wire` 是协议扩展点。每个协议实现 `wire.Protocol` 并在 `init()` 中注册；`routing.Runner` 只面向接口，不感知具体供应商协议。
 
 当前有两条协议路径：
 

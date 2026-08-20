@@ -73,7 +73,7 @@ func waitFor(t *testing.T, desc string, check func() bool) {
 func TestWebSocketNativePassthroughPipe(t *testing.T) {
 	upstream, received := startWSMockUpstream(t)
 	srv, ts := newTestServer(t)
-	srv.opt.NativeBase = upstream.URL
+	srv.setNativeBase(upstream.URL)
 
 	callerKey, _ := srv.opt.State.CallerKey()
 	header := http.Header{}
@@ -114,7 +114,7 @@ func TestWebSocketNativePassthroughPipe(t *testing.T) {
 func TestWebSocketRoutedHintFallsBack(t *testing.T) {
 	upstream, _ := startWSMockUpstream(t)
 	srv, ts := newTestServer(t)
-	srv.opt.NativeBase = upstream.URL
+	srv.setNativeBase(upstream.URL)
 
 	callerKey, _ := srv.opt.State.CallerKey()
 	header := http.Header{}
@@ -136,7 +136,7 @@ func TestWebSocketRoutedHintFallsBack(t *testing.T) {
 func TestWebSocketUpstreamDownFallsBack(t *testing.T) {
 	srv, ts := newTestServer(t)
 	// 端口 1 基本必拒连，避免依赖外部 DNS。
-	srv.opt.NativeBase = "http://127.0.0.1:1"
+	srv.setNativeBase("http://127.0.0.1:1")
 
 	callerKey, _ := srv.opt.State.CallerKey()
 	header := http.Header{}
@@ -156,7 +156,7 @@ func TestWebSocketUpstreamDownFallsBack(t *testing.T) {
 func TestWebSocketRoutedFrameOnPipeCloses(t *testing.T) {
 	upstream, _ := startWSMockUpstream(t)
 	srv, ts := newTestServer(t)
-	srv.opt.NativeBase = upstream.URL
+	srv.setNativeBase(upstream.URL)
 
 	callerKey, _ := srv.opt.State.CallerKey()
 	header := http.Header{}
@@ -188,7 +188,7 @@ func TestWebSocketRoutedFrameOnPipeCloses(t *testing.T) {
 func TestWebSocketPassthroughDisabled(t *testing.T) {
 	upstream, _ := startWSMockUpstream(t)
 	srv, ts := newTestServer(t)
-	srv.opt.NativeBase = upstream.URL
+	srv.setNativeBase(upstream.URL)
 	srv.opt.DisableWebSocketPassthrough = true
 
 	callerKey, _ := srv.opt.State.CallerKey()
@@ -230,7 +230,7 @@ func startWSSilentUpstream(t *testing.T) *httptest.Server {
 func TestWSSilentWatchdogTearsDownPipe(t *testing.T) {
 	upstream := startWSSilentUpstream(t)
 	srv, ts := newTestServer(t)
-	srv.opt.NativeBase = upstream.URL
+	srv.setNativeBase(upstream.URL)
 	srv.wsSilent = 300 * time.Millisecond
 
 	callerKey, _ := srv.opt.State.CallerKey()
@@ -293,7 +293,7 @@ func startWSPingRecorderUpstream(t *testing.T) (*httptest.Server, *atomic.Int32)
 func TestWSKeepalivePingsIdleUpstream(t *testing.T) {
 	upstream, pings := startWSPingRecorderUpstream(t)
 	srv, ts := newTestServer(t)
-	srv.opt.NativeBase = upstream.URL
+	srv.setNativeBase(upstream.URL)
 	srv.wsKeepalive = 40 * time.Millisecond
 
 	callerKey, _ := srv.opt.State.CallerKey()
@@ -316,7 +316,7 @@ func TestWSKeepalivePingsIdleUpstream(t *testing.T) {
 func TestWSSilentWatchdogSparesIdlePipe(t *testing.T) {
 	upstream, _ := startWSMockUpstream(t)
 	srv, ts := newTestServer(t)
-	srv.opt.NativeBase = upstream.URL
+	srv.setNativeBase(upstream.URL)
 	srv.wsSilent = 300 * time.Millisecond
 
 	callerKey, _ := srv.opt.State.CallerKey()

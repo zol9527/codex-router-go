@@ -297,6 +297,12 @@ func relayFrames(src, dst *websocket.Conn, onModel func(string), onFrame func(da
 			onFrame(data)
 		}
 		if mtype == websocket.TextMessage {
+			// Client → native frames can contain a response.create payload
+			// replaying legacy custom-tool IDs. Normalize only this direction;
+			// upstream events remain byte-for-byte untouched.
+			if onModel != nil {
+				data = normalizeLegacyCustomToolFrame(data)
+			}
 			model := frameModel(data)
 			if isRoutedSlug(model) {
 				// 本管道只服务原生模型；断线后调用方带 hint 重连
@@ -316,6 +322,18 @@ func relayFrames(src, dst *websocket.Conn, onModel func(string), onFrame func(da
 			return err
 		}
 	}
+}
+
+func normalizeLegacyCustomToolFrame(data []byte) []byte {
+	var payload map[string]any
+	if err := json.Unmarshal(data, &payload); err != nil || !normalizeLegacyCustomToolIDs(payload) {
+		return data
+	}
+	normalized, err := json.Marshal(payload)
+	if err != nil {
+		return data
+	}
+	return normalized
 }
 
 // pipeCloseStatus 把收线错误映射成活动状态码：正常关闭/路由帧哨兵

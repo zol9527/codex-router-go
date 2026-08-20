@@ -1,33 +1,17 @@
 package server
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/loyd/codex-router/internal/httpx"
+	"github.com/loyd/codex-router/internal/nativebackend"
 	"github.com/loyd/codex-router/internal/usage"
 )
-
-var base64RawURL = base64.RawURLEncoding
-
-// forwardHeaders 是允许透传到 native 后端的调用方头集合
-// （会话凭据与 Codex 协同元数据）。其余头一概不转发。
-var forwardHeaders = []string{
-	"Authorization", "Chatgpt-Account-Id", "Openai-Beta", "Originator",
-	"Session_Id", "Session-Id", "Thread-Id", "X-Client-Request-Id",
-	"X-Codex-Beta-Features", "X-Codex-Installation-Id",
-	"X-Codex-Parent-Thread-Id", "X-Codex-Turn-Metadata", "X-Codex-Turn-State",
-	"X-Codex-Window-Id", "X-Oai-Attestation", "X-Openai-Subagent",
-	"X-Responsesapi-Include-Timing-Metrics",
-}
 
 // nativeUnsupportedParams 是 ChatGPT 后端拒绝的公共 Responses 参数。
 // 仅对"凭据被替换的调用方"归一（Codex 自己的请求本来就合规）。
@@ -66,6 +50,7 @@ func (s *Server) handleNative(w http.ResponseWriter, r *http.Request, route stri
 		requestedModel = m
 	}
 	setRoute("openai", requestedModel, sessionNameFromHeaders(r.Header))
+	normalizeLegacyCustomToolIDs(payload)
 
 	// 凭据被替换的无会话调用方：归一到 native 端点的窄请求面。
 	if s.callerBroughtNoUpstreamCredential(r) {
@@ -80,33 +65,68 @@ func (s *Server) handleNative(w http.ResponseWriter, r *http.Request, route stri
 		return
 	}
 
-	headers := s.nativeHeaders(r)
-	upstreamBody, encoding := httpx.CompressBody(normalized)
-	if encoding != "" {
-		headers["Content-Encoding"] = encoding
-	}
-
-	target := s.nativeTarget(route)
-	resp, err := httpx.Fetch(r.Context(), http.MethodPost, target, headers, upstreamBody, s.client, s.upstreamIdle)
+	resp, err := s.native.Relay(r.Context(), nativebackend.RelayRequest{
+		Route: route, Body: normalized, Header: r.Header, Compress: true,
+	})
 	if err != nil {
 		logf("native request failed model=%s error=%v", requestedModel, err)
 		writeJSON(w, http.StatusBadGateway, errBody("local_router_error", "The local router could not complete the request."))
 		return
 	}
 	defer resp.Body.Close()
-	s.relayResponse(w, resp)
+	s.relayNative(w, resp)
 	s.recordTurn(usage.Event{
 		Model: requestedModel, Provider: "openai",
-		Status: resp.StatusCode, DurationMs: time.Since(started).Milliseconds(),
+		Status: resp.Status, DurationMs: time.Since(started).Milliseconds(),
 	})
 	logf("model=%s provider=openai status=%d duration_ms=%d",
-		requestedModel, resp.StatusCode, time.Since(started).Milliseconds())
+		requestedModel, resp.Status, time.Since(started).Milliseconds())
 }
 
-// relayResponse 把上游响应头与字节流转发给调用方。
-// content-length/transfer-encoding/connection 由 Go 的 ResponseWriter
-// 自己管理；上游若压缩过则原样透传 content-encoding 与字节。
-func (s *Server) relayResponse(w http.ResponseWriter, resp *http.Response) {
+// normalizeLegacyCustomToolIDs repairs custom-tool items produced by older
+// router versions. Those versions emitted a custom_tool_call with an fc_ item
+// ID, but the Responses contract requires ctc_ for custom calls (and ctco_ for
+// custom-tool outputs). Keeping this at the Responses request boundary lets
+// an existing session recover without discarding its history.
+func normalizeLegacyCustomToolIDs(payload map[string]any) bool {
+	changed := normalizeLegacyCustomToolItems(payload["input"])
+	if response, ok := payload["response"].(map[string]any); ok {
+		changed = normalizeLegacyCustomToolItems(response["input"]) || changed
+	}
+	return changed
+}
+
+func normalizeLegacyCustomToolItems(raw any) bool {
+	items, ok := raw.([]any)
+	if !ok {
+		return false
+	}
+	changed := false
+	for _, raw := range items {
+		item, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		prefix := ""
+		switch item["type"] {
+		case "custom_tool_call":
+			prefix = "ctc_"
+		case "custom_tool_call_output":
+			prefix = "ctco_"
+		default:
+			continue
+		}
+		id, _ := item["id"].(string)
+		if strings.HasPrefix(id, "fc_") {
+			item["id"] = prefix + strings.TrimPrefix(id, "fc_")
+			changed = true
+		}
+	}
+	return changed
+}
+
+// relayNative 把 Native Backend 的受限响应适配回 HTTP transport。
+func (s *Server) relayNative(w http.ResponseWriter, resp *nativebackend.RelayResponse) {
 	skip := map[string]bool{
 		"content-length": true, "transfer-encoding": true,
 		"connection": true, "keep-alive": true,
@@ -119,62 +139,18 @@ func (s *Server) relayResponse(w http.ResponseWriter, resp *http.Response) {
 			w.Header().Add(name, value)
 		}
 	}
-	w.WriteHeader(resp.StatusCode)
-	flusher, _ := w.(http.Flusher)
-	buf := make([]byte, 32*1024)
-	for {
-		n, err := resp.Body.Read(buf)
-		if n > 0 {
-			if _, werr := w.Write(buf[:n]); werr != nil {
-				return
-			}
-			if flusher != nil {
-				flusher.Flush()
-			}
-		}
-		if err != nil {
-			// 响应中途死掉（含空闲看门狗断开）：头已无法重写，只能
-			// 截断 —— 留一行日志供审计，调用方按流提前结束自愈。
-			if !errors.Is(err, io.EOF) {
-				logf("relay truncated status=%d idle=%v err=%v",
-					resp.StatusCode, errors.Is(err, httpx.ErrUpstreamIdle), err)
-			}
-			return
-		}
+	w.WriteHeader(resp.Status)
+	if _, err := io.Copy(w, resp.Body); err != nil {
+		logf("native relay truncated status=%d idle=%v err=%v", resp.Status,
+			errors.Is(err, httpx.ErrUpstreamIdle), err)
 	}
 }
 
 // callerForwardHeaders 提取白名单调用方头，并补齐上游凭据兜底。
 // HTTP native 透传与 WS 管道（wsproxy.go）共用。
+// callerForwardHeaders 保留给 WS transport；header 细节由 Native Backend 负责。
 func (s *Server) callerForwardHeaders(r *http.Request) map[string]string {
-	headers := map[string]string{}
-	for _, name := range forwardHeaders {
-		if value := r.Header.Get(name); value != "" {
-			headers[name] = value
-		}
-	}
-	// 自带上游凭据的调用方原样透传；无凭据（或只带了本路由自己的
-	// caller/internal key）时尝试注入本机 Codex 登录会话 —— 路由密钥
-	// 绝不离开本机。
-	if headers["Authorization"] == "" || s.isRouterLocalToken(headers["Authorization"]) {
-		if fallback := s.nativeSessionHeaders(); len(fallback) > 0 {
-			for k, v := range fallback {
-				headers[k] = v
-			}
-		} else if headers["Authorization"] != "" {
-			delete(headers, "Authorization")
-		}
-	}
-	return headers
-}
-
-// nativeHeaders 从调用方请求里提取白名单头并补充兜底凭据。
-func (s *Server) nativeHeaders(r *http.Request) map[string]string {
-	headers := s.callerForwardHeaders(r)
-	headers["Content-Type"] = "application/json"
-	headers["Accept"] = "text/event-stream"
-	headers["Accept-Encoding"] = "identity"
-	return headers
+	return s.native.Headers(r.Header)
 }
 
 // isRouterLocalToken 判断 bearer token 是否本路由自己的密钥。
@@ -231,113 +207,6 @@ func subtleEqual(a, b string) bool {
 func (s *Server) nativeTarget(route string) string {
 	withoutV1 := strings.TrimPrefix(route, "/v1")
 	return strings.TrimSuffix(s.opt.NativeBase, "/") + withoutV1
-}
-
-// ---- 本机 Codex 登录会话兜底 ----
-
-// codexAuthTokens 是 ChatGPT 登录模式（tokens 段）的凭据。
-type codexAuthTokens struct {
-	AccessToken string `json:"access_token"`
-	AccountID   string `json:"account_id"`
-}
-
-// codexAuthFile 对齐 $CODEX_HOME/auth.json 的两种形态：
-// API key 模式（顶层 OPENAI_API_KEY 字符串）与 ChatGPT 登录模式
-// （tokens.access_token / tokens.account_id；顶层 OPENAI_API_KEY 为 null）。
-// last_refresh 已是 ISO 时间字符串，不参与判定、不强解析。
-type codexAuthFile struct {
-	AccessToken string          `json:"OPENAI_API_KEY"`
-	AccountID   string          `json:"chatgpt_account_id"`
-	Tokens      codexAuthTokens `json:"tokens"`
-}
-
-// normalize 统一两种形态：登录模式优先，API key 模式回落顶层字段。
-func (f *codexAuthFile) normalize() {
-	if f.AccessToken == "" {
-		f.AccessToken = f.Tokens.AccessToken
-	}
-	if f.AccountID == "" {
-		f.AccountID = f.Tokens.AccountID
-	}
-}
-
-var (
-	nativeSessionMu   sync.Mutex
-	nativeSessionAt   time.Time
-	nativeSessionData *codexAuthFile
-)
-
-// nativeSessionHeaders 读取 $CODEX_HOME/auth.json 的 access token 与
-// account id，提前 2 分钟过期（与 codex-native-session.mjs 一致）。
-// 读取失败返回 nil —— 没有 native 会话时 native 引擎/注入不可用。
-func (s *Server) nativeSessionHeaders() map[string]string {
-	nativeSessionMu.Lock()
-	defer nativeSessionMu.Unlock()
-	if nativeSessionData == nil || time.Since(nativeSessionAt) > 30*time.Second {
-		if data, err := readCodexAuth(); err == nil {
-			nativeSessionData = data
-		} else {
-			nativeSessionData = nil
-		}
-		nativeSessionAt = time.Now()
-	}
-	data := nativeSessionData
-	if data == nil || data.AccessToken == "" {
-		return nil
-	}
-	if !codexTokenUsable(data) {
-		return nil
-	}
-	headers := map[string]string{"Authorization": "Bearer " + data.AccessToken}
-	if data.AccountID != "" {
-		headers["Chatgpt-Account-Id"] = data.AccountID
-	}
-	return headers
-}
-
-// codexTokenUsable 解析 JWT exp 声明并提前两分钟判定过期。
-// 无效载荷按不可用处理（fail closed）。
-func codexTokenUsable(data *codexAuthFile) bool {
-	parts := strings.Split(data.AccessToken, ".")
-	if len(parts) != 3 {
-		return false
-	}
-	claims, err := base64DecodeURL(parts[1])
-	if err != nil {
-		return false
-	}
-	var payload struct {
-		Exp float64 `json:"exp"`
-	}
-	if err := json.Unmarshal(claims, &payload); err != nil {
-		return false
-	}
-	return time.Now().Add(2*time.Minute).Unix() < int64(payload.Exp)
-}
-
-func base64DecodeURL(value string) ([]byte, error) {
-	return base64RawURL.DecodeString(value)
-}
-
-func readCodexAuth() (*codexAuthFile, error) {
-	home := os.Getenv("CODEX_HOME")
-	if home == "" {
-		userHome, err := os.UserHomeDir()
-		if err != nil {
-			return nil, err
-		}
-		home = filepath.Join(userHome, ".codex")
-	}
-	raw, err := os.ReadFile(filepath.Join(home, "auth.json"))
-	if err != nil {
-		return nil, err
-	}
-	var data codexAuthFile
-	if err := json.Unmarshal(raw, &data); err != nil {
-		return nil, err
-	}
-	data.normalize()
-	return &data, nil
 }
 
 // wStatus 从 ResponseWriter 猜测已提交的状态（activity 收尾用）。

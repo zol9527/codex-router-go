@@ -175,7 +175,7 @@ func TestSlowWatchdogSilentForIdlePipe(t *testing.T) {
 func TestWSPipeActivityFollowsTurnEndToEnd(t *testing.T) {
 	upstream, _ := startWSMockUpstream(t)
 	srv, ts := newTestServer(t)
-	srv.opt.NativeBase = upstream.URL
+	srv.setNativeBase(upstream.URL)
 
 	callerKey, _ := srv.opt.State.CallerKey()
 	header := http.Header{}

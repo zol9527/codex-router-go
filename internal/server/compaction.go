@@ -3,20 +3,16 @@ package server
 import (
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"time"
 
-	"github.com/loyd/codex-router/internal/httpx"
 	"github.com/loyd/codex-router/internal/registry"
+	"github.com/loyd/codex-router/internal/routing"
 	"github.com/loyd/codex-router/internal/translate"
 	"github.com/loyd/codex-router/internal/usage"
-	"github.com/loyd/codex-router/internal/wire"
-	_ "github.com/loyd/codex-router/internal/wire/chatcompletion"
-	_ "github.com/loyd/codex-router/internal/wire/responses"
 )
 
 // routed compaction，移植自 router.mjs 的 compaction 族函数。
@@ -26,10 +22,6 @@ import (
 //     + 摘要消息]}，Codex 拿去续会话；
 //   - v2（input 尾部 compaction_trigger）：返回 kcr1: base64 摘要的
 //     compaction item（JSON 或合成 SSE，按请求的 stream 字段）。
-
-const compactPrompt = `You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another language model that will resume the task.
-
-Include current progress, key decisions, constraints, user preferences, remaining steps, and critical data or references. Be concise, structured, and focused on seamless continuation.`
 
 const summaryPrefixText = "Another language model started this task and produced a continuation summary. Use it to continue without repeating completed work:"
 
@@ -54,140 +46,32 @@ func encodeSummaryText(summary string) string {
 // handleRoutedCompaction 执行压缩并写出结果。
 func (s *Server) handleRoutedCompaction(w http.ResponseWriter, r *http.Request,
 	payload map[string]any, model *registry.Model, provider *registry.Provider,
-	credential string, v2 bool, route string, started time.Time) {
+	credential string, v2 bool, started time.Time) {
 
+	runner := *s.routeRunner
+	runner.Recorder = s.opt.Usage
+	runner.RateLimits = s.opt.RateLimits
+	runner.Client = s.client
+	runner.Idle = s.upstreamIdle
+	result, ok := runner.RunCompaction(routing.Request{
+		Context: r.Context(), Payload: payload, Model: model, Provider: provider,
+		Credential: credential, Sink: responseSink{w: w}, Header: r.Header,
+		Started: started,
+	})
+	if !ok {
+		return
+	}
 	providerID := s.registry().CanonicalProviderID(provider.ID)
-
-	// 请求构造：整段对话 + 压缩指令，非流式、无工具。
-	// 压缩重放协作条目，agent 载荷解析与普通回合相同。
-	compactionPayload := map[string]any{}
-	for k, v := range payload {
-		compactionPayload[k] = v
-	}
-	if input, ok := compactionPayload["input"].([]any); ok {
-		compactionPayload["input"] = s.normalizeRoutedAgentInput(r.Context(), input)
-	}
-	// 压缩重放整段对话，任何残留图片同样要在到达文本模型前被读掉
-	//（会重新读取，是否重试由 Codex 决定）。
-	s.bridgeVision(w, r, compactionPayload, model)
-	if input, ok := compactionPayload["input"].([]any); ok {
-		// v1 压缩保留链式结构、v2 过滤触发标记后重放。
-		filtered := make([]any, 0, len(input))
-		for _, raw := range input {
-			if item, ok := raw.(map[string]any); ok && item["type"] == "compaction_trigger" {
-				continue
-			}
-			filtered = append(filtered, raw)
-		}
-		compactionPayload["input"] = append(filtered, userMessageItem(compactPrompt))
-	} else {
-		compactionPayload["input"] = []any{userMessageItem(compactPrompt)}
-	}
-	compactionPayload["model"] = model.UpstreamModel
-	compactionPayload["stream"] = false
-	// 空工具列表已禁用工具调用；tool_choice:"none" 与之配套反被
-	// 部分上游拒绝，故整个字段省略。
-	compactionPayload["tools"] = []any{}
-	delete(compactionPayload, "previous_response_id")
-	delete(compactionPayload, "client_metadata")
-
-	// 压缩同样经协议抽象层：provider 声明的协议决定上游形态
-	//（chat 翻译或 Responses 直通；流强制非流式）。
-	proto, err := wire.ForProvider(provider)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, errBody("protocol_unavailable", err.Error()))
-		return
-	}
-	prepared, err := proto.Prepare(compactionPayload, model)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", err.Error()))
-		return
-	}
-	logTranslationDegradation(prepared, model)
-	prepared.Stream = false
-	prepared.Accept = "application/json"
-	normalized, err := json.Marshal(prepared.Body)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, errBody("invalid_request_error", "Unable to encode request."))
-		return
-	}
-
-	headers := translate.UpstreamHeadersFrom(headerMap(r.Header), credential, Version)
-	headers["Content-Type"] = "application/json"
-	headers["Accept"] = prepared.Accept
-	target := strings.TrimSuffix(s.providerBaseURL(provider), "/") + prepared.Path
-
-	resp, err := httpx.Fetch(r.Context(), http.MethodPost, target, headers, normalized, s.client, s.upstreamIdle)
-	if err != nil {
-		logf("model=%s provider=%s status=502 duration_ms=%d compact err=%v",
-			model.Slug, provider.ID, time.Since(started).Milliseconds(), err)
-		writeJSON(w, http.StatusBadGateway, errBody("provider_api_proxy_error",
-			"The API-provider forwarder could not complete the request."))
-		s.recordTurn(usage.Event{Model: model.Slug, Provider: providerID, Status: 502,
-			DurationMs: time.Since(started).Milliseconds()})
-		return
-	}
-	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
-	if err != nil {
-		idle := errors.Is(err, httpx.ErrUpstreamIdle)
-		status := http.StatusBadGateway
-		errType, message := "provider_api_proxy_error", "The compaction response could not be read."
-		if idle {
-			status = http.StatusGatewayTimeout
-			errType, message = "upstream_idle_timeout",
-				"The upstream produced no data within the idle window while the compaction response was being read."
-		}
-		logf("model=%s provider=%s status=%d duration_ms=%d compact upstream_idle=%v err=%v",
-			model.Slug, provider.ID, status, time.Since(started).Milliseconds(), idle, err)
-		writeJSON(w, status, errBody(errType, message))
-		s.recordTurn(usage.Event{Model: model.Slug, Provider: providerID, Status: status,
-			DurationMs: time.Since(started).Milliseconds(), UpstreamIdle: idle})
-		return
-	}
-	if len(raw) >= 32<<20 {
-		writeJSON(w, http.StatusBadGateway, errBody("provider_api_proxy_error", "Compact response is too large."))
-		return
-	}
-	var chatBody map[string]any
-	if err := json.Unmarshal(raw, &chatBody); err != nil {
-		writeJSON(w, http.StatusBadGateway, errBody("provider_api_proxy_error",
-			"The upstream compaction response was not valid JSON."))
-		return
-	}
-	if resp.StatusCode >= 400 {
-		retryAfter := 0
-		if ra := resp.Header.Get("Retry-After"); ra != "" {
-			fmt.Sscanf(ra, "%d", &retryAfter)
-		}
-		s.writeUpstreamError(w, provider, model, &upstreamFailure{
-			status: resp.StatusCode, bodyText: string(raw), retryAfter: retryAfter,
-		}, started)
-		s.recordTurn(usage.Event{Model: model.Slug, Provider: providerID, Status: resp.StatusCode,
-			DurationMs: time.Since(started).Milliseconds()})
-		return
-	}
-
-	// 统一翻译回 Responses 形态再提取（协议无关）。
-	responseJSON := proto.TranslateNonStream(chatBody, model, wire.StreamOptions{})
-	summary := extractResponsesSummaryText(responseJSON)
-	usageTokens := chatUsageTokens(chatBody)
-
 	if !v2 {
-		// v1：尾预算内的 user 消息 + 摘要。
-		output := compactOutput(payload["input"], summary)
-		writeJSON(w, http.StatusOK, map[string]any{"output": output})
+		writeJSON(w, http.StatusOK, map[string]any{"output": compactOutput(payload["input"], result.Summary)})
 		s.recordTurn(usage.Event{Model: model.Slug, Provider: providerID, Status: 200,
 			DurationMs:  time.Since(started).Milliseconds(),
-			InputTokens: usageTokens.prompt, OutputTokens: usageTokens.completion})
+			InputTokens: result.PromptTokens, OutputTokens: result.CompletionTokens})
 		return
 	}
-
-	// v2：kcr1: base64 摘要的 compaction item。
 	item := map[string]any{
-		"type":              "compaction",
-		"id":                "cmp_" + randomHexID(),
-		"encrypted_content": encodeSummaryText(summary),
+		"type": "compaction", "id": "cmp_" + randomHexID(),
+		"encrypted_content": encodeSummaryText(result.Summary),
 	}
 	if stream, _ := payload["stream"].(bool); !stream {
 		writeJSON(w, http.StatusOK, compactionSnapshot(payload["model"], item, "completed"))
@@ -196,7 +80,7 @@ func (s *Server) handleRoutedCompaction(w http.ResponseWriter, r *http.Request,
 	}
 	s.recordTurn(usage.Event{Model: model.Slug, Provider: providerID, Status: 200,
 		DurationMs:  time.Since(started).Milliseconds(),
-		InputTokens: usageTokens.prompt, OutputTokens: usageTokens.completion})
+		InputTokens: result.PromptTokens, OutputTokens: result.CompletionTokens})
 }
 
 // userMessageItem 构造一个 user 文本消息 item。
@@ -280,70 +164,6 @@ func compactOutput(input any, summary string) []any {
 	}
 	output = append(output, userMessageItem(summaryText))
 	return output
-}
-
-// extractChatResponseText 从非流式 chat 响应提取 assistant 文本。
-func extractChatResponseText(body map[string]any) string {
-	choices, _ := body["choices"].([]any)
-	for _, raw := range choices {
-		choice, ok := raw.(map[string]any)
-		if !ok {
-			continue
-		}
-		message, ok := choice["message"].(map[string]any)
-		if !ok {
-			continue
-		}
-		if text, ok := message["content"].(string); ok {
-			return text
-		}
-		if parts, ok := message["content"].([]any); ok {
-			var buf strings.Builder
-			for _, partRaw := range parts {
-				if part, ok := partRaw.(map[string]any); ok {
-					if text, ok := part["text"].(string); ok {
-						buf.WriteString(text)
-					}
-				}
-			}
-			return buf.String()
-		}
-	}
-	return ""
-}
-
-// extractResponsesSummaryText 从 Responses 形态 JSON 提取 assistant 文本。
-func extractResponsesSummaryText(response map[string]any) string {
-	output, _ := response["output"].([]any)
-	for _, raw := range output {
-		item, ok := raw.(map[string]any)
-		if !ok || item["type"] != "message" {
-			continue
-		}
-		content, _ := item["content"].([]any)
-		for _, partRaw := range content {
-			if part, ok := partRaw.(map[string]any); ok {
-				if text, ok := part["text"].(string); ok && text != "" {
-					return text
-				}
-			}
-		}
-	}
-	return ""
-}
-
-type chatUsage struct{ prompt, completion int64 }
-
-func chatUsageTokens(body map[string]any) chatUsage {
-	usageField, _ := body["usage"].(map[string]any)
-	out := chatUsage{}
-	if v, ok := usageField["prompt_tokens"].(float64); ok {
-		out.prompt = int64(v)
-	}
-	if v, ok := usageField["completion_tokens"].(float64); ok {
-		out.completion = int64(v)
-	}
-	return out
 }
 
 // compactionSnapshot 构造 v2 非流式响应壳。

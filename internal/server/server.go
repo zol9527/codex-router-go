@@ -3,6 +3,7 @@
 package server
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"log"
@@ -14,10 +15,13 @@ import (
 	"time"
 
 	"github.com/loyd/codex-router/internal/cred"
+	"github.com/loyd/codex-router/internal/nativebackend"
 	"github.com/loyd/codex-router/internal/registry"
+	"github.com/loyd/codex-router/internal/routing"
 	"github.com/loyd/codex-router/internal/state"
 	"github.com/loyd/codex-router/internal/usage"
 	"github.com/loyd/codex-router/internal/vision"
+	"github.com/loyd/codex-router/internal/wire"
 )
 
 // CallerPathPrefix 与 Node 版一致：caller key 以 URL 路径形式出现。
@@ -82,6 +86,10 @@ type Server struct {
 	// 换指针 —— 请求路径只读，RWMutex 足够。
 	regMu sync.RWMutex
 	reg   *registry.Registry
+	// native 是 Native Backend adapter；server 只表达 HTTP transport 语义。
+	native nativebackend.Client
+	// routeRunner 承载一次完整 Routing Turn；HTTP handler 只做 transport。
+	routeRunner *routing.Runner
 
 	// visionCache 是会话级读图缓存：Codex 每轮重发完整历史，同一
 	// (session, ImageKey) 只在首次调读图引擎（详见 vision 包注释）。
@@ -123,6 +131,15 @@ func (s *Server) SetRegistry(next *registry.Registry) {
 	s.regMu.Lock()
 	s.reg = next
 	s.regMu.Unlock()
+}
+
+// setNativeBase 同步测试注入的 Native Backend 地址；生产路径 base 在
+// New 时固定，不通过该入口变更。
+func (s *Server) setNativeBase(base string) {
+	s.opt.NativeBase = base
+	if backend, ok := s.native.(*nativebackend.Backend); ok {
+		s.native = nativebackend.New(base, s.client, s.upstreamIdle, backend.IsLocalToken)
+	}
 }
 
 // 上游 fail-fast 默认档（对齐 AI SDK 语义：把无限挂起变成可重试的
@@ -177,44 +194,75 @@ func New(opt Options) (*Server, error) {
 	wsSilent := resolveTimeout(opt.WSSilentTimeout, DefaultWSSilentTimeout)
 	wsKeepalive := resolveTimeout(opt.WSKeepaliveInterval, DefaultWSKeepaliveInterval)
 	slowLog := resolveTimeout(opt.SlowRequestLogDelay, DefaultSlowRequestLogDelay)
-	return &Server{
+	client := &http.Client{
+		// 上游思考型模型可能长时间不吐首字节 —— 但"永远不吐"必须
+		// fail-fast：响应头窗口由 ResponseHeaderTimeout 把关（计时
+		// 从请求写完到首字节响应头，不含 body 流式时长），body 挂死
+		// 由 httpx.Fetch 的空闲看门狗把关。取消仍由请求上下文管理，
+		// 这里依旧不设全局超时。
+		Transport: &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			DialContext: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			// TLS 握手窗口：经 Surge/Clash 类 TUN 代理时 TCP 在
+			// fake-IP 层秒连（拨号超时不触发），代理节点抖动会把
+			// TLS 握手黑洞成"连接 ESTABLISHED 但永不完成"——此处
+			// 不设超时则请求永久挂死且零日志（2026-08-16 commit
+			// 生成全挂事故：6 个僵尸请求只靠 /health 才数得出来）。
+			// 档位与拨号 30s 同类，固定值、不开 env。
+			TLSHandshakeTimeout:   15 * time.Second,
+			MaxIdleConns:          16,
+			MaxIdleConnsPerHost:   8,
+			IdleConnTimeout:       90 * time.Second,
+			ForceAttemptHTTP2:     true,
+			ResponseHeaderTimeout: headerTimeout,
+		},
+	}
+	internalKey := opt.State.InternalKey()
+	native := nativebackend.New(opt.NativeBase, client, idleTimeout, func(header string) bool {
+		token := nativebackend.BearerToken(header)
+		if token == "" {
+			return false
+		}
+		return subtleEqual(token, callerKey) || (internalKey != "" && subtleEqual(token, internalKey))
+	})
+	server := &Server{
 		opt:                opt,
 		callerKey:          callerKey,
 		reg:                opt.Registry,
+		native:             native,
 		upstreamIdle:       idleTimeout,
 		wsSilent:           wsSilent,
 		wsKeepalive:        wsKeepalive,
 		wsKeepaliveIdleCap: DefaultWSKeepaliveIdleCap,
 		slowRequestLog:     slowLog,
 		visionCache:        vision.NewSessionCache(vision.SessionCacheCapacity),
-		client: &http.Client{
-			// 上游思考型模型可能长时间不吐首字节 —— 但"永远不吐"必须
-			// fail-fast：响应头窗口由 ResponseHeaderTimeout 把关（计时
-			// 从请求写完到首字节响应头，不含 body 流式时长），body 挂死
-			// 由 httpx.Fetch 的空闲看门狗把关。取消仍由请求上下文管理，
-			// 这里依旧不设全局超时。
-			Transport: &http.Transport{
-				Proxy: http.ProxyFromEnvironment,
-				DialContext: (&net.Dialer{
-					Timeout:   30 * time.Second,
-					KeepAlive: 30 * time.Second,
-				}).DialContext,
-				// TLS 握手窗口：经 Surge/Clash 类 TUN 代理时 TCP 在
-				// fake-IP 层秒连（拨号超时不触发），代理节点抖动会把
-				// TLS 握手黑洞成"连接 ESTABLISHED 但永不完成"——此处
-				// 不设超时则请求永久挂死且零日志（2026-08-16 commit
-				// 生成全挂事故：6 个僵尸请求只靠 /health 才数得出来）。
-				// 档位与拨号 30s 同类，固定值、不开 env。
-				TLSHandshakeTimeout:   15 * time.Second,
-				MaxIdleConns:          16,
-				MaxIdleConnsPerHost:   8,
-				IdleConnTimeout:       90 * time.Second,
-				ForceAttemptHTTP2:     true,
-				ResponseHeaderTimeout: headerTimeout,
-			},
+		client:             client,
+		active:             map[int]*activityEntry{},
+	}
+	server.routeRunner = &routing.Runner{
+		Registry:       server.registry,
+		Native:         server.native,
+		Client:         server.client,
+		Idle:           server.upstreamIdle,
+		Version:        Version,
+		Recorder:       server.opt.Usage,
+		RateLimits:     server.opt.RateLimits,
+		StateDir:       server.opt.State.Dir,
+		NormalizeInput: server.normalizeRoutedAgentInput,
+		BridgeVision: func(ctx context.Context, header http.Header, payload map[string]any, model *registry.Model) {
+			server.bridgeVision(ctx, header, payload, model)
 		},
-		active: map[int]*activityEntry{},
-	}, nil
+		ProviderBaseURL:        server.providerBaseURL,
+		TranslateProviderError: translateProviderError,
+		LogTranslationDegraded: func(prepared *wire.Request, model *registry.Model) {
+			logTranslationDegradation(prepared, model)
+		},
+		Logf: logf,
+	}
+	return server, nil
 }
 
 // Handler 返回根路由处理器。

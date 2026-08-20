@@ -111,6 +111,9 @@ func TestSSETranslationGoldenSequence(t *testing.T) {
 	if fn["name"] != "shell" || fn["arguments"] != `{"cmd":"ls"}` || fn["call_id"] != "call_9" {
 		t.Errorf("function_call item wrong: %+v", fn)
 	}
+	if id, _ := fn["id"].(string); !strings.HasPrefix(id, "fc_") {
+		t.Errorf("function_call id = %q, want fc_ prefix", id)
+	}
 	usage := response["usage"].(map[string]any)
 	if usage["input_tokens"] != float64(10) || usage["output_tokens"] != float64(5) {
 		t.Errorf("usage mapping wrong: %+v", usage)

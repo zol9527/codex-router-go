@@ -94,7 +94,7 @@ func TestAgentRelayEndToEnd(t *testing.T) {
 	srv, ts := newTestServer(t)
 	srv.opt.Registry.Providers["zai-coding"].BaseURL = chatUpstream.URL
 	srv.opt.Registry.Providers["zai-coding"].BaseURLEnv = ""
-	srv.opt.NativeBase = native.URL
+	srv.setNativeBase(native.URL)
 	t.Setenv("ZAI_API_KEY", "")
 	t.Setenv("MODEL_ROUTER_AGENT_RELAY_MODEL", "gpt-5.6-sol")
 	callerKey, _ := srv.opt.State.CallerKey()

@@ -14,12 +14,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"github.com/loyd/codex-router/internal/nativebackend"
 )
 
 const agentPayloadRelayTool = "relay_external_agent_payload"
@@ -181,33 +181,17 @@ func (s *Server) relayAgentPayload(ctx context.Context, item map[string]any, enc
 		}},
 		"tool_choice": map[string]any{"type": "function", "name": agentPayloadRelayTool},
 	}
-	raw, err := json.Marshal(body)
+	response, err := s.native.PostResponses(ctx, nativebackend.Request{
+		Body: body, MaxBytes: 4 << 20, IdleWatchdog: true,
+	})
 	if err != nil {
 		return "", err
 	}
-	headers := s.nativeHeaders(&http.Request{Header: http.Header{}})
-	headers["Accept"] = "text/event-stream"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.nativeTarget("/responses"),
-		strings.NewReader(string(raw)))
-	if err != nil {
-		return "", err
-	}
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
-	resp, err := s.client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	payload, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-	if err != nil {
-		return "", err
-	}
-	if resp.StatusCode != http.StatusOK {
+	if response.Status != 200 {
 		// 不记录响应体：协作载荷是密文，错误体同样可能携带它。
-		return "", fmt.Errorf("native collaboration payload relay failed with HTTP %d", resp.StatusCode)
+		return "", fmt.Errorf("native collaboration payload relay failed with HTTP %d", response.Status)
 	}
+	payload := response.Body
 	if len(payload) > 4<<20 {
 		return "", fmt.Errorf("native collaboration payload relay response is too large")
 	}

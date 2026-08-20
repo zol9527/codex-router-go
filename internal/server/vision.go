@@ -8,12 +8,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"path/filepath"
 	"strings"
 	"sync"
 
+	"github.com/loyd/codex-router/internal/nativebackend"
 	"github.com/loyd/codex-router/internal/registry"
 	"github.com/loyd/codex-router/internal/vision"
 )
@@ -24,7 +24,7 @@ const visionConcurrency = 3
 
 // bridgeVision 对携带图片的 routed 回合执行读图与替换。
 // 无图 / 桥关闭 / 无引擎可解析时零成本直通。
-func (s *Server) bridgeVision(w http.ResponseWriter, r *http.Request,
+func (s *Server) bridgeVision(ctx context.Context, header http.Header,
 	payload map[string]any, routeModel *registry.Model) {
 
 	input, ok := payload["input"].([]any)
@@ -35,11 +35,11 @@ func (s *Server) bridgeVision(w http.ResponseWriter, r *http.Request,
 	if !settings.EffectiveEnabled(configured) {
 		return
 	}
-	engines := vision.ResolveEngines(s.visionCandidates(r), settings, configured)
+	engines := vision.ResolveEngines(s.visionCandidates(header), settings, configured)
 	if len(engines) == 0 {
 		return
 	}
-	reader := vision.NewReader(s.describeCaller(routeModel, r))
+	reader := vision.NewReader(s.describeCaller(routeModel, header))
 	if reasoning, ok := payload["reasoning"].(map[string]any); ok {
 		if effort, ok := reasoning["effort"].(string); ok {
 			reader.Effort = effort
@@ -53,7 +53,7 @@ func (s *Server) bridgeVision(w http.ResponseWriter, r *http.Request,
 	images := vision.CollectImages(input)
 	// 会话名是缓存的第一维键；无 X-Codex-Turn-Metadata 的客户端
 	// 由缓存自身判空跳过（不查不写，行为与无缓存时一致）。
-	session := sessionNameFromHeaders(r.Header)
+	session := sessionNameFromHeaders(header)
 	evidence := map[string]vision.Evidence{}
 	failures := map[string]string{}
 	sem := make(chan struct{}, visionConcurrency)
@@ -74,7 +74,7 @@ func (s *Server) bridgeVision(w http.ResponseWriter, r *http.Request,
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			result, err := reader.Read(r.Context(), engines, image)
+			result, err := reader.Read(ctx, engines, image)
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {
@@ -96,8 +96,8 @@ func (s *Server) bridgeVision(w http.ResponseWriter, r *http.Request,
 // 视觉原生模型（merged 目录里 listed 的）—— native 授权的唯一证据
 // 是请求手里的活会话，磁盘上的捕获可能已过期（登出后仍能读到文件）。
 // 读图走 native 单路：不消耗付费 provider 配额，也不做同步凭据探测。
-func (s *Server) visionCandidates(r *http.Request) []vision.Engine {
-	if !s.hasUpstreamAuthorization(r) {
+func (s *Server) visionCandidates(header http.Header) []vision.Engine {
+	if !s.hasUpstreamAuthorization(header) {
 		return nil
 	}
 	registrySlugs := map[string]bool{}
@@ -108,81 +108,32 @@ func (s *Server) visionCandidates(r *http.Request) []vision.Engine {
 		filepath.Join(s.opt.State.Dir, "merged-models.json"), registrySlugs)
 }
 
-func (s *Server) hasUpstreamAuthorization(r *http.Request) bool {
-	header := strings.TrimSpace(r.Header.Get("Authorization"))
-	if header == "" {
+func (s *Server) hasUpstreamAuthorization(header http.Header) bool {
+	authorization := strings.TrimSpace(header.Get("Authorization"))
+	if authorization == "" {
 		return false
 	}
-	return !s.isRouterLocalToken(header)
+	return !s.isRouterLocalToken(authorization)
 }
 
 // describeCaller 装配读图调用：native 单路。native 路径经闭包捕获
 // 原始请求（它贡献会话头，而 DescribeCaller 的抽象签名不携带请求）。
-func (s *Server) describeCaller(routeModel *registry.Model, r *http.Request) vision.DescribeCaller {
+func (s *Server) describeCaller(routeModel *registry.Model, header http.Header) vision.DescribeCaller {
 	_ = routeModel
 	return func(ctx context.Context, engine vision.Engine, effort, question, dataURL string) (string, error) {
-		return s.describeNative(ctx, engine, effort, question, dataURL, r)
+		return s.describeNative(ctx, engine, effort, question, dataURL, header)
 	}
 }
 
 // describeNative：调用方的活会话 + ChatGPT 后端 /responses 读图。
 // 不落任何新凭据；FORWARD_HEADERS 里只有会话头会跟随。
-func (s *Server) describeNative(ctx context.Context, engine vision.Engine, effort, question, dataURL string, sourceRequest *http.Request) (string, error) {
-	instructions := vision.EvidenceInstructions
-	if question != "" {
-		instructions += vision.FocusInstructions(question)
-	}
-	// 档位优先级：操作者/会话传入的 effort > 引擎默认 > 声明阶梯末档。
-	if effort == "" {
-		effort = engine.DefaultEffort
-	}
-	if effort == "" && len(engine.Efforts) > 0 {
-		effort = engine.Efforts[len(engine.Efforts)-1]
-	}
-	requestBody := map[string]any{
-		"model":        engine.GatewayModel,
-		"instructions": instructions,
-		"input": []any{map[string]any{
-			"type": "message", "role": "user",
-			"content": []any{
-				map[string]any{"type": "input_text", "text": "Transcribe this image as evidence for a model that cannot see it."},
-				map[string]any{"type": "input_image", "image_url": dataURL},
-			},
-		}},
-		// 后端强制流式：非流式 400 {"detail":"Stream must be set to true"}
-		// （2026-08-16 错误体实锤）。协作载荷中继同款 stream:true 已在生产验证。
-		"stream": true,
-		"store":  false,
-	}
-	if effort != "" {
-		requestBody["reasoning"] = map[string]any{"effort": effort}
-	}
-	headers := s.nativeHeaders(sourceRequest)
-	headers["Accept"] = "text/event-stream"
-	raw, err := json.Marshal(requestBody)
-	if err != nil {
-		return "", err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.nativeTarget("/responses"), strings.NewReader(string(raw)))
-	if err != nil {
-		return "", err
-	}
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
-	resp, err := s.client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	payload, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
-	if err != nil {
-		return "", err
-	}
-	if resp.StatusCode != http.StatusOK {
-		return "", vision.StatusErrorWithBody(resp.StatusCode, payload)
-	}
-	return parseNativeTranscriptStream(payload)
+func (s *Server) describeNative(ctx context.Context, engine vision.Engine, effort, question, dataURL string, header http.Header) (string, error) {
+	// 档位选择、请求构造与 SSE 解析都归 Native Backend；server 只传入
+	// 调用方会话头，避免 vision 继续感知 endpoint/auth 细节。
+	return s.native.Describe(ctx, nativebackend.DescribeRequest{
+		Engine: engine, Effort: effort, Question: question, DataURL: dataURL,
+		Header: header, MaxBytes: 8 << 20,
+	})
 }
 
 // parseNativeTranscriptStream 从 native /responses 的 SSE 流提取文本：

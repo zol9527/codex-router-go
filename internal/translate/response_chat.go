@@ -171,7 +171,7 @@ func TranslateNonStreamChatWith(body map[string]any, t *ChatToResponsesSSE) map[
 }
 
 type itemState struct {
-	kind        string // "reasoning" | "message" | "function_call"
+	kind        string // "reasoning" | "message" | "function_call" | "custom_tool_call"
 	itemID      string
 	callID      string
 	name        string
@@ -342,23 +342,28 @@ func (t *ChatToResponsesSSE) feedDelta(delta map[string]any) []string {
 			if v, ok := call["index"].(float64); ok {
 				chatIndex = int(v)
 			}
+			fn, _ := call["function"].(map[string]any)
+			name, _ := fn["name"].(string)
 			state := t.functionCall[chatIndex]
 			if state == nil {
-				state = t.newItem("function_call")
+				kind := "function_call"
+				if t.customTools[name] {
+					kind = "custom_tool_call"
+				}
+				state = t.newItem(kind)
 				t.functionCall[chatIndex] = state
 			}
 			if id, ok := call["id"].(string); ok && id != "" && state.callID == "" {
 				state.callID = id
 			}
-			fn, _ := call["function"].(map[string]any)
 			if fn == nil {
 				continue
 			}
-			if name, ok := fn["name"].(string); ok && name != "" && state.name == "" {
+			if name != "" && state.name == "" {
 				state.name = name
 				// custom 工具的调用按其真实形态回传（custom_tool_call）。
 				if t.customTools[name] {
-					state.custom = true
+					t.promoteCustomToolCall(state)
 				}
 			}
 			if args, ok := fn["arguments"].(string); ok && args != "" {
@@ -390,16 +395,27 @@ func (t *ChatToResponsesSSE) feedDelta(delta map[string]any) []string {
 // 预设的占位值会挡住它 —— 真实 id 优先，缺失才在 item 构造时派生。
 func (t *ChatToResponsesSSE) newItem(kind string) *itemState {
 	prefix := map[string]string{
-		"reasoning": "rs_", "message": "msg_", "function_call": "fc_",
+		"reasoning": "rs_", "message": "msg_", "function_call": "fc_", "custom_tool_call": "ctc_",
 	}[kind]
 	state := &itemState{
 		kind:        kind,
 		itemID:      prefix + randomID(),
 		outputIndex: t.nextIndex,
-		added:       kind != "function_call",
+		added:       kind != "function_call" && kind != "custom_tool_call",
 	}
 	t.nextIndex++
 	return state
+}
+
+// promoteCustomToolCall 把尚未发送 added 事件的自定义工具调用切换为
+// Responses 规定的 ctc_ item ID。历史实现先按 function_call 建立状态，
+// 因为工具名可能晚一个 delta 到达；只要还没对客户端发出 item，就可以
+// 无损完成类型和 ID 的升级。
+func (t *ChatToResponsesSSE) promoteCustomToolCall(s *itemState) {
+	s.custom = true
+	if !s.added && strings.HasPrefix(s.itemID, "fc_") {
+		s.itemID = "ctc_" + strings.TrimPrefix(s.itemID, "fc_")
+	}
 }
 
 // close 关闭全部进行中 items，产出 response.completed 与 [DONE]。

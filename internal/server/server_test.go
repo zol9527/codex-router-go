@@ -296,7 +296,7 @@ func TestNativePassthroughUnregisteredModel(t *testing.T) {
 	defer native.Close()
 
 	srv, ts := newTestServer(t)
-	srv.opt.NativeBase = native.URL
+	srv.setNativeBase(native.URL)
 
 	callerKey, _ := srv.opt.State.CallerKey()
 	req, _ := http.NewRequest(http.MethodPost,
@@ -356,6 +356,66 @@ func TestResponsesPassthrough(t *testing.T) {
 	}
 	if upstreamAuth != "Bearer test-opencode-key" {
 		t.Errorf("upstream auth = %q", upstreamAuth)
+	}
+}
+
+// 旧版本曾把 custom_tool_call 的 item id 生成为 fc_；native 严格校验要求
+// ctc_。透传边界应修复已存在会话里的旧历史，避免用户必须新建任务。
+func TestResponsesPassthroughNormalizesLegacyCustomToolIDs(t *testing.T) {
+	var input []any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode upstream body: %v", err)
+			return
+		}
+		input, _ = body["input"].([]any)
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"type\":\"response.created\"}\n\n")
+	}))
+	defer upstream.Close()
+
+	srv, ts := newTestServer(t)
+	reg := srv.opt.Registry
+	reg.Providers["opencode-go-responses"].BaseURL = upstream.URL
+	reg.Providers["opencode-go-responses"].BaseURLEnv = ""
+	t.Setenv("OPENCODE_API_KEY", "")
+
+	callerKey, _ := srv.opt.State.CallerKey()
+	body := `{"model":"opencode-go-responses/gpt-5.6-luna","stream":true,"input":[{"type":"custom_tool_call","id":"fc_legacy","call_id":"call_legacy","name":"exec","input":"ls"},{"type":"custom_tool_call_output","id":"fc_legacy_output","call_id":"call_legacy","output":"ok"}]}`
+	req, _ := http.NewRequest(http.MethodPost,
+		ts.URL+CallerPathPrefix+"/"+callerKey+"/v1/responses", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	if len(input) != 2 {
+		t.Fatalf("upstream input length = %d, want 2", len(input))
+	}
+	if got := input[0].(map[string]any)["id"]; got != "ctc_legacy" {
+		t.Errorf("custom tool call id = %v, want ctc_legacy", got)
+	}
+	if got := input[1].(map[string]any)["id"]; got != "ctco_legacy_output" {
+		t.Errorf("custom tool output id = %v, want ctco_legacy_output", got)
+	}
+}
+
+func TestNormalizeLegacyCustomToolFrame(t *testing.T) {
+	frame := []byte(`{"type":"response.create","response":{"input":[{"type":"custom_tool_call","id":"fc_ws","call_id":"call_ws","name":"exec","input":"ls"}]}}`)
+	normalized := normalizeLegacyCustomToolFrame(frame)
+	var payload map[string]any
+	if err := json.Unmarshal(normalized, &payload); err != nil {
+		t.Fatal(err)
+	}
+	response := payload["response"].(map[string]any)
+	items := response["input"].([]any)
+	if got := items[0].(map[string]any)["id"]; got != "ctc_ws" {
+		t.Errorf("websocket custom tool call id = %v, want ctc_ws", got)
 	}
 }
 
