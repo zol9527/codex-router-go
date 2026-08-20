@@ -8,18 +8,16 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/loyd/codex-router/internal/cred"
-	"github.com/loyd/codex-router/internal/httpx"
 	"github.com/loyd/codex-router/internal/registry"
-	"github.com/loyd/codex-router/internal/spill"
 	"github.com/loyd/codex-router/internal/state"
 	"github.com/loyd/codex-router/internal/usage"
+	"github.com/loyd/codex-router/internal/vision"
 )
 
 // CallerPathPrefix 与 Node 版一致：caller key 以 URL 路径形式出现。
@@ -51,6 +49,10 @@ type Options struct {
 	// 请求帧而上游此后零回帧超过该窗口 → 主动拆管（调用方重连自愈）。
 	// 跨 turn 空闲不拆。0 = 默认档；负值 = 关闭。
 	WSSilentTimeout time.Duration
+	// WSKeepaliveInterval 是上游 WS 管道的 keepalive ping 周期：空闲
+	// 管道周期性向上游发 ping，避免中间设备（NAT/TUN）按空闲超时砍断
+	// （客户端腿是本地回环，不发）。0 = 默认档；负值 = 关闭。
+	WSKeepaliveInterval time.Duration
 	// SlowRequestLogDelay 是慢请求可见性看门狗：请求在途超过该窗口
 	// 仍无收尾日志时补一行 `slow request pending`（只记录、不拆流）。
 	// 背景：2026-08-16 Surge fake-IP 把 TLS 握手黑洞，请求永久挂死且
@@ -64,17 +66,26 @@ type Server struct {
 	opt       Options
 	client    *http.Client
 	callerKey string
-	// upstreamIdle 是解析后的响应体看门狗窗口（0=关闭），
-	// 供所有上游请求的 RetryOptions 使用。
+	// upstreamIdle 是解析后的响应体看门狗窗口（0=关闭）。它只将无
+	// 字节流转换为明确错误，不在 Router 内重放请求。
 	upstreamIdle time.Duration
 	// wsSilent 是解析后的 WS 管道看门狗窗口（0=关闭）。
 	wsSilent time.Duration
+	// wsKeepalive 是解析后的上游 keepalive ping 周期（0=关闭）。
+	wsKeepalive time.Duration
+	// wsKeepaliveIdleCap 是空闲管道的保活封顶：连续无数据帧超过该窗口
+	// 的管道主动干净关闭（防调用方泄漏管道时无限累积）。
+	wsKeepaliveIdleCap time.Duration
 	// slowRequestLog 是解析后的慢请求日志窗口（0=关闭）。
 	slowRequestLog time.Duration
 	// reg 是当前生效的注册表；SIGUSR1 热重载（动态注册模型后）整体
 	// 换指针 —— 请求路径只读，RWMutex 足够。
 	regMu sync.RWMutex
 	reg   *registry.Registry
+
+	// visionCache 是会话级读图缓存：Codex 每轮重发完整历史，同一
+	// (session, ImageKey) 只在首次调读图引擎（详见 vision 包注释）。
+	visionCache *vision.SessionCache
 
 	mu           sync.Mutex
 	active       map[int]*activityEntry
@@ -91,6 +102,12 @@ type activityEntry struct {
 	model       string
 	sessionName string
 	startedAt   time.Time
+	// inFlight 非 nil 时（WS 管道这类跨 turn 的长生命周期载体），以
+	// 回调结果决定是否计入 active：管道空闲（无在途 turn）不算请求。
+	// nil（HTTP 单请求路径）恒计入。2026-08-18 实发：Codex 每次对话
+	// 开一条 WS preconnect 且长期不关，管道级 activity 让 state 永远
+	// generating，托盘动画永不回 idle。
+	inFlight func() bool
 }
 
 // New 构造 Server。
@@ -118,6 +135,16 @@ const (
 	// DefaultWSSilentTimeout：上游 response.created 正常 ~1s 内到达，
 	// 60s 极保守 —— 触发即认定上游侧黑洞（见 wsWatchdog）。
 	DefaultWSSilentTimeout = 60 * time.Second
+	// DefaultWSKeepaliveInterval：上游 WS 管道的 keepalive ping 周期。
+	// 2026-08-19 实证：上游腿经 Surge TUN，空闲管道在 ~30.05 分钟被
+	// 中间设备按空闲超时砍断（194 条管道 1006 unexpected EOF / RST），
+	// 下一次使用才发现管道已死。60s ping 让链路始终有流量，远低于
+	// 任何常见 NAT/TUN 空闲窗口。
+	DefaultWSKeepaliveInterval = 60 * time.Second
+	// DefaultWSKeepaliveIdleCap：keepalive 不设无限保活 —— 空闲超过该
+	// 窗口的管道主动干净关闭。正常会话的跨 turn 间隙远短于 2 小时；
+	// 泄漏管道（调用方 bug）2 小时后回收，防无限累积。
+	DefaultWSKeepaliveIdleCap = 2 * time.Hour
 	// DefaultSlowRequestLogDelay：健康长请求（GLM max effort + 大上下文）
 	// 约 90s 完成，120s 只记真正的悬挂、不误伤慢而正常的流。
 	DefaultSlowRequestLogDelay = 120 * time.Second
@@ -145,24 +172,26 @@ func New(opt Options) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	// spill 落盘文件的保留期清理（启动即清一次，之后每小时）。
-	spill.StartJanitor(filepath.Join(opt.State.Dir, spill.DirName))
 	headerTimeout := resolveTimeout(opt.UpstreamHeaderTimeout, DefaultUpstreamHeaderTimeout)
 	idleTimeout := resolveTimeout(opt.UpstreamIdleTimeout, DefaultUpstreamIdleTimeout)
 	wsSilent := resolveTimeout(opt.WSSilentTimeout, DefaultWSSilentTimeout)
+	wsKeepalive := resolveTimeout(opt.WSKeepaliveInterval, DefaultWSKeepaliveInterval)
 	slowLog := resolveTimeout(opt.SlowRequestLogDelay, DefaultSlowRequestLogDelay)
 	return &Server{
-		opt:            opt,
-		callerKey:      callerKey,
-		reg:            opt.Registry,
-		upstreamIdle:   idleTimeout,
-		wsSilent:       wsSilent,
-		slowRequestLog: slowLog,
+		opt:                opt,
+		callerKey:          callerKey,
+		reg:                opt.Registry,
+		upstreamIdle:       idleTimeout,
+		wsSilent:           wsSilent,
+		wsKeepalive:        wsKeepalive,
+		wsKeepaliveIdleCap: DefaultWSKeepaliveIdleCap,
+		slowRequestLog:     slowLog,
+		visionCache:        vision.NewSessionCache(vision.SessionCacheCapacity),
 		client: &http.Client{
 			// 上游思考型模型可能长时间不吐首字节 —— 但"永远不吐"必须
 			// fail-fast：响应头窗口由 ResponseHeaderTimeout 把关（计时
 			// 从请求写完到首字节响应头，不含 body 流式时长），body 挂死
-			// 由 FetchWithRetry 的空闲看门狗把关。取消仍由请求上下文管理，
+			// 由 httpx.Fetch 的空闲看门狗把关。取消仍由请求上下文管理，
 			// 这里依旧不设全局超时。
 			Transport: &http.Transport{
 				Proxy: http.ProxyFromEnvironment,
@@ -327,13 +356,21 @@ func requireCodexTransport(w http.ResponseWriter, r *http.Request) bool {
 const staleActivity = 15 * time.Minute
 const errorStatusDuration = 8 * time.Second
 
-// beginRequest 登记 activity 并返回结束函数。
+// beginRequest 登记 activity 并返回结束函数（HTTP 单请求路径：
+// 登记即视为在途，直到 finish）。
 func (s *Server) beginRequest() (setRoute func(provider, model, session string), finish func(status int)) {
+	return s.beginActivity(nil)
+}
+
+// beginActivity 登记一条 activity；inFlight 语义见 activityEntry.inFlight。
+// WS 管道路径传入看门狗的在途 turn 判定，把上报窗口从"管道存活"
+// 收窄成"turn 在途"。
+func (s *Server) beginActivity(inFlight func() bool) (setRoute func(provider, model, session string), finish func(status int)) {
 	s.mu.Lock()
 	s.requestSeq++
 	id := s.requestSeq
 	started := time.Now()
-	entry := &activityEntry{id: strconv.Itoa(id), startedAt: started}
+	entry := &activityEntry{id: strconv.Itoa(id), startedAt: started, inFlight: inFlight}
 	s.active[id] = entry
 	s.mu.Unlock()
 
@@ -347,6 +384,9 @@ func (s *Server) beginRequest() (setRoute func(provider, model, session string),
 			defer s.mu.Unlock()
 			if _, pending := s.active[id]; !pending {
 				return // 与 finish 赛跑落败：请求已收尾，不误报
+			}
+			if entry.inFlight != nil && !entry.inFlight() {
+				return // 长连接载体当前无在途 turn：空闲管道不是慢请求
 			}
 			logf("slow request pending id=%s provider=%s model=%s session=%s elapsed_ms=%d",
 				entry.id, entry.provider, entry.model, entry.sessionName,
@@ -393,7 +433,11 @@ func (s *Server) activityPayload() map[string]any {
 	defer s.mu.Unlock()
 	now := time.Now()
 	for id, entry := range s.active {
-		if now.Sub(entry.startedAt) > staleActivity {
+		// 带 inFlight 的条目（WS 管道）生命周期归管道管理（拆管时
+		// finish）；按 startedAt 过期会把仍健康的管道踢出 active，
+		// 之后管道上的新 turn 永远不上报。挂死的管道由 WS 静默看门狗
+		// 拆管收尾，不依赖这里的 stale 兜底。
+		if entry.inFlight == nil && now.Sub(entry.startedAt) > staleActivity {
 			delete(s.active, id)
 		}
 	}
@@ -401,6 +445,9 @@ func (s *Server) activityPayload() map[string]any {
 	for _, entry := range s.active {
 		if entry.provider == "" {
 			continue
+		}
+		if entry.inFlight != nil && !entry.inFlight() {
+			continue // 空闲长连接载体：无在途 turn，不报 generating
 		}
 		item := map[string]any{
 			"id": entry.id, "provider": entry.provider, "startedAt": entry.startedAt.UnixMilli(),
@@ -497,20 +544,4 @@ func sessionNameFromHeaders(header http.Header) string {
 // logf 统一服务日志（时间戳 + 组件前缀，等价 Node 版 console.error）。
 func logf(format string, args ...any) {
 	log.Printf("[codex-router] "+format, args...)
-}
-
-// upstreamRetryOpts 是所有上游请求共用的重试/超时装配：
-//   - Client 固定为 s.client —— 此前调用点漏传 Client 实际走了
-//     http.DefaultClient，server 里精心构造的 Transport（拨号超时、
-//     ResponseHeaderTimeout）对主请求路径不生效；
-//   - IdleTimeout 挂响应体看门狗（0=关闭）；
-//   - OnRetry 把静默重试变成 router.log 里的可见行。
-func (s *Server) upstreamRetryOpts() httpx.RetryOptions {
-	opts := httpx.DefaultRetryOptions()
-	opts.Client = s.client
-	opts.IdleTimeout = s.upstreamIdle
-	opts.OnRetry = func(attempt, status int, err error, delayMs int) {
-		logf("upstream retry attempt=%d status=%d err=%v delay_ms=%d", attempt, status, err, delayMs)
-	}
-	return opts
 }

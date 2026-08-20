@@ -1,6 +1,5 @@
-// Package httpx 提供请求体编解码（zstd/gzip/deflate/brotli）与
-// "首字节前才合法" 的上游重试。两者都按旧 AGENTS.md 的移植规格实现：
-// 重试只在未中继任何字节前发生，body 是可重放的字节序列。
+// Package httpx 提供请求体编解码（zstd/gzip/deflate/brotli）与单次上游
+// 请求。重试由 Codex 调用方决定；Router 只把本次上游的结果或错误返回。
 package httpx
 
 import (
@@ -11,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"time"
 
@@ -157,117 +155,23 @@ func CompressBody(body []byte) ([]byte, string) {
 	return compressed, "zstd"
 }
 
-// ---- 上游重试：只在首字节前合法 ----
-
-// RetryableStatuses 表示"中介从未从源站拿到可用响应"：
-// 502/503/504 网关类，520-524 Cloudflare 边缘类。
-// 刻意不含 429（限流，Retry-After 已被透传）、4xx（确定性）、500（源站已运行）。
-var RetryableStatuses = map[int]bool{
-	502: true, 503: true, 504: true,
-	520: true, 521: true, 522: true, 523: true, 524: true,
-}
-
-// RetryOptions 控制重试循环。Retries=0 禁用；默认 2 次、250ms 起、
-// 3 倍退避、5 秒预算 —— 乘上 Codex 自己的约五次重连仍是快速失败。
-type RetryOptions struct {
-	Retries   int
-	BackoffMs int
-	BudgetMs  int
-	CanRetry  func() bool
-	OnRetry   func(attempt int, status int, err error, delayMs int)
-	Client    *http.Client
-	// IdleTimeout 是响应体看门狗窗口：最终接受的响应 body 连续
-	// 这么久没有字节即断开（错误链上带 ErrUpstreamIdle）。0=关闭。
-	// 只作用于"响应已开始"后的挂死 —— 响应头超时由 http.Transport
-	// 的 ResponseHeaderTimeout 负责。
-	IdleTimeout time.Duration
-}
-
-// DefaultRetryOptions 返回与 Node 版一致的默认值。
-func DefaultRetryOptions() RetryOptions {
-	return RetryOptions{Retries: 2, BackoffMs: 250, BudgetMs: 5000}
-}
-
-// wrapIdle 给最终接受的响应 body 挂空闲看门狗（见 idle.go）。
-// 中间被丢弃的重试响应不包 —— 它们的 body 只被排空后关闭。
-func wrapIdle(resp *http.Response, opts RetryOptions) *http.Response {
-	if resp != nil && resp.Body != nil && opts.IdleTimeout > 0 {
-		resp.Body = NewIdleReadCloser(resp.Body, opts.IdleTimeout)
-	}
-	return resp
-}
-
-// FetchWithRetry 发送请求并在"响应从未开始"类失败上有限重试。
-// 返回最终响应与重试次数（首次之外的尝试数）。
-// canRetry 在每次重试前重新检查 —— 一旦调用方中继过任何字节，
-// 重放会向正在读的流追加第二份响应，这是结构性红线。
-func FetchWithRetry(ctx context.Context, method, url string, headers map[string]string, body []byte, opts RetryOptions) (*http.Response, int, error) {
-	if opts.Retries == 0 && opts.BackoffMs == 0 && opts.BudgetMs == 0 {
-		opts = DefaultRetryOptions()
-	}
-	client := opts.Client
+// Fetch 只发送一次上游请求。响应体可选挂空闲看门狗，防止已建立连接后
+// 永久无字节；它只产生明确错误，不在 Router 内重放请求。
+func Fetch(ctx context.Context, method, url string, headers map[string]string, body []byte, client *http.Client, idleTimeout time.Duration) (*http.Response, error) {
 	if client == nil {
 		client = http.DefaultClient
 	}
-	started := time.Now()
-	attempt := 0
-	for {
-		req, err := http.NewRequestWithContext(ctx, method, url, bytes.NewReader(body))
-		if err != nil {
-			return nil, attempt, err
-		}
-		for k, v := range headers {
-			req.Header.Set(k, v)
-		}
-		resp, err := client.Do(req)
-		if attempt >= opts.Retries {
-			return wrapIdle(resp, opts), attempt, err
-		}
-		var retryable bool
-		var status int
-		if err != nil {
-			retryable = isRetryableTransportError(err)
-		} else {
-			status = resp.StatusCode
-			retryable = RetryableStatuses[status]
-		}
-		if !retryable {
-			return wrapIdle(resp, opts), attempt, err
-		}
-		if ctx.Err() != nil || (opts.CanRetry != nil && !opts.CanRetry()) {
-			return wrapIdle(resp, opts), attempt, err
-		}
-		if time.Since(started) >= time.Duration(opts.BudgetMs)*time.Millisecond {
-			return wrapIdle(resp, opts), attempt, err
-		}
-		if resp != nil && resp.Body != nil {
-			io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-			resp.Body.Close()
-		}
-		delay := float64(opts.BackoffMs) * math.Pow(3, float64(attempt))
-		attempt++
-		if opts.OnRetry != nil {
-			opts.OnRetry(attempt, status, err, int(delay))
-		}
-		select {
-		case <-time.After(time.Duration(delay) * time.Millisecond):
-		case <-ctx.Done():
-			return nil, attempt, ctx.Err()
-		}
-		if ctx.Err() != nil {
-			return nil, attempt, ctx.Err()
-		}
+	req, err := http.NewRequestWithContext(ctx, method, url, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
 	}
-}
-
-// isRetryableTransportError 识别"连接从未建立/响应从未开始"类失败。
-// context 取消与超时不是上游故障，不重试。
-func isRetryableTransportError(err error) bool {
-	if err == nil {
-		return false
+	for k, v := range headers {
+		req.Header.Set(k, v)
 	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return false
+	resp, err := client.Do(req)
+	if err != nil || resp == nil || resp.Body == nil || idleTimeout <= 0 {
+		return resp, err
 	}
-	return isConnectError(err)
+	resp.Body = NewIdleReadCloser(resp.Body, idleTimeout)
+	return resp, nil
 }

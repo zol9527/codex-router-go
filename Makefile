@@ -36,7 +36,12 @@ version:
 
 cli: $(BINARY)
 
-$(BINARY):
+# 源码必须作为依赖列出：无依赖的规则在有旧产物时永不再构建，
+# install-cli 会把陈旧二进制原子替换上线（2026-08-20 实发：dist 里
+# 残留旧构建，新注册参数 --efforts 部署后不生效，排查到产物过期）。
+GO_SOURCES := $(shell find . -name '*.go' -not -path './dist/*' 2>/dev/null)
+
+$(BINARY): $(GO_SOURCES)
 	@mkdir -p $(DIST)
 	go build $(GOFLAGS_RELEASE) -ldflags '$(LDFLAGS_RELEASE)' -o $@ ./cmd/codex-router
 	@echo "built: $@ (version $(VERSION))"

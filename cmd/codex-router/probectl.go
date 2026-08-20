@@ -58,7 +58,7 @@ func controlProbe(st *state.State, reg *registry.Registry, args []string) error 
 	if model == "" {
 		return fmt.Errorf("provider %s has no models registered", provider.ID)
 	}
-	base := probeBaseURL(provider)
+	base := probeBaseURL(st, provider)
 	client := &http.Client{Timeout: 60 * time.Second}
 
 	report := map[string]any{
@@ -133,14 +133,10 @@ func pickProbeModel(reg *registry.Registry, provider *registry.Provider, args []
 	return ""
 }
 
-// probeBaseURL 与 server.providerBaseURL 同规则（env 覆盖 > 默认）。
-func probeBaseURL(p *registry.Provider) string {
-	if p.BaseURLEnv != "" {
-		if v := os.Getenv(p.BaseURLEnv); v != "" {
-			return strings.TrimSuffix(v, "/")
-		}
-	}
-	return strings.TrimSuffix(p.BaseURL, "/")
+// probeBaseURL 与 server.(*Server).providerBaseURL 同规则（env 覆盖 >
+// config base_url > 注册表默认），外加剥尾斜杠。
+func probeBaseURL(st *state.State, p *registry.Provider) string {
+	return strings.TrimSuffix(providerBaseURL(st, p), "/")
 }
 
 // probePost 发一个 chat completions 请求，返回解析后的响应。

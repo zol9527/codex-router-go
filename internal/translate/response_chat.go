@@ -101,15 +101,25 @@ func (t *ChatToResponsesSSE) TotalTokens() int64 {
 }
 
 // HasContent 报告本流是否产出过客户端可行动的内容
-// （输出文本或工具调用；纯 reasoning 不算 —— 空补全守卫的判定）。
+// （输出文本或有效工具调用；纯 reasoning 不算 —— 空补全守卫的判定）。
+// custom 工具的调用要求解出的 input 非空：GLM-5.3 在 100k+ 上下文会
+// 退化成反复发空载荷 exec 调用（2026-08-17 15:55-16:31 实发死循环：
+// 每轮仅 out=5 token，Codex 收到空调用后 needs_follow_up 无限续轮，
+// 单个 turn 烧了 200+ 次请求），空载荷在这里不算内容，由守卫按
+// empty_completion 失败收尾；普通 function 调用的参数可为空
+// （无参工具是合法形态），照旧算内容。
 func (t *ChatToResponsesSSE) HasContent() bool {
 	if t.message != nil && t.message.text.Len() > 0 {
 		return true
 	}
 	for _, state := range t.functionCall {
-		if state != nil {
-			return true
+		if state == nil {
+			continue
 		}
+		if state.custom && emptyCustomInput(state.arguments.String()) {
+			continue
+		}
+		return true
 	}
 	return false
 }
@@ -541,6 +551,15 @@ func (t *ChatToResponsesSSE) customToolCallItem(s *itemState, payload string) ma
 	}
 }
 
+// emptyCustomInput 判定 custom 调用的有效载荷是否为空。模型退化时的
+// 空调用表现为：arguments 缺失、字面 "{}"、或 {"input":""} —— 这些
+// 都不构成可执行的载荷；解不出 input 的乱形状（如 {"cmd":"ls"}）
+// 仍按非空处理，与 customToolInput 的"不丢调用"立场一致。
+func emptyCustomInput(args string) bool {
+	trimmed := strings.TrimSpace(customToolInput(args))
+	return trimmed == "" || trimmed == "{}"
+}
+
 // customToolInput 从模型按伪装 schema 生成的 arguments 里解出自由文本
 // 载荷：{"input": "..."} 优先；整体是 JSON 字符串字面量则取字面量；
 // 都不是就把原始 arguments 当载荷（模型没按 schema 来时不至于丢调用）。
@@ -605,6 +624,15 @@ func (t *ChatToResponsesSSE) responseShell(status string) map[string]any {
 // input_tokens: 0 会让 Codex 永不压缩、会话撑爆窗口。替换只落在
 // 显式零上、estimate 只高不低（压缩阈值有 14% 余量），替换事实通过
 // SubstitutedInputTokens 单独暴露 —— telemetry 永远保留 provider 原值。
+//
+// null 防御（2026-08-19 实发）：上游（opencode）会偶发把 usage 字段或
+// details 子项报成 null（deepseek 短输出时 completion_tokens_details.
+// reasoning_tokens=null）。Codex 的 usage 反序列化是非 Option 整数，
+// 任何 null 都会让整个 ResponseCompleted 解析失败，客户端只能整轮
+// 丢弃并全量重试（实发一轮重试 11 次、浪费 ~50 万 input token）。
+// 因此这里非数值（null/字符串）一律不透传：字段缺失对 Codex 无害
+// （补零路径早已在产线省略键），null 则致命。details 只保留数值子项，
+// 全部非数值时整个省略。
 func (t *ChatToResponsesSSE) responsesUsage(usage map[string]any) map[string]any {
 	if usage == nil {
 		return nil
@@ -622,24 +650,41 @@ func (t *ChatToResponsesSSE) responsesUsage(usage map[string]any) map[string]any
 			out["total_tokens"] = float64(t.estimatedInput)
 		}
 	} else {
-		if v, ok := usage["prompt_tokens"]; ok {
+		if v, ok := usage["prompt_tokens"].(float64); ok {
 			out["input_tokens"] = v
 		}
-		if v, ok := usage["completion_tokens"]; ok {
+		if v, ok := usage["completion_tokens"].(float64); ok {
 			out["output_tokens"] = v
 		}
-		if v, ok := usage["total_tokens"]; ok {
+		if v, ok := usage["total_tokens"].(float64); ok {
 			out["total_tokens"] = v
 		}
 	}
-	if details, ok := usage["prompt_tokens_details"].(map[string]any); ok {
+	if details := numericDetails(usage["prompt_tokens_details"]); len(details) > 0 {
 		out["input_tokens_details"] = details
 	}
-	if details, ok := usage["completion_tokens_details"].(map[string]any); ok {
+	if details := numericDetails(usage["completion_tokens_details"]); len(details) > 0 {
 		out["output_tokens_details"] = details
 	}
 	if len(out) == 0 {
 		return nil
+	}
+	return out
+}
+
+// numericDetails 只保留 details map 里的数值子项（cached_tokens/
+// reasoning_tokens 等在 Codex 侧是非 Option 整数，null 会炸掉整个
+// 事件的解析）；非 map 或无数值子项时返回 nil。
+func numericDetails(raw any) map[string]any {
+	details, ok := raw.(map[string]any)
+	if !ok {
+		return nil
+	}
+	out := make(map[string]any, len(details))
+	for k, v := range details {
+		if n, ok := v.(float64); ok {
+			out[k] = n
+		}
 	}
 	return out
 }

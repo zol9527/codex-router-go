@@ -7,7 +7,7 @@
 > 设计基线与迁移记录见 [GO-REWRITE-PLAN.md](GO-REWRITE-PLAN.md)。
 
 把 Codex（App 与 CLI）接到你自己的模型订阅上：**Z.ai GLM Coding Plan**、
-**opencode Go/Zen**，外加**原生 ChatGPT 订阅直通**。路由器以 Responses API
+**opencode Go/Zen**、自托管 **LiteLLM**，外加**原生 ChatGPT 订阅直通**。路由器以 Responses API
 的身份站在 Codex 背后，把外部模型混入 Codex 原生模型选择器——你在同一个
 picker 里选 `zai-coding/glm-5.3` 和 `gpt-5.6-sol`。
 
@@ -68,6 +68,10 @@ api_key = "..."
 # 也支持环境变量引用：api_key = "{ZAI_API_KEY}"
 # 未设置的变量展开为空（=未配置）；{非变量形状} 按字面量保留
 
+[litellm]
+api_key = "sk-..."
+# base_url = "https://your-litellm.example/v1"  # 必填；也可 export LITELLM_BASE_URL
+
 [env]
 # 可选：dotenv 兜底文件。GUI App 拉起的服务继承 launchd 环境，
 # 看不到登录 shell 里的变量；{VAR} 查不到进程环境时从这里兜底。
@@ -99,7 +103,6 @@ control config init                     生成注释模板
 control reload                          重读配置+刷新 catalog，不重启
 control subagents status|mode|select-all|unselect-all|set|provider
 control picker set <slug> show|hide | provider <id> | all | status
-control tool-result-spill status|on|off|max-bytes <bytes>
 control presence set always|follow-codex
 control account --json | provider-usage --json    配额与用量
 control vision-bridge on|off | status | engine <slug|local|auto> [effort] | effort <level|default> | local <tag>
@@ -111,15 +114,14 @@ control local-runtime status|start|stop
 
 | 功能 | 说明 |
 |---|---|
-| 空补全守卫 | 上游 200 但零 token：按住不发头→同字节静默重试→仍空则如实报错 |
+| 空补全守卫 | 上游 200 但零 token：按住响应头，结束时返回明确失败；是否重试交给 Codex |
 | Prompt-token 补零 | 上游报 `input_tokens: 0` 时以偏高估算替换，防 Codex 永不压缩上下文 |
-| Tool-result spill | 超阈值工具结果首过境截断：全文内容寻址落盘+回执带路径，判定是内容纯函数，前缀缓存永不翻转（取代旧 aging） |
 | Namespace 拍平 | Codex 的 `<ns>__<tool>` 展开为真工具，响应精确映射回 |
 | Compaction v1/v2 | 80KB 尾部摘要 / kcr1 base64 压缩 |
 | Subagent relay | Fernet 密文检测，外部模型的子代理载荷经原生端点中继 |
-| **视觉桥** | 文本模型也能读图：结构化转写（六段证据合同）、一图一购缓存、引擎自动选择/回退/本地 Ollama |
+| **视觉桥** | 文本模型也能读图：结构化转写（六段证据合同）、单引擎单次读取、本地 Ollama |
 | Rate-limit 收割 | 从上游响应头攒限流窗口信息 |
-| 用量计量 | 每回合一行 JSONL：token、首 token 延迟、重试；App 用量卡片的数据源 |
+| 用量计量 | 每回合一行 JSONL：token、首 token 延迟；App 用量卡片的数据源 |
 | **协作子代理** | Codex v2 协作的分身候选：注册表 `multiAgentVersion` 证明标记（真实探针通过才标）→ catalog 发布 + agents 目录按名 spawn 定义；`control subagents` 三模式管理（proven/selected/all），本地只能收窄不能放大 |
 | codex shim | 可选的 PATH 包装器，启动前确认路由器就绪（`codex-router shim install`） |
 
@@ -136,10 +138,11 @@ zai HTTP 流挂 8 分半、原生 WSS 管道零回帧 10 分钟、Surge fake-IP 
 | 响应头超时 `CODEX_ROUTER_HEADER_TIMEOUT_SEC` | 300 | 上游多久不回响应头判死（502） | 设 `0` |
 | 流空闲看门狗 `CODEX_ROUTER_IDLE_TIMEOUT_SEC` | 180 | SSE 流上多久零字节判死：头未提交回 504 `upstream_idle_timeout`；已提交只截断（调用方整轮重试） | 设 `0` |
 | WS 静默看门狗 `CODEX_ROUTER_WS_SILENT_TIMEOUT_SEC` | 60 | 客户端发过请求帧而上游此后零回帧超窗口 → 主动拆管（跨 turn 空闲不拆） | 设 `0` |
+| WS keepalive `CODEX_ROUTER_WS_KEEPALIVE_SEC` | 60 | 空闲管道周期向上游发 ping，防中间设备（NAT/TUN）按空闲超时砍断（2026-08-19 实证：经 Surge TUN 的管道空闲 ~30 分钟必死） | 设 `0` |
 | 慢请求日志 `CODEX_ROUTER_SLOW_REQUEST_LOG_SEC` | 120 | 请求在途超窗口补一行 `slow request pending`（只记录、不拆流，收尾日志照常）—— 挂死请求不再零痕迹 | 设 `0` |
 
 失败一律落 `router.log`（含 model/provider/status/duration/错误摘要）与
-`usage-events.jsonl`（`upstreamIdle`/`streamAborted`/`retries` 字段）。
+`usage-events.jsonl`（`upstreamIdle`/`streamAborted` 字段）。
 
 
 ## 扩展协议

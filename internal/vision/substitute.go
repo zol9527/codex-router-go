@@ -226,27 +226,13 @@ func firstDataURL(text string) string {
 	return rest
 }
 
-// Evidence 是一张图的读图结果（缓存与注入的单元）。
+// Evidence 是一张图的读图结果（注入的单元）。
 type Evidence struct {
 	Engine     string `json:"engine"`
 	Question   string `json:"question,omitempty"`
 	Transcript string `json:"transcript"`
-	// FellBack 标记实际读图的引擎不是首选（回退发生过）。
-	FellBack bool `json:"fellBack,omitempty"`
-	// PriorFailures 记录回退链上先失败的引擎（"engine: err"）。
-	// 成功兜底时首选引擎的失败原因 otherwise 会被吞掉（2026-08-16
-	// qwen3.7-max anthropic 路径排查即卡在这）。
-	PriorFailures []string `json:"priorFailures,omitempty"`
 	// Incomplete 标记读图被尺寸上限截断（值得再看一眼）。
 	Incomplete bool `json:"incomplete,omitempty"`
-}
-
-// CacheKey 按（图片字节、effort、账号、问题）键控 —— 一图一购：
-// 同图同问免费重放；不同账号的 native 转录绝不互用（一次缓存命中
-// 会跳过"这个会话能不能花这个模型"的全部检查）。
-func CacheKey(dataURL, effort, account, question string) string {
-	digest := sha256.Sum256([]byte(dataURL + "\x00" + effort + "\x00" + account + "\x00" + question))
-	return base64.RawURLEncoding.EncodeToString(digest[:])
 }
 
 // RenderEvidence 把证据渲染成注入回合的文本：
@@ -255,9 +241,6 @@ func RenderEvidence(evidence Evidence, filePath string) string {
 	var header strings.Builder
 	header.WriteString("[image read by ")
 	header.WriteString(evidence.Engine)
-	if evidence.FellBack {
-		header.WriteString(" (fallback engine)")
-	}
 	if filePath != "" {
 		header.WriteString("; file: ")
 		header.WriteString(filePath)

@@ -6,11 +6,18 @@ import (
 	"github.com/loyd/codex-router/internal/registry"
 )
 
-// glmEffortLadder 是 Codex effort 阶的全序（低→高）。
-var glmEffortLadder = []string{"minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
+// EffortLadder 是 effort 档的全序（低→高）——router 的规范阶梯，
+// 所有档位归一（钳制/区间展开）都在这一条序上做。
+var EffortLadder = []string{"minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
+
+// CodexEffortRungs 是 Codex 桌面端会请求的档位词汇（enabled-reasoning-
+// efforts 不会超出这个集合）。catalog 发布集按它做区间展开，保证
+// Codex 侧校验（spawn 的 reasoning_effort 必须 ∈ supported 集合，
+// 校验发生在请求到达 router 之前）永远不会因词汇差异拒掉请求。
+var CodexEffortRungs = []string{"low", "medium", "high", "xhigh"}
 
 func ladderRank(effort string) int {
-	for i, rung := range glmEffortLadder {
+	for i, rung := range EffortLadder {
 		if rung == effort {
 			return i
 		}
@@ -18,12 +25,26 @@ func ladderRank(effort string) int {
 	return -1
 }
 
-// glmEffort 把请求的 effort 钳制到模型自己声明的阶梯上。
-// Z.ai 按"模型"而非按"厂商"声明档位：GLM-5.3 是 low/high/max，
-// GLM-5.2 只有 high/max。Codex 顶档（xhigh/max/ultra）一律取模型最高档；
-// 其余取"不高于请求档的最近已声明档"；低于模型下限则落在下限。
-// 未声明阶梯（单档模型）返回 ""，表示该模型根本不支持此参数。
-func glmEffort(requested string, levels []string) string {
+func absRank(a, b int) int {
+	if a > b {
+		return a - b
+	}
+	return b - a
+}
+
+// ClampEffort 把请求的 effort 归到模型声明的档位阶梯上（区间映射）：
+// 每个声明档位"拥有"请求阶梯上离它最近的一段连续区间。
+// 规则：
+//   - 顶档请求（xhigh/max/ultra）语义就是"拉满"，一律取模型最高声明档；
+//   - 其余请求取绝对距离最近的声明档，平手取较低者（严格小于保证
+//     升序遍历时先到者胜，落在省钱侧）；
+//   - 未声明阶梯（levels 全部不在规范阶梯上）或不认识的请求档返回 ""，
+//     调用方据此决定透传还是删参。
+//
+// 例：deepseek 声明 [minimal, high]（距 3 级），请求 medium（距 high 1 级、
+// 距 minimal 2 级）→ high；请求 low → minimal。GLM-5.3 声明
+// [low, high, max]，请求 medium 平手 → low（与旧"就近向下"行为一致）。
+func ClampEffort(requested string, levels []string) string {
 	var declared []string
 	for _, level := range levels {
 		if ladderRank(level) >= 0 {
@@ -37,14 +58,14 @@ func glmEffort(requested string, levels []string) string {
 	case "xhigh", "max", "ultra":
 		return declared[len(declared)-1]
 	}
-	ceiling := ladderRank("high")
-	if rank := ladderRank(requested); rank >= 0 {
-		ceiling = rank
+	rank := ladderRank(requested)
+	if rank < 0 {
+		return ""
 	}
-	best := declared[0]
-	for _, level := range declared {
-		if ladderRank(level) <= ceiling {
-			best = level
+	best, bestDist := declared[0], absRank(ladderRank(declared[0]), rank)
+	for _, level := range declared[1:] {
+		if d := absRank(ladderRank(level), rank); d < bestDist {
+			best, bestDist = level, d
 		}
 	}
 	return best
@@ -67,7 +88,8 @@ func ApplyRequestProfile(body map[string]any, requestedEffort string, model *reg
 			levels = append(levels, level.Effort)
 		}
 		if len(levels) > 1 {
-			if effort := glmEffort(requestedEffort, levels); effort != "" {
+			// 区间钳制（ClampEffort）；单档模型 zai 拒收该参数，删除。
+			if effort := ClampEffort(requestedEffort, levels); effort != "" {
 				body["reasoning_effort"] = effort
 			} else {
 				delete(body, "reasoning_effort")
@@ -98,11 +120,21 @@ func ApplyRequestProfile(body map[string]any, requestedEffort string, model *reg
 			body["tool_choice"] = "auto"
 		}
 	default:
-		// 无特殊 profile：reasoning.effort 已收集为 requestedEffort，
-		// 作为标准 reasoning_effort 透传（上游不认时会拒绝或忽略，
-		// 这与 LiteLLM 时代的行为一致）。
+		// 无特殊 profile：effort 先按模型声明档位做区间钳制 ——
+		// 自定义模型常见的 400 根源是 Codex 词汇表的档位上游不认
+		// （2026-08-20 litellm/volcengine 实发）。模型未声明档位时
+		// 原样透传（与 LiteLLM 时代的行为一致，上游不认时自行拒绝
+		// 或忽略）。
 		if requestedEffort != "" {
-			body["reasoning_effort"] = requestedEffort
+			levels := make([]string, 0, len(model.ReasoningLevels))
+			for _, level := range model.ReasoningLevels {
+				levels = append(levels, level.Effort)
+			}
+			if effort := ClampEffort(requestedEffort, levels); effort != "" {
+				body["reasoning_effort"] = effort
+			} else {
+				body["reasoning_effort"] = requestedEffort
+			}
 		}
 	}
 	// thinking 载荷里可能残留 Responses 侧的 reasoning 对象形态，清掉。

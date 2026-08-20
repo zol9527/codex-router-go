@@ -10,10 +10,8 @@ func TestSettingsWriteReadRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	enabled := true
 	written := Settings{
-		Enabled:    &enabled,
-		Engine:     "gpt-5.6-luna",
-		LocalModel: "qwen2.5vl:3b",
-		Effort:     "high",
+		Enabled: &enabled,
+		Effort:  "high",
 	}
 	if err := WriteSettings(dir, written); err != nil {
 		t.Fatalf("write: %v", err)
@@ -25,7 +23,7 @@ func TestSettingsWriteReadRoundTrip(t *testing.T) {
 	if read.EffectiveEnabled(configured) != true {
 		t.Error("enabled must round-trip")
 	}
-	if read.Engine != "gpt-5.6-luna" || read.Effort != "high" || read.LocalModel != "qwen2.5vl:3b" {
+	if read.Effort != "high" {
 		t.Errorf("fields did not round-trip: %+v", read)
 	}
 	info, err := os.Stat(filepath.Join(dir, "vision-bridge.json"))
@@ -39,21 +37,21 @@ func TestSettingsWriteReadRoundTrip(t *testing.T) {
 
 func TestWriteSettingsPreservesUnrelatedFields(t *testing.T) {
 	dir := t.TempDir()
-	// pin 引擎 + 档位后单独切开关：其余字段必须保留
-	// （tray 的开关与引擎选择是两个独立按钮）。
-	if err := WriteSettings(dir, Settings{Engine: "gpt-5.6-luna", Effort: "low"}); err != nil {
+	// pin 档位后单独切开关：其余字段必须保留（tray 的开关与档位
+	// 是两个独立入口）。
+	if err := WriteSettings(dir, Settings{Effort: "low"}); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 	off := false
-	if err := WriteSettings(dir, Settings{Enabled: &off, Engine: "gpt-5.6-luna", Effort: "low"}); err != nil {
+	if err := WriteSettings(dir, Settings{Enabled: &off, Effort: "low"}); err != nil {
 		t.Fatalf("write off: %v", err)
 	}
 	read, configured := ReadSettings(dir)
 	if !configured || read.EffectiveEnabled(configured) {
 		t.Fatalf("off must round-trip, got %+v configured=%v", read, configured)
 	}
-	if read.Engine != "gpt-5.6-luna" || read.Effort != "low" {
-		t.Errorf("engine/effort must survive the toggle: %+v", read)
+	if read.Effort != "low" {
+		t.Errorf("effort must survive the toggle: %+v", read)
 	}
 }
 

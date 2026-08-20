@@ -227,10 +227,8 @@ func applyEvent(acc *providerAcc, e *Event, at time.Time) {
 	if firstToken > 0 && firstToken <= duration {
 		generation = duration - firstToken
 	}
-	// 长 Codex 回合可能触发空补全守卫预算后仍以 200 正常完成 ——
-	// 该标记只说明「停止等待分类空补全」，不代表速率不可用。
-	// 空补全/重试/取消的回复才剔除。
-	measurable := success && e.Retries == 0 && !e.EmptyCompletion && !e.EmptyCompletionRetried
+	// 空补全或取消的回复不进入速率样本。
+	measurable := success && !e.EmptyCompletion
 	output := nonneg64(e.OutputTokens)
 	if measurable && output > 0 && firstToken > 0 && generation > 0 {
 		impossible := float64(output)*1000/float64(generation) > maxPlausibleTokensPerSecond

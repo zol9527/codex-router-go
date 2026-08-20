@@ -14,25 +14,20 @@ import (
 // Event 是一回合的计量记录。零值字段不序列化（保持 JSONL 紧凑，
 // 与 Node 版的条件展开一致）。
 type Event struct {
-	At                     string `json:"at"`
-	Model                  string `json:"model"`
-	Provider               string `json:"provider"`
-	Status                 int    `json:"status"`
-	DurationMs             int64  `json:"durationMs"`
-	ResponseStartMs        int64  `json:"responseStartMs,omitempty"`
-	FirstTokenMs           int64  `json:"firstTokenMs,omitempty"`
-	Retries                int    `json:"retries,omitempty"`
-	InputTokens            int64  `json:"inputTokens"`
-	OutputTokens           int64  `json:"outputTokens"`
-	TotalTokens            int64  `json:"totalTokens"`
-	CachedInputTokens      int64  `json:"cachedInputTokens,omitempty"`
-	EstimatedInputTokens   int64  `json:"estimatedInputTokens,omitempty"`
-	StreamAborted          bool   `json:"streamAborted,omitempty"`
-	UpstreamIdle           bool   `json:"upstreamIdle,omitempty"`
-	EmptyCompletion        bool   `json:"emptyCompletion,omitempty"`
-	EmptyCompletionRetried bool   `json:"emptyCompletionRetried,omitempty"`
-	ToolResultsSpilled     int    `json:"toolResultsSpilled,omitempty"`
-	ToolResultBytesSaved   int64  `json:"toolResultBytesSaved,omitempty"`
+	At                   string `json:"at"`
+	Model                string `json:"model"`
+	Provider             string `json:"provider"`
+	Status               int    `json:"status"`
+	DurationMs           int64  `json:"durationMs"`
+	ResponseStartMs      int64  `json:"responseStartMs,omitempty"`
+	FirstTokenMs         int64  `json:"firstTokenMs,omitempty"`
+	InputTokens          int64  `json:"inputTokens"`
+	OutputTokens         int64  `json:"outputTokens"`
+	TotalTokens          int64  `json:"totalTokens"`
+	EstimatedInputTokens int64  `json:"estimatedInputTokens,omitempty"`
+	StreamAborted        bool   `json:"streamAborted,omitempty"`
+	UpstreamIdle         bool   `json:"upstreamIdle,omitempty"`
+	EmptyCompletion      bool   `json:"emptyCompletion,omitempty"`
 }
 
 // Recorder 追加写入 JSONL（进程内串行，0600）。

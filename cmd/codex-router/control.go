@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -110,6 +111,15 @@ func cmdControl(args []string) error {
 	// providers 形式都按 list 处理。
 	case len(rest) >= 1 && rest[0] == "providers":
 		return controlProvidersList(st, reg, hasJSONFlag(rest))
+	case len(rest) >= 3 && rest[0] == "set" && (rest[2] == "on" || rest[2] == "off"):
+		// 托盘开关协议：`set <id> on|off [--targets codex]`。UI 的开关
+		// 按钮走这条（providers enable 只有追加形态，关不掉）。
+		return controlProvidersSet(st, reg, rest[1], rest[2] == "on")
+	case len(rest) >= 1 && rest[0] == "apply":
+		// 托盘在 set 之后紧跟 `apply --targets codex --activate`：重发布
+		// catalog + config 集成块。等价 reload（幂等，caller key 不变），
+		// 路由强制本身按请求实时判定，不依赖这一步。
+		return controlReload(st, reg)
 	case cutControlCommand(rest) != "":
 		return fmt.Errorf("%s was removed in the go rewrite; this build serves codex routing only", cutControlCommand(rest))
 	case len(rest) >= 1 && rest[0] == "credential" && len(rest) >= 2:
@@ -120,8 +130,6 @@ func cmdControl(args []string) error {
 		return controlSubagents(st, reg, rest[1:])
 	case len(rest) >= 1 && rest[0] == "picker":
 		return controlPicker(st, reg, rest[1:])
-	case len(rest) >= 1 && rest[0] == "tool-result-spill":
-		return controlToolResultSpill(st, rest[1:])
 	case len(rest) >= 1 && rest[0] == "models":
 		return controlModels(st, reg, rest[1:])
 	case len(rest) >= 1 && rest[0] == "reload":
@@ -134,8 +142,6 @@ func cmdControl(args []string) error {
 		return controlProbe(st, reg, rest[1:])
 	case len(rest) >= 1 && rest[0] == "vision-bridge":
 		return controlVisionBridge(*stateDir, reg, rest[1:])
-	case len(rest) >= 1 && rest[0] == "local-runtime":
-		return controlLocalRuntime(*stateDir, rest[1:])
 	case len(rest) >= 3 && rest[0] == "presence" && rest[1] == "set":
 		if err := state.SetPresenceMode(st.Dir, rest[2]); err != nil {
 			return err
@@ -165,20 +171,19 @@ func controlUsage() {
   control service start|stop|restart|status
   control providers list [--json]
   control providers enable ID [ID...]     (append to selection)
+  control set ID on|off                   (tray toggle path; rewrites selection)
+  control apply                           (republish catalog + config block; = reload)
   control credential PROVIDER             write api_key to config.toml (stdin prompt)
   control credential PROVIDER --remove    remove the provider's config.toml table
   control config init                     write the commented config.toml template
   control reload                          re-read config + refresh catalog, no restart
   control subagents status|mode <m>|select-all|unselect-all|declare <slug>|undeclare <slug>|set <slug> on|off|provider <id> on|off
   control picker set <slug> show|hide | provider <id> show|hide | all show|hide | status
-  control tool-result-spill status|on|off|max-bytes <bytes>
   control models sync [PROVIDER]|list|remove <slug>|add PROVIDER <upstream-id>
   control presence set always|follow-codex
   control account --json | control provider-usage --json
   control probe PROVIDER [MODEL]           upstream behavior probe (models/args-visibility/usage accounting)
-  control vision-bridge on|off | status | engine <slug|local|auto> [effort] | effort <level|default> | local <tag>
-  control vision-bridge pull TAG | pull-status | benchmark [TAG] | catalog
-  control local-runtime status|start|stop
+  control vision-bridge on|off | status | effort <level|default>
 `)
 }
 
@@ -190,7 +195,7 @@ func cutControlCommand(rest []string) string {
 		return ""
 	}
 	cut := map[string]bool{
-		"apply": true, "doctor": true, "maintenance": true,
+		"doctor": true, "maintenance": true,
 		"auth-mode": true, "signed-routing": true,
 		"login": true, "install-cli": true,
 		"harness": true, "local-models": true,
@@ -277,9 +282,8 @@ func controlJSON(st *state.State, reg *registry.Registry) error {
 		// App 设置页的「Subagent models / Model picker」区块数据源
 		//（tray 的 ModelSettingsSnapshot 解码器）。
 		"modelSettings": map[string]any{
-			"subagents":       state.SubagentSettingsSnapshot(st.Dir),
-			"picker":          state.PickerSnapshot(st.Dir),
-			"toolResultSpill": state.ToolResultSpillSnapshot(st.Dir),
+			"subagents": state.SubagentSettingsSnapshot(st.Dir),
+			"picker":    state.PickerSnapshot(st.Dir),
 			// 视觉卡数据源：enabled/engine/effort/引擎列表/下载状态。
 			"visionBridge": visionBridgeSnapshot(st, reg),
 		},
@@ -300,7 +304,7 @@ func controlJSON(st *state.State, reg *registry.Registry) error {
 }
 
 func orderedProviderIDs(reg *registry.Registry) []string {
-	return []string{"zai-coding", "opencode-go"}
+	return []string{"zai-coding", "opencode-go", "litellm"}
 }
 
 // controlService：App 化后的服务面 —— 不再经 launchd，直接管进程。
@@ -474,7 +478,47 @@ func controlProvidersEnable(st *state.State, reg *registry.Registry, ids []strin
 		return err
 	}
 	fmt.Printf("enabled providers: %s\n", strings.Join(current, ", "))
-	fmt.Println("republish the catalog by re-running install")
+	fmt.Println("republish the catalog with `control apply` (tray does this automatically)")
+	return nil
+}
+
+// controlProvidersSet 是托盘开关的写路径：`set <id> on|off`。与
+// controlProvidersEnable（只追加）不同，这里整体重写选择 —— 关闭即从
+// enabled-providers.json 移除。变体 id 归一到家族主 id（协议变体与主
+// provider 一起启停，见 state.ProviderEnabled）。
+func controlProvidersSet(st *state.State, reg *registry.Registry, id string, on bool) error {
+	if reg.Providers[id] == nil {
+		canonical := reg.CanonicalProviderID(id)
+		if reg.Providers[canonical] == nil {
+			return fmt.Errorf("unknown provider %q", id)
+		}
+		id = canonical
+	}
+	current := st.EnabledProviders()
+	next := make([]string, 0, len(current)+1)
+	found := false
+	for _, existing := range current {
+		if existing == id {
+			found = true
+			if on {
+				next = append(next, existing)
+			}
+			continue
+		}
+		next = append(next, existing)
+	}
+	if on && !found {
+		next = append(next, id)
+	}
+	if err := st.SetEnabledProviders(next); err != nil {
+		return err
+	}
+	stateText := "disabled"
+	if on {
+		stateText = "enabled"
+	}
+	fmt.Printf("provider %s: %s (%d selected)\n", id, stateText, len(next))
+	fmt.Println("run `control apply` to republish the catalog (tray does this automatically)")
 	return nil
 }
 
@@ -528,6 +572,9 @@ const configTemplate = `# Model Router 凭证配置（Claude Code 式）。
 
 [opencode-go]
 # api_key = "..."
+
+[litellm]
+# api_key = "sk-..."
 `
 
 // controlConfig：config 子命令。init —— 文件不存在则写模板（0600）
@@ -564,6 +611,13 @@ func controlConfig(st *state.State, args []string) error {
 func controlReload(st *state.State, reg *registry.Registry) error {
 	if err := st.ConfigParseError(); err != nil {
 		return fmt.Errorf("config.toml: %w", err)
+	}
+	// 覆盖层可能在本命令内刚被改写（models add/remove/sync 先写
+	// user-models.json 再走到这里）——重载一次注册表，catalog 重发布
+	// 必须看到最新条目，而不是命令启动时的快照（2026-08-20 实发：
+	// models add litellm 后 catalog 仍 13 条，新模型被静默漏掉）。
+	if fresh, err := registry.LoadWithOverlay(st.Dir, ""); err == nil {
+		reg = fresh
 	}
 	enabled := map[string]bool{}
 	for _, id := range st.EnabledProviders() {
@@ -791,38 +845,6 @@ func controlPicker(st *state.State, reg *registry.Registry, args []string) error
 	return printSnapshot()
 }
 
-// controlToolResultSpill：截断开关面（App 设置页的开关走这里）。
-// 开关与阈值读的是状态文件、服务端逐请求读取 —— 改完下一回合即生效，
-// 无需重启服务。max-bytes 调整截断阈值（下限 1024 字节）。
-func controlToolResultSpill(st *state.State, args []string) error {
-	if len(args) >= 2 && args[0] == "max-bytes" {
-		n, err := strconv.Atoi(args[1])
-		if err != nil {
-			return fmt.Errorf("usage: control tool-result-spill max-bytes <bytes>")
-		}
-		if err := state.SetToolResultSpillMaxBytes(st.Dir, n); err != nil {
-			return err
-		}
-	} else {
-		action := "status"
-		if len(args) > 0 {
-			action = args[0]
-		}
-		switch action {
-		case "status":
-		case "on", "off":
-			if err := state.SetToolResultSpillEnabled(st.Dir, action == "on"); err != nil {
-				return err
-			}
-		default:
-			return fmt.Errorf("usage: control tool-result-spill status|on|off|max-bytes <bytes>")
-		}
-	}
-	raw, _ := json.MarshalIndent(state.ToolResultSpillSnapshot(st.Dir), "", "  ")
-	fmt.Println(string(raw))
-	return nil
-}
-
 // controlModels：动态模型注册面。
 //
 //	sync [PROVIDER]   发现+注册（无参数=所有已启用且有凭证的 provider）
@@ -877,10 +899,11 @@ func controlModels(st *state.State, reg *registry.Registry, args []string) error
 		fmt.Printf("removed: %s\n", args[1])
 		return nil
 	case "add":
-		if len(args) < 3 {
-			return fmt.Errorf("usage: control models add PROVIDER <upstream-model-id>")
+		overrides, positional := parseModelAddFlags(args[1:])
+		if len(positional) < 2 {
+			return fmt.Errorf("usage: control models add PROVIDER <upstream-model-id> [--efforts minimal,high] [--default-effort high] [--context-window 1048576]")
 		}
-		return runModelSync(st, reg, args[1], args[2])
+		return runModelSync(st, reg, positional[0], positional[1], overrides)
 	case "sync":
 		targets := args[1:]
 		if action == "add" {
@@ -936,7 +959,7 @@ func runModelSyncAll(st *state.State, reg *registry.Registry, targets []string) 
 }
 
 // runModelSync 手动注册单个模型（不经过货架对照，直接建模）。
-func runModelSync(st *state.State, reg *registry.Registry, providerID, upstreamID string) error {
+func runModelSync(st *state.State, reg *registry.Registry, providerID, upstreamID string, overrides discover.ModelOverrides) error {
 	p := reg.Providers[reg.CanonicalProviderID(providerID)]
 	if p == nil {
 		return fmt.Errorf("unknown provider %q", providerID)
@@ -948,7 +971,10 @@ func runModelSync(st *state.State, reg *registry.Registry, providerID, upstreamI
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	entry := discover.BuildEntry(reg, p, upstreamID, st.Dir, ctx)
+	// 单模型注册同样采信上游自报元数据（部署级真值）；货架拉不到
+	// （私有模型未列出、断网）就回落本地猜测链，注册本身不受阻。
+	self := discover.FetchSelfReport(ctx, &http.Client{Timeout: 20 * time.Second}, providerBaseURL(st, p), credential, upstreamID)
+	entry := discover.BuildEntry(reg, p, upstreamID, st.Dir, ctx, self, overrides)
 	entries := registry.ReadUserModels(st.Dir)
 	for _, e := range entries {
 		if e.Model.Slug == entry.Model.Slug {
@@ -966,6 +992,47 @@ func runModelSync(st *state.State, reg *registry.Registry, providerID, upstreamI
 	}
 	signalServerRegistryReload()
 	return nil
+}
+
+// parseModelAddFlags 从 models add 参数里分离覆盖项与位置参数：
+// 位置参数是 PROVIDER 与上游模型 ID，--efforts/--default-effort/
+// --context-window 各取一个后随值。覆盖值与位置参数可任意交错，
+// 缺值的开关按原样留在位置参数里（后续 provider 校验自然报错）。
+func parseModelAddFlags(args []string) (discover.ModelOverrides, []string) {
+	var ov discover.ModelOverrides
+	var positional []string
+	for i := 0; i < len(args); i++ {
+		takeValue := func() (string, bool) {
+			if i+1 >= len(args) {
+				return "", false
+			}
+			i++
+			return args[i], true
+		}
+		switch args[i] {
+		case "--efforts":
+			if v, ok := takeValue(); ok {
+				for _, part := range strings.Split(v, ",") {
+					if part = strings.TrimSpace(part); part != "" {
+						ov.Efforts = append(ov.Efforts, part)
+					}
+				}
+			}
+		case "--default-effort":
+			if v, ok := takeValue(); ok {
+				ov.DefaultEffort = strings.TrimSpace(v)
+			}
+		case "--context-window":
+			if v, ok := takeValue(); ok {
+				if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+					ov.ContextWindow = n
+				}
+			}
+		default:
+			positional = append(positional, args[i])
+		}
+	}
+	return ov, positional
 }
 
 // signalServerRegistryReload 向 serve 进程发 SIGUSR1（读 router.pid）。

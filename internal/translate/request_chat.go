@@ -45,6 +45,13 @@ type ChatRequest struct {
 	// "invoked with incompatible payload"（2026-08-15 deepseek 子代理
 	// 实发事故：模型自造 {"cmd"/"command"} 载荷三连击穿）。
 	CustomTools []string
+	// OmittedItemTypes / OmittedPartTypes 记录翻译中因类型未知而被
+	// 降级（item 占位符替换 / part 丢弃）的形状名。非空说明客户端
+	// 协议出现了翻译器不认识的类型，内容可能静默丢失——server 层
+	// 据此打告警日志（2026-08-18 agent_message 任务书被占位符吞掉的
+	// 事故全程 HTTP 200、零错误线索，观测位是为下一次事故准备的）。
+	OmittedItemTypes []string
+	OmittedPartTypes []string
 }
 
 // TranslateToChat 把一个 Responses 请求体翻译成 chat-completions 请求。
@@ -101,6 +108,7 @@ func TranslateToChat(responses map[string]any) (*ChatRequest, error) {
 		}}
 	}
 	pendingReasoning := ""
+	omissions := &omissionLog{}
 	for _, raw := range input {
 		item, ok := raw.(map[string]any)
 		if !ok {
@@ -115,7 +123,7 @@ func TranslateToChat(responses map[string]any) (*ChatRequest, error) {
 			}
 			continue
 		}
-		expanded := inputItemToMessages(item)
+		expanded := inputItemToMessages(item, omissions)
 		if pendingReasoning != "" {
 			consumed := false
 			for _, message := range expanded {
@@ -137,8 +145,10 @@ func TranslateToChat(responses map[string]any) (*ChatRequest, error) {
 	}
 
 	// tools：Responses 的扁平 function 形状 → chat 的嵌套 function 形状。
-	// namespace 工具（协作运行时、app 工具集、MCP）chat 上游无法表达，
-	// M1 与 LiteLLM 行为一致地丢弃，扁平 function（shell 等核心工具）保留。
+	// namespace / mcp 形态的协作运行时、app 工具集、MCP server 已在
+	// server 管线（routed.go 的 FlattenNamespaceTools）拍平成普通
+	// function 到达这里；此处仍见 namespace/mcp 只可能是绕过管线的
+	// 直连调用，兜底丢弃。扁平 function（shell 等核心工具）保留。
 	if tools, ok := responses["tools"].([]any); ok {
 		var chatTools []any
 		for _, raw := range tools {
@@ -184,7 +194,8 @@ func TranslateToChat(responses map[string]any) (*ChatRequest, error) {
 			case "web_search", "web_search_preview":
 				// chat-completions 上游没有对应物；丢弃。
 			case "namespace", "mcp":
-				// M3 移植完整的 namespace 拍平；M1 丢弃。
+				// 正常流量在 server 管线已拍平为普通 function，
+				// 这里只兜未过管线的直连调用。
 			}
 		}
 		if len(chatTools) > 0 {
@@ -202,6 +213,8 @@ func TranslateToChat(responses map[string]any) (*ChatRequest, error) {
 	if len(messages) > 0 {
 		out["messages"] = messages
 	}
+	chat.OmittedItemTypes = omissions.items
+	chat.OmittedPartTypes = omissions.parts
 	return chat, nil
 }
 
@@ -230,17 +243,18 @@ func translateToolChoice(tc any) any {
 // inputItemToMessages 把一个 Responses input item 展开成零或多个
 // chat messages。function_call 展开成带 tool_calls 的 assistant 消息，
 // 后续的 CoalesceAssistantMessages 会把它与前一条 assistant 合并。
-func inputItemToMessages(item map[string]any) []map[string]any {
+// omissions 记录降级为占位符的未知类型，供调用方告警。
+func inputItemToMessages(item map[string]any, omissions *omissionLog) []map[string]any {
 	itemType, _ := item["type"].(string)
 	switch itemType {
 	case "":
 		// 无 type 的 item 按 role 当作 message 处理（宽容历史形态）。
 		if _, ok := item["role"]; ok {
-			return messageItemToMessages(item)
+			return messageItemToMessages(item, omissions)
 		}
 		return nil
 	case "message":
-		return messageItemToMessages(item)
+		return messageItemToMessages(item, omissions)
 	case "function_call":
 		name, _ := item["name"].(string)
 		args, _ := item["arguments"].(string)
@@ -299,9 +313,13 @@ func inputItemToMessages(item map[string]any) []map[string]any {
 				"type": "text", "text": summaryPrefix + "\n\n" + summary,
 			}},
 		}}
+	case "agent_message":
+		return agentMessageItemToMessages(item, omissions)
 	default:
 		// web_search_call、local_shell_call 等执行记录降级为
-		// 文本占位，保留历史结构可读。
+		// 文本占位，保留历史结构可读。内容承载型 item 落到这里
+		// 就是静默丢内容（agent_message 事故），必须留名给上层告警。
+		omissions.item(itemType)
 		return []map[string]any{{
 			"role": "assistant",
 			"content": []any{map[string]any{
@@ -312,7 +330,83 @@ func inputItemToMessages(item map[string]any) []map[string]any {
 	}
 }
 
-func messageItemToMessages(item map[string]any) []map[string]any {
+// omissionLog 收集翻译期因类型未知而被降级的形状名（去重）。
+// translate 层保持无 IO 依赖，只负责收集；日志由 server 层落地。
+type omissionLog struct {
+	items []string
+	parts []string
+}
+
+func (o *omissionLog) item(kind string) {
+	o.items = appendUnique(o.items, kind)
+}
+
+func (o *omissionLog) part(kind string) {
+	o.parts = appendUnique(o.parts, kind)
+}
+
+func appendUnique(list []string, value string) []string {
+	for _, existing := range list {
+		if existing == value {
+			return list
+		}
+	}
+	return append(list, value)
+}
+
+// agentMessageItemToMessages 把 Codex 多代理协作的跨代理消息
+// （spawn/followup 的 NEW_TASK 任务书、send_message 与 RESULT 回传）
+// 映射为 user 消息。content 的 input_text part 是投递信封，
+// encrypted_content part 承载任务正文——Codex 自产自销的透传载体，
+// 实测为明文（2026-08-18 rollout 取证），无需解密即可收编。
+//
+// 绝不能落入 default 的占位符分支：子代理的整个任务书只有这一个
+// item，占位符会让 explorer 在任务盲状态下空转或臆测任务
+// （2026-08-18 实发：两个 explorer 分别"请求重发任务"和
+// 臆测出 onboardingv2 乱搜两分钟）。历史回放时正文也可能直接
+// 放 message/text 字符串字段，做兜底；全部无可读文本则丢弃，
+// 与空消息策略一致。
+func agentMessageItemToMessages(item map[string]any, omissions *omissionLog) []map[string]any {
+	var texts []string
+	if parts, ok := item["content"].([]any); ok {
+		for _, raw := range parts {
+			part, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			var text string
+			switch part["type"] {
+			case "input_text", "output_text", "text":
+				text, _ = part["text"].(string)
+			case "encrypted_content":
+				text, _ = part["encrypted_content"].(string)
+			default:
+				if partType, _ := part["type"].(string); partType != "" {
+					omissions.part(partType)
+				}
+			}
+			if strings.TrimSpace(text) != "" {
+				texts = append(texts, text)
+			}
+		}
+	}
+	if len(texts) == 0 {
+		for _, key := range []string{"message", "text"} {
+			if text, _ := item[key].(string); strings.TrimSpace(text) != "" {
+				texts = append(texts, text)
+			}
+		}
+	}
+	if len(texts) == 0 {
+		return nil
+	}
+	return []map[string]any{{
+		"role":    "user",
+		"content": strings.Join(texts, "\n"),
+	}}
+}
+
+func messageItemToMessages(item map[string]any, omissions *omissionLog) []map[string]any {
 	role, _ := item["role"].(string)
 	switch role {
 	case "user", "system", "developer":
@@ -329,7 +423,7 @@ func messageItemToMessages(item map[string]any) []map[string]any {
 	case string:
 		msg["content"] = content
 	case []any:
-		msg["content"] = translateContentParts(content)
+		msg["content"] = translateContentParts(content, omissions)
 	default:
 		msg["content"] = ""
 	}
@@ -352,8 +446,8 @@ func messageItemToMessages(item map[string]any) []map[string]any {
 
 // translateContentParts 把 Responses content parts 翻成 chat parts。
 // input_text/output_text/text → text；input_image → image_url（留给
-// vision 路径）；其余降级为文本占位。
-func translateContentParts(parts []any) []any {
+// vision 路径）；未知类型降级为文本占位并记入 omissions。
+func translateContentParts(parts []any, omissions *omissionLog) []any {
 	out := make([]any, 0, len(parts))
 	for _, raw := range parts {
 		part, ok := raw.(map[string]any)
@@ -391,9 +485,14 @@ func translateContentParts(parts []any) []any {
 				})
 			}
 		case "encrypted_content":
-			// 密文载荷 chat 上游无法消费，丢弃（subagent relay 在 M3
-			// 负责在翻译前解出明文）。
+			// message item 的密文 part 丢弃：server 层 agentrelay
+			// 已在翻译前把协作载荷换成明文（agent_message 的明文
+			// 收编在 agentMessageItemToMessages），这里只剩 reasoning
+			// 回放类的真密文，chat 上游无法消费。
 		default:
+			if partType, _ := part["type"].(string); partType != "" {
+				omissions.part(partType)
+			}
 			if text, ok := part["text"].(string); ok && strings.TrimSpace(text) != "" {
 				out = append(out, map[string]any{"type": "text", "text": text})
 			}

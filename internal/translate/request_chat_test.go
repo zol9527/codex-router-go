@@ -194,27 +194,105 @@ func TestCompactionItemBecomesUserMessage(t *testing.T) {
 	}
 }
 
-// GLM effort 阶梯：请求档钳到模型声明档。
-func TestGLMEffort(t *testing.T) {
+// agent_message（Codex 多代理的 NEW_TASK 任务书 / RESULT 回传）必须
+// 完整翻译成 user 消息：信封 input_text 与明文 encrypted_content 载荷
+// 都要保留。落进 default 占位符分支会让子代理收不到任务
+// （2026-08-18 explorer 任务盲事故的根因）。
+func TestAgentMessageBecomesUserMessage(t *testing.T) {
+	input := obj(t, `{
+		"input": [
+			{"type":"agent_message","id":"amsg_1","author":"/root/repo_compare","recipient":"/root/repo_compare/explore_opencodex_remote",
+			 "content":[
+				{"type":"input_text","text":"Message Type: NEW_TASK\nTask name: /root/repo_compare/explore_opencodex_remote\nSender: /root/repo_compare\nPayload:\n"},
+				{"type":"encrypted_content","encrypted_content":"任务：核实 https://github.com/lidge-jun/opencodex 的依赖与内存占用。"}
+			 ]}
+		]
+	}`)
+	chat, _ := TranslateToChat(input)
+	messages := chat.Body["messages"].([]map[string]any)
+	if len(messages) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(messages))
+	}
+	if messages[0]["role"] != "user" {
+		t.Errorf("agent_message should be a user message, got %v", messages[0]["role"])
+	}
+	text, _ := messages[0]["content"].(string)
+	if !strings.Contains(text, "NEW_TASK") || !strings.Contains(text, "核实 https://github.com/lidge-jun/opencodex") {
+		t.Errorf("agent_message envelope/payload lost: %q", text)
+	}
+}
+
+// 回放兜底：历史形态把正文直接放 message 字符串字段；
+// 全空载荷丢弃而不是生成占位符。
+func TestAgentMessageReplayAndEmptyFallbacks(t *testing.T) {
+	chat, _ := TranslateToChat(obj(t, `{
+		"input": [
+			{"type":"agent_message","message":"我先核对两边的一手证据。"},
+			{"type":"agent_message","content":[{"type":"input_text","text":"   "}]}
+		]
+	}`))
+	messages := chat.Body["messages"].([]map[string]any)
+	if len(messages) != 1 {
+		t.Fatalf("expected 1 message (empty dropped), got %d", len(messages))
+	}
+	if text, _ := messages[0]["content"].(string); !strings.Contains(text, "一手证据") {
+		t.Errorf("replayed agent_message text lost: %q", text)
+	}
+}
+
+// 翻译期降级观测：未知 item / part 类型必须记入 ChatRequest 的
+// Omitted 集合（去重），server 层据此告警——静默占位符没有日志
+// 就无迹可循（2026-08-18 agent_message 事故的教训）。
+func TestOmittedTypesCollected(t *testing.T) {
+	chat, _ := TranslateToChat(obj(t, `{
+		"input": [
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"},{"type":"mystery_part","text":"x"}]},
+			{"type":"mystery_item"},
+			{"type":"mystery_item"}
+		]
+	}`))
+	if len(chat.OmittedItemTypes) != 1 || chat.OmittedItemTypes[0] != "mystery_item" {
+		t.Errorf("OmittedItemTypes = %v, want single deduped mystery_item", chat.OmittedItemTypes)
+	}
+	if len(chat.OmittedPartTypes) != 1 || chat.OmittedPartTypes[0] != "mystery_part" {
+		t.Errorf("OmittedPartTypes = %v, want single mystery_part", chat.OmittedPartTypes)
+	}
+}
+
+// effort 区间映射：请求档归到绝对距离最近的声明档（平手取低），
+// 顶档取模型最高声明档。相比旧 glmEffort 的"就近向下"语义，中点
+// 归属保意图（deepseek [minimal,high] 收 medium → high，不再静默
+// 塌到 minimal）；未知/缺失请求档返回 ""（调用方删参或透传，不再
+// 冒充 high —— 让模型自身默认接管）。
+func TestClampEffort(t *testing.T) {
 	cases := []struct {
 		requested string
 		levels    []string
 		want      string
 	}{
+		// GLM-5.3 [low, high, max]：与旧"就近向下"完全一致（medium 平手取低）
 		{"low", []string{"low", "high", "max"}, "low"},
 		{"medium", []string{"low", "high", "max"}, "low"},
 		{"high", []string{"low", "high", "max"}, "high"},
 		{"xhigh", []string{"low", "high", "max"}, "max"},
 		{"ultra", []string{"low", "high", "max"}, "max"},
-		{"low", []string{"high", "max"}, "high"}, // 低于下限落在下限
-		{"max", []string{"high", "max"}, "max"},
-		{"high", []string{"max"}, "max"},           // 单档模型由外层删参数，钳制函数钳到唯一档
-		{"bogus", []string{"low", "high"}, "high"}, // 未知值按 high 对待（Node 版行为）
-		{"", []string{"low", "high"}, "high"},      // 缺失同样按 high
+		{"minimal", []string{"low", "high", "max"}, "low"}, // 低于下限落在下限
+		// deepseek [minimal, high]：区间语义的核心场景（2026-08-20
+		// explorer spawn 三连拒的直接解法）
+		{"low", []string{"minimal", "high"}, "minimal"},
+		{"medium", []string{"minimal", "high"}, "high"}, // 距 high 1 级、距 minimal 2 级
+		{"high", []string{"minimal", "high"}, "high"},
+		{"xhigh", []string{"minimal", "high"}, "high"}, // 顶档取最高声明档
+		{"minimal", []string{"minimal", "high"}, "minimal"},
+		// 单档/异常
+		{"high", []string{"max"}, "max"},              // 单档模型由外层删参数，钳制函数钳到唯一档
+		{"bogus", []string{"low", "high"}, ""},        // 未知值不再冒充 high（语义变化）
+		{"", []string{"low", "high"}, ""},             // 缺失同样返回空
+		{"high", []string{"turbo", "ultra"}, "ultra"}, // 阶梯外的声明名被过滤，只认 ultra
 	}
 	for _, tc := range cases {
-		if got := glmEffort(tc.requested, tc.levels); got != tc.want {
-			t.Errorf("glmEffort(%q, %v) = %q, want %q", tc.requested, tc.levels, got, tc.want)
+		if got := ClampEffort(tc.requested, tc.levels); got != tc.want {
+			t.Errorf("ClampEffort(%q, %v) = %q, want %q", tc.requested, tc.levels, got, tc.want)
 		}
 	}
 }
@@ -422,6 +500,47 @@ func TestCustomToolInputFallbacks(t *testing.T) {
 	}
 }
 
+// 空载荷 custom 调用不算内容（2026-08-17 GLM-5.3 大上下文退化事故：
+// 模型反复发空参数 exec，Codex needs_follow_up 无限续轮 200+ 次）。
+// arguments 缺失、字面 "{}"、"{"input":""}" 三种形态都必须判空。
+func TestEmptyCustomToolCallHasNoContent(t *testing.T) {
+	cases := map[string]string{
+		"missing":     `{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_e","function":{"name":"exec"}}]}}]}`,
+		"empty-obj":   `{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_e","function":{"name":"exec","arguments":"{}"}}]}}]}`,
+		"empty-input": `{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_e","function":{"name":"exec","arguments":"{\"input\":\"\"}"}}]}}]}`,
+		"blank-input": `{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_e","function":{"name":"exec","arguments":"{\"input\":\"  \"}"}}]}}]}`,
+		"whitespace":  `{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_e","function":{"name":"exec","arguments":"   "}}]}}]}`,
+	}
+	for name, chunk := range cases {
+		translator := NewChatToResponsesSSE("", "glm").WithCustomTools([]string{"exec"})
+		translator.Created()
+		translator.Feed(chunk)
+		translator.Feed(`{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`)
+		translator.Feed("[DONE]")
+		if translator.HasContent() {
+			t.Errorf("%s: 空载荷 custom 调用不算内容", name)
+		}
+	}
+
+	// 对照一：非空载荷的 custom 调用照旧算内容。
+	withPayload := NewChatToResponsesSSE("", "glm").WithCustomTools([]string{"exec"})
+	withPayload.Created()
+	withPayload.Feed(`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_f","function":{"name":"exec","arguments":"{\"input\":\"ls\"}"}}]}}]}`)
+	withPayload.Feed("[DONE]")
+	if !withPayload.HasContent() {
+		t.Error("带载荷的 custom 调用必须算内容")
+	}
+
+	// 对照二：普通 function 调用参数为空是合法无参形态，照旧算内容。
+	plain := NewChatToResponsesSSE("", "glm")
+	plain.Created()
+	plain.Feed(`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_g","function":{"name":"shell","arguments":""}}]}}]}`)
+	plain.Feed("[DONE]")
+	if !plain.HasContent() {
+		t.Error("无参 function 调用是合法形态，必须算内容")
+	}
+}
+
 // 非流式路径：custom 调用出现在 completed 的 output 数组里。
 func TestCustomToolCallNonStream(t *testing.T) {
 	body := obj(t, `{
@@ -444,5 +563,25 @@ func TestCustomToolCallNonStream(t *testing.T) {
 	}
 	if item["call_id"] != "call_y" {
 		t.Errorf("custom_tool_call call_id must survive, got %v", item["call_id"])
+	}
+}
+
+// 空 profile（自定义模型）的 effort 区间钳制：声明 [minimal, high] 的
+// 模型收到 medium 请求时发上游 high（距离最近档），杜绝"Codex 词汇
+// 档位上游不认"的 400；未声明档位的模型保持原样透传。
+func TestApplyRequestProfileDefaultClampsEffort(t *testing.T) {
+	body := map[string]any{"model": "volcengine/deepseek-v4-flash"}
+	ApplyRequestProfile(body, "medium", &registry.Model{
+		Slug: "litellm/deepseek", RequestProfile: "",
+		ReasoningLevels: []registry.ReasoningLevel{{Effort: "minimal"}, {Effort: "high"}},
+	})
+	if got := body["reasoning_effort"]; got != "high" {
+		t.Errorf("medium must clamp to high, got %v", got)
+	}
+
+	body = map[string]any{"model": "plain"}
+	ApplyRequestProfile(body, "high", &registry.Model{Slug: "litellm/plain", RequestProfile: ""})
+	if got := body["reasoning_effort"]; got != "high" {
+		t.Errorf("undeclared levels must pass through, got %v", got)
 	}
 }

@@ -3,6 +3,86 @@ import SwiftUI
 
 private let islandBezel = Color(red: 0.004, green: 0.005, blue: 0.007)
 
+/// 悬浮岛/托盘装饰动画的低频驱动工具。
+///
+/// 这些动画此前用 `withAnimation(.repeatForever)` 隐式驱动，SwiftUI 会以
+/// 显示刷新率（ProMotion 最高 120fps）持续重算 ViewGraph 布局——这是托盘
+/// App 生成态 CPU 居高不下的主因（思考球在 529a3c7 已单独节流，但光晕/
+/// 扫光/跑马灯等隐式动画不在其列）。这里统一改为 `TimelineView` 显式驱动：
+/// 数值由时间纯函数计算，帧率上限 12fps，空闲态走静态视图分支。
+///
+/// schedule 一律用 `.periodic` 而非 `.animation(minimumInterval:paused:)`：
+/// 后者只节流 content 求值，渲染循环仍以显示帧率跑 ViewGraph render，
+/// 每 vsync 拖 NSHostingView 所在窗口全树 AppKit 布局（2026-08-18 实测
+/// 主窗口生成态 17-27% CPU，采样热点 UpdateCycle → CA::Transaction::commit
+/// → NSHostingView.layout → ViewGraphRootValueUpdater.render）。`.periodic`
+/// 的静态分支则完全不挂时间线。
+///
+/// 注意 `.periodic` 也不是终点：动画活跃期间（tick 12fps）同样会拖
+/// hosting view 以显示帧率跑 layout（同日二轮实测仍有 16-18%，更新栈
+/// 直指 StatusBeacon 的时间线）——TimelineView 与 AppKit 窗口的互操作
+/// 即如此。主窗口 StatusBeacon 已退回 CALayer 动画（render server 进程
+/// 插值，App 零帧成本，见 ModelRouterTrayApp.swift BreathingBeaconDot）。
+/// 岛内这些视图在岛关闭时不实例化；若日后常开岛仍见 CPU 高，按同一
+/// 思路迁到 CA 层。
+enum IslandAnimation {
+  /// 18px 级别的装饰元素 12fps 足够，与 ThinkingOrbCanvas 的节流一致。
+  static let framesPerSecond: Double = 12
+
+  /// 呼吸相位：0 → 1 → 0 的余弦往返，近似原 easeInOut autoreverse 的观感。
+  static func breathPhase(at date: Date, duration: Double) -> Double {
+    guard duration > 0 else { return 0 }
+    let t = normalizedCycle(date.timeIntervalSinceReferenceDate, duration)
+    return 0.5 - 0.5 * cos(2 * .pi * t / duration)
+  }
+
+  /// 线性循环进度 0..<1，用于旋转扫光这类单向循环动画。
+  static func loopProgress(at date: Date, duration: Double) -> Double {
+    guard duration > 0 else { return 0 }
+    return normalizedCycle(date.timeIntervalSinceReferenceDate, duration) / duration
+  }
+
+  /// easeInOut 的解析近似（smoothstep），跑马灯手工插值用。
+  static func easeInOut(_ progress: Double) -> Double {
+    let clamped = min(1, max(0, progress))
+    return clamped * clamped * (3 - 2 * clamped)
+  }
+
+  /// 跑马灯位移纯函数：前进 → 停 → 回退 → 停 的循环，范围 [-overflow, 0]。
+  static func marqueeOffset(elapsed: Double, overflow: Double, travelDuration: Double, pause: Double) -> Double {
+    let overflow = max(0, overflow)
+    guard overflow > 2 else { return 0 }
+    let travel = max(2.8, travelDuration)
+    let cycle = 2 * travel + 2 * pause
+    let t = normalizedCycle(elapsed, cycle)
+    if t < travel {
+      return -overflow * easeInOut(t / travel)
+    }
+    if t < travel + pause {
+      return -overflow
+    }
+    if t < 2 * travel + pause {
+      return -overflow * (1 - easeInOut((t - travel - pause) / travel))
+    }
+    return 0
+  }
+
+  /// 弹窗 footer 呼吸点的启停判定（含无障碍减弱动态）。
+  static func beaconBreathing(state: RouterActivityState, reduceMotion: Bool) -> Bool {
+    !reduceMotion && (state == .generating || state == .starting)
+  }
+
+  /// 岛屿边缘光效的启停判定：idle 静态化，仅 starting/generating 驱动时间线。
+  static func glowAnimating(state: RouterActivityState, reduceMotion: Bool) -> Bool {
+    !reduceMotion && (state == .starting || state == .generating)
+  }
+
+  private static func normalizedCycle(_ value: Double, _ duration: Double) -> Double {
+    let remainder = value.truncatingRemainder(dividingBy: duration)
+    return remainder < 0 ? remainder + duration : remainder
+  }
+}
+
 private struct IslandActivitySession: Identifiable {
   let id: String
   let name: String
@@ -1033,60 +1113,72 @@ private struct BouncingSessionName: View {
 
   @State private var containerWidth: CGFloat = 0
   @State private var textWidth: CGFloat = 0
-  @State private var offset: CGFloat = 0
-  @State private var animationTask: Task<Void, Never>?
 
   var body: some View {
     GeometryReader { geometry in
-      Text(text)
-        .font(.system(size: fontSize, weight: weight, design: .rounded))
-        .foregroundStyle(.white.opacity(0.92))
-        .fixedSize(horizontal: true, vertical: false)
-        .background {
-          GeometryReader { textGeometry in
-            Color.clear.preference(key: SessionTextWidthKey.self, value: textGeometry.size.width)
+      // 滚动位移由 marqueeOffset 纯函数按时间计算，12fps 上限（见
+      // IslandAnimation 注释）。schedule 用 .periodic（.animation 只节流
+      // 求值、渲染循环仍全帧率，见 StatusBeacon 注释）；无溢出/减弱动态
+      // 时走静态分支，零时间线零渲染。
+      Group {
+        if isMarqueeRunning {
+          TimelineView(
+            .periodic(from: .now, by: 1 / IslandAnimation.framesPerSecond)
+          ) { context in
+            marqueeText(offset: marqueeOffset(at: context.date))
           }
+        } else {
+          marqueeText(offset: 0)
         }
-        .offset(x: offset)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .onAppear { updateContainerWidth(geometry.size.width) }
-        .onChange(of: geometry.size.width) { updateContainerWidth($0) }
+      }
+      .onAppear { updateContainerWidth(geometry.size.width) }
+      .onChange(of: geometry.size.width) { updateContainerWidth($0) }
     }
     .frame(height: max(14, fontSize + 4))
     .clipped()
     .onPreferenceChange(SessionTextWidthKey.self) { width in
       textWidth = width
-      restartAnimation()
     }
-    .onChange(of: text) { _ in restartAnimation() }
-    .onChange(of: reduceMotion) { _ in restartAnimation() }
-    .onDisappear { animationTask?.cancel() }
     .accessibilityLabel(text)
+  }
+
+  private func marqueeText(offset: CGFloat) -> some View {
+    Text(text)
+      .font(.system(size: fontSize, weight: weight, design: .rounded))
+      .foregroundStyle(.white.opacity(0.92))
+      .fixedSize(horizontal: true, vertical: false)
+      .background {
+        GeometryReader { textGeometry in
+          Color.clear.preference(key: SessionTextWidthKey.self, value: textGeometry.size.width)
+        }
+      }
+      .offset(x: offset)
+      .frame(maxWidth: .infinity, alignment: .leading)
+  }
+
+  private var overflow: CGFloat {
+    max(0, textWidth - containerWidth)
+  }
+
+  private var isMarqueeRunning: Bool {
+    !reduceMotion && containerWidth > 0 && overflow > 2
+  }
+
+  private func marqueeOffset(at date: Date) -> CGFloat {
+    guard isMarqueeRunning else { return 0 }
+    return CGFloat(
+      IslandAnimation.marqueeOffset(
+        elapsed: date.timeIntervalSinceReferenceDate,
+        overflow: Double(overflow),
+        travelDuration: Double(overflow / 18),
+        pause: 0.7
+      )
+    )
   }
 
   private func updateContainerWidth(_ width: CGFloat) {
     guard abs(containerWidth - width) > 0.5 else { return }
     containerWidth = width
-    restartAnimation()
-  }
-
-  private func restartAnimation() {
-    animationTask?.cancel()
-    withAnimation(nil) { offset = 0 }
-    let overflow = max(0, textWidth - containerWidth)
-    guard !reduceMotion, containerWidth > 0, overflow > 2 else { return }
-    animationTask = Task { @MainActor in
-      try? await Task.sleep(nanoseconds: 850_000_000)
-      guard !Task.isCancelled else { return }
-      let travelDuration = max(2.8, Double(overflow / 18))
-      while !Task.isCancelled {
-        withAnimation(.easeInOut(duration: travelDuration)) { offset = -overflow }
-        try? await Task.sleep(nanoseconds: UInt64((travelDuration + 0.7) * 1_000_000_000))
-        guard !Task.isCancelled else { return }
-        withAnimation(.easeInOut(duration: travelDuration)) { offset = 0 }
-        try? await Task.sleep(nanoseconds: UInt64((travelDuration + 0.7) * 1_000_000_000))
-      }
-    }
   }
 }
 
@@ -1312,9 +1404,6 @@ private struct LiveOrb: View {
   @Environment(\.accessibilityReduceMotion) private var reduceMotion
   let state: RouterActivityState
   var count: Int = 0
-  @State private var pulsing = false
-  @State private var rippling = false
-  @State private var effectTask: Task<Void, Never>?
 
   var body: some View {
     ZStack(alignment: .topTrailing) {
@@ -1323,31 +1412,30 @@ private struct LiveOrb: View {
           ThinkingOrbView(
             mode: orbMode,
             reduceMotion: reduceMotion,
+            running: ThinkingOrbView.shouldRunAnimation(state: state),
             size: 18
           )
             .frame(width: 18, height: 18)
         } else {
-          ZStack {
-            Circle()
-              .stroke(state.tint.opacity(0.38), lineWidth: 0.7)
-              .frame(width: 11, height: 11)
-              .scaleEffect(rippling ? (state == .idle ? 2.0 : 2.3) : 0.72)
-              .opacity(rippling ? 0 : (state == .idle ? 0.24 : 0.38))
-            Circle()
-              .fill(state.tint.opacity(orbHaloOpacity))
-              .frame(width: 18, height: 18)
-              .scaleEffect(orbHaloScale)
-            Circle()
-              .fill(state.tint)
-              .frame(width: 8, height: 8)
-              .overlay(Circle().stroke(Color.white.opacity(0.42), lineWidth: 0.6))
-              .scaleEffect(coreScale)
-              .opacity(coreOpacity)
-              .shadow(
-                color: state.tint.opacity(pulsing ? 0.42 : 0.16),
-                radius: pulsing ? 3.5 : 1.2
-              )
+          // starting 兜底状态点：12fps 显式驱动（见 IslandAnimation 注释）。
+          // starting 是瞬态（探活期最长 30s），但路由器掉线期间它会持续
+          // 存在，不能按显示帧率空转。schedule 用 .periodic（.animation
+          // 只节流求值、渲染循环仍全帧率，见 StatusBeacon 注释），
+          // paused 语义由视图分支表达。
+          Group {
+            if isFallbackAnimating {
+              TimelineView(
+                .periodic(from: .now, by: 1 / IslandAnimation.framesPerSecond)
+              ) { context in
+                let w = IslandAnimation.breathPhase(at: context.date, duration: 1.35)
+                let ripple = 1 - pow(1 - IslandAnimation.loopProgress(at: context.date, duration: 1.9), 2)
+                fallbackOrb(w: w, ripple: ripple)
+              }
+            } else {
+              fallbackOrb(w: 0, ripple: 0)
+            }
           }
+          .frame(width: 18, height: 18)
         }
       }
       .frame(width: 18, height: 18)
@@ -1362,11 +1450,34 @@ private struct LiveOrb: View {
           .offset(x: 5, y: -4)
       }
     }
-    .onAppear { animate() }
-    .onChange(of: state) { _ in animate() }
-    .onChange(of: count) { _ in animate() }
-    .onChange(of: reduceMotion) { _ in animate() }
-    .onDisappear { effectTask?.cancel() }
+  }
+
+  private var isFallbackAnimating: Bool {
+    !reduceMotion && state == .starting
+  }
+
+  private func fallbackOrb(w: Double, ripple: Double) -> some View {
+    ZStack {
+      Circle()
+        .stroke(state.tint.opacity(0.38), lineWidth: 0.7)
+        .frame(width: 11, height: 11)
+        .scaleEffect(0.72 + 1.58 * ripple)
+        .opacity(0.38 * (1 - ripple))
+      Circle()
+        .fill(state.tint.opacity(0.13 + 0.11 * w))
+        .frame(width: 18, height: 18)
+        .scaleEffect(0.92 + 0.36 * w)
+      Circle()
+        .fill(state.tint)
+        .frame(width: 8, height: 8)
+        .overlay(Circle().stroke(Color.white.opacity(0.42), lineWidth: 0.6))
+        .scaleEffect(0.88 + 0.28 * w)
+        .opacity(0.84 + 0.16 * w)
+        .shadow(
+          color: state.tint.opacity(0.16 + 0.26 * w),
+          radius: 1.2 + 2.3 * w
+        )
+    }
   }
 
   private var orbMode: ThinkingOrbMode {
@@ -1376,66 +1487,57 @@ private struct LiveOrb: View {
     case .idle, .starting: return .shaping
     }
   }
-
-  private var orbHaloOpacity: Double {
-    if state == .idle { return pulsing ? 0.16 : 0.08 }
-    return pulsing ? 0.24 : 0.13
-  }
-
-  private var orbHaloScale: CGFloat {
-    if state == .idle { return pulsing ? 1.14 : 0.94 }
-    if state == .error { return 1 }
-    return pulsing ? 1.28 : 0.92
-  }
-
-  private var coreScale: CGFloat {
-    if reduceMotion { return 1 }
-    switch state {
-    case .idle:
-      return pulsing ? 1.10 : 0.92
-    case .starting, .generating:
-      return pulsing ? 1.16 : 0.88
-    case .error:
-      return pulsing ? 1.18 : 1
-    }
-  }
-
-  private var coreOpacity: Double {
-    if reduceMotion { return 1 }
-    if state == .idle { return pulsing ? 1 : 0.76 }
-    return pulsing ? 1 : 0.84
-  }
-
-  private func animate() {
-    effectTask?.cancel()
-    withAnimation(nil) {
-      pulsing = false
-      rippling = false
-    }
-    // ThinkingOrbView owns animation for idle, generating, and error. These
-    // state values only affect the fallback status-dot branch used at startup.
-    guard !reduceMotion, state == .starting else { return }
-
-    withAnimation(.easeInOut(duration: 1.35).repeatForever(autoreverses: true)) {
-      pulsing = true
-    }
-    withAnimation(.easeOut(duration: 1.9).repeatForever(autoreverses: false)) {
-      rippling = true
-    }
-  }
 }
 
 private struct StatusGlow: View {
   @Environment(\.accessibilityReduceMotion) private var reduceMotion
   let state: RouterActivityState
 
-  @State private var sweepAngle = -120.0
-  @State private var sweepOpacity = 0.0
-  @State private var breathing = false
+  // error 态的一次性脉冲是 0.8s 瞬态动画，结束后静止，无节流必要。
   @State private var errorPulse = false
   @State private var effectTask: Task<Void, Never>?
 
+  private static let sweepDuration = 3.2
+  private static let startingBreathDuration = 1.8
+  private static let generatingBreathDuration = 1.35
+
   var body: some View {
+    // 呼吸/扫光 12fps 显式驱动，idle 完全静态（原先空闲时 3.2s 呼吸
+    // repeatForever 仍以显示帧率唤醒渲染管线）。schedule 用 .periodic
+    // 而非 .animation(minimumInterval:)：后者只节流 content 求值，渲染
+    // 循环仍以显示帧率跑 ViewGraph render、每 vsync 拖 hosting view 全
+    // 树布局（2026-08-18 主窗口 StatusBeacon 实测 17-27% CPU 的同款
+    // 根因）。原 paused 语义由视图分支表达：非动画态零时间线。
+    Group {
+      if isAnimating {
+        TimelineView(
+          .periodic(from: .now, by: 1 / IslandAnimation.framesPerSecond)
+        ) { context in
+          glowLayers(
+            breath: IslandAnimation.breathPhase(at: context.date, duration: breathDuration),
+            sweepAngle: Self.sweepAngle(at: context.date)
+          )
+        }
+      } else {
+        glowLayers(breath: 0, sweepAngle: -120)
+      }
+    }
+    .onAppear { restartEffects() }
+    .onChange(of: state) { _ in restartEffects() }
+    .onChange(of: reduceMotion) { _ in restartEffects() }
+    .onDisappear { effectTask?.cancel() }
+    .animation(.easeInOut(duration: 0.25), value: state)
+    .accessibilityHidden(true)
+  }
+
+  private static func sweepAngle(at date: Date) -> Double {
+    -120.0 + 360 * IslandAnimation.loopProgress(
+      at: date,
+      duration: Self.sweepDuration
+    )
+  }
+
+  private func glowLayers(breath: Double, sweepAngle: Double) -> some View {
     ZStack(alignment: .topLeading) {
       IslandSilhouette()
         .inset(by: 1)
@@ -1462,30 +1564,32 @@ private struct StatusGlow: View {
         )
         .frame(width: 44, height: 44)
         .offset(x: 1, y: -2)
-        .opacity(localHaloOpacity)
+        .opacity(haloOpacity(breath: breath))
 
-      if sweepOpacity > 0.001 {
+      if state == .generating, !reduceMotion {
         IslandSilhouette()
           .inset(by: 1)
-          .strokeBorder(sweepGradient(angle: .degrees(sweepAngle)), lineWidth: 3)
+          .strokeBorder(self.sweepGradient(angle: .degrees(sweepAngle)), lineWidth: 3)
           .blur(radius: 2.4)
-          .opacity(sweepOpacity * 0.35)
+          .opacity(0.52 * 0.35)
         IslandSilhouette()
           .inset(by: 1)
-          .strokeBorder(sweepGradient(angle: .degrees(sweepAngle)), lineWidth: 1.15)
-          .opacity(sweepOpacity)
+          .strokeBorder(self.sweepGradient(angle: .degrees(sweepAngle)), lineWidth: 1.15)
+          .opacity(0.52)
       }
 
       IslandSilhouette()
         .inset(by: 3.5)
         .strokeBorder(Color.white.opacity(0.035), lineWidth: 0.45)
     }
-    .onAppear { restartEffects() }
-    .onChange(of: state) { _ in restartEffects() }
-    .onChange(of: reduceMotion) { _ in restartEffects() }
-    .onDisappear { effectTask?.cancel() }
-    .animation(.easeInOut(duration: 0.25), value: state)
-    .accessibilityHidden(true)
+  }
+
+  private var isAnimating: Bool {
+    IslandAnimation.glowAnimating(state: state, reduceMotion: reduceMotion)
+  }
+
+  private var breathDuration: Double {
+    state == .starting ? Self.startingBreathDuration : Self.generatingBreathDuration
   }
 
   private var edgeOpacity: Double {
@@ -1505,14 +1609,15 @@ private struct StatusGlow: View {
     state == .error && errorPulse ? 1.3 : 0.8
   }
 
-  private var localHaloOpacity: Double {
+  private func haloOpacity(breath: Double) -> Double {
     switch state {
     case .idle:
-      return breathing ? 0.11 : 0.045
+      // 静态化：取原呼吸区间的下沿，空闲时不再有周期性亮度变化
+      return 0.045
     case .starting:
-      return breathing ? 0.20 : 0.09
+      return 0.09 + 0.11 * breath
     case .generating:
-      return breathing ? 0.24 : 0.11
+      return 0.11 + 0.13 * breath
     case .error:
       return errorPulse ? 0.20 : 0.12
     }
@@ -1538,47 +1643,15 @@ private struct StatusGlow: View {
 
   private func restartEffects() {
     effectTask?.cancel()
-    withAnimation(nil) {
-      sweepAngle = -120
-      sweepOpacity = 0
-      breathing = false
-      errorPulse = false
-    }
-    guard !reduceMotion else { return }
-
-    let nextState = state
+    withAnimation(nil) { errorPulse = false }
+    guard state == .error, !reduceMotion else { return }
     effectTask = Task { @MainActor in
       await Task<Never, Never>.yield()
       guard !Task.isCancelled else { return }
-
-      switch nextState {
-      case .idle:
-        withAnimation(.easeInOut(duration: 3.2).repeatForever(autoreverses: true)) {
-          breathing = true
-        }
-      case .starting:
-        withAnimation(.easeInOut(duration: 1.8).repeatForever(autoreverses: true)) {
-          breathing = true
-        }
-      case .generating:
-        withAnimation(nil) {
-          sweepAngle = -120
-          sweepOpacity = 0.52
-        }
-        await Task<Never, Never>.yield()
-        guard !Task.isCancelled else { return }
-        withAnimation(.linear(duration: 3.2).repeatForever(autoreverses: false)) {
-          sweepAngle = 240
-        }
-        withAnimation(.easeInOut(duration: 1.35).repeatForever(autoreverses: true)) {
-          breathing = true
-        }
-      case .error:
-        withAnimation(nil) { errorPulse = true }
-        await Task<Never, Never>.yield()
-        guard !Task.isCancelled else { return }
-        withAnimation(.easeOut(duration: 0.8)) { errorPulse = false }
-      }
+      withAnimation(nil) { errorPulse = true }
+      await Task<Never, Never>.yield()
+      guard !Task.isCancelled else { return }
+      withAnimation(.easeOut(duration: 0.8)) { errorPulse = false }
     }
   }
 }

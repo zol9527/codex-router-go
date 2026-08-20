@@ -87,7 +87,7 @@ func (s *Server) handleNative(w http.ResponseWriter, r *http.Request, route stri
 	}
 
 	target := s.nativeTarget(route)
-	resp, retries, err := httpx.FetchWithRetry(r.Context(), http.MethodPost, target, headers, upstreamBody, s.upstreamRetryOpts())
+	resp, err := httpx.Fetch(r.Context(), http.MethodPost, target, headers, upstreamBody, s.client, s.upstreamIdle)
 	if err != nil {
 		logf("native request failed model=%s error=%v", requestedModel, err)
 		writeJSON(w, http.StatusBadGateway, errBody("local_router_error", "The local router could not complete the request."))
@@ -97,7 +97,7 @@ func (s *Server) handleNative(w http.ResponseWriter, r *http.Request, route stri
 	s.relayResponse(w, resp)
 	s.recordTurn(usage.Event{
 		Model: requestedModel, Provider: "openai",
-		Status: resp.StatusCode, DurationMs: time.Since(started).Milliseconds(), Retries: retries,
+		Status: resp.StatusCode, DurationMs: time.Since(started).Milliseconds(),
 	})
 	logf("model=%s provider=openai status=%d duration_ms=%d",
 		requestedModel, resp.StatusCode, time.Since(started).Milliseconds())

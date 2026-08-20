@@ -153,7 +153,6 @@ final class RouterStore: ObservableObject {
   @Published private(set) var providerUsageError: String?
   @Published private(set) var providerSetup: [String: ProviderSetupState] = [:]
   @Published private(set) var providerOperation: String?
-  @Published private(set) var visionDownload: VisionDownloadState?
   @Published private(set) var benchmarkingTag: String?
   @Published private(set) var maintenanceMessage: String?
   @Published private(set) var maintenanceSucceeded = false
@@ -219,6 +218,7 @@ final class RouterStore: ObservableObject {
   private var latestObservedActivityRequestID: String?
   private var lastObservedSessionID: String?
   private var activityHealthFailureStartedAt: Date?
+
   private var dailyUsageCache: [DailyUsageCacheKey: [DailyUsagePoint]] = [:]
   private var localUsageTotalsCache: [LocalUsageTotalsCacheKey: UsageTotals] = [:]
 
@@ -279,6 +279,21 @@ final class RouterStore: ObservableObject {
     if let storedMode, let mode = IslandMode(rawValue: storedMode) { return mode }
     if let legacyVisible { return legacyVisible ? .notch : .off }
     return hasLaunchedBefore ? .notch : .off
+  }
+
+  // Activity polling drives SwiftUI state, and the old fixed 350ms cadence kept
+  // the main thread laying out views even while nothing was happening. Keep the
+  // fast cadence only while an activity must be watched; idle/hidden states can
+  // discover the next request a little later without visibly changing the UI.
+  nonisolated static func activityPollingInterval(
+    surfacesVisible: Bool,
+    activeRequestCount: Int,
+    activityState: RouterActivityState
+  ) -> UInt64 {
+    if activeRequestCount > 0 || activityState == .generating || activityState == .starting {
+      return 350_000_000
+    }
+    return surfacesVisible ? 1_000_000_000 : 3_000_000_000
   }
 
   init() {
@@ -652,6 +667,7 @@ final class RouterStore: ObservableObject {
     "anthropic-api": "Claude",
     "zai-coding": "GLM",
     "zai-api": "GLM API",
+    "litellm": "LiteLLM",
     "qwen-plan": "Qwen",
     "ollama-cloud": "Ollama",
     "commandcode": "Command Code",
@@ -996,7 +1012,13 @@ final class RouterStore: ObservableObject {
     while !Task.isCancelled {
       await refreshActivity()
       do {
-        try await Task.sleep(nanoseconds: 350_000_000)
+        try await Task.sleep(
+          nanoseconds: Self.activityPollingInterval(
+            surfacesVisible: surfacesVisible,
+            activeRequestCount: activeRequestCount,
+            activityState: activityState
+          )
+        )
       } catch {
         return
       }
@@ -1463,54 +1485,6 @@ final class RouterStore: ObservableObject {
     await applyModelSettings(arguments: ["vision-bridge", enabled ? "on" : "off"])
   }
 
-  func setToolResultSpillEnabled(_ enabled: Bool) async {
-    await applyModelSettings(
-      arguments: ["tool-result-spill", enabled ? "on" : "off"],
-      successMessage: enabled
-        ? "Oversized tool results are saved to disk and replaced with pointer receipts."
-        : "Exact tool results will be sent on the next external-model request."
-    )
-  }
-
-  /// Picks a cloud engine ("auto" or a model slug) as the image reader, and
-  /// optionally the reasoning effort it reads at. Passing "default" for the
-  /// effort hands the level back to the model. One command, so the two never
-  /// land out of step.
-  func setVisionBridgeEngine(_ value: String, effort: String? = nil) async {
-    var arguments = ["vision-bridge", "engine", value]
-    if let effort { arguments.append(effort) }
-    await applyModelSettings(arguments: arguments)
-  }
-
-  func setVisionBridgeEffort(_ effort: String) async {
-    await applyModelSettings(arguments: ["vision-bridge", "effort", effort])
-  }
-
-
-  /// Deletes the model from disk. Irreversible short of downloading it again,
-  /// so the tray arms the row before this is reachable.
-
-  /// Switches the reader to an already-installed local model.
-  func useLocalVisionModel(_ tag: String) async {
-    await applyModelSettings(arguments: ["vision-bridge", "local", tag])
-  }
-
-  /// Scores an installed model against the checked-in ground-truth image. This
-  /// is what makes "not benchmarked" actionable in the tray: download any
-  /// model, then measure whether it actually reads before trusting it.
-  func benchmarkLocalVisionModel(_ tag: String) async {
-    guard benchmarkingTag == nil else { return }
-    benchmarkingTag = tag
-    defer { benchmarkingTag = nil }
-    do {
-      _ = try await runControl(arguments: ["vision-bridge", "benchmark", tag])
-      await refresh()
-      message = "\(tag) tested. The score is on its row."
-    } catch {
-      message = error.localizedDescription
-    }
-  }
-
   /// Measures Ollama's own eval counters, so the number is this machine's
   /// observed generation speed rather than a marketing estimate.
   func benchmarkLocalModelSpeed(_ tag: String) async {
@@ -1526,61 +1500,10 @@ final class RouterStore: ObservableObject {
     }
   }
 
-  /// Downloads a local vision model with Ollama, then pins it. The tray row
-  /// shows the size, so the click is the consent for the download.
-  ///
-  /// Gigabytes take minutes: the control command starts a detached worker and
-  /// returns at once, and this polls progress so the row shows a live
-  /// percentage instead of a frozen panel. Only the download buttons are
-  /// disabled meanwhile — the rest of the tray stays usable.
-  func downloadLocalVisionModel(_ tag: String) async {
-    guard visionDownload?.isRunning != true else { return }
-    let startedAt = Date().timeIntervalSince1970 * 1_000
-    visionDownload = VisionDownloadState(
-      tag: tag,
-      status: "downloading",
-      detail: "starting",
-      percent: 0,
-      error: nil,
-      startedAt: startedAt,
-      updatedAt: startedAt
-    )
-    do {
-      _ = try await runControl(arguments: ["vision-bridge", "pull", tag])
-    } catch {
-      message = error.localizedDescription
-      visionDownload = nil
-      return
-    }
-    await pollVisionDownload()
-  }
-
   /// Downloads a local chat model through Ollama, installs/starts Ollama when
   /// needed, and checks the model on for Codex after the pull completes. The
   /// control command returns immediately; the state file is polled so the
   /// tray remains responsive during multi-gigabyte downloads.
-  /// `force` carries the operator's deliberate override for a model this
-  /// machine is rated too small for. Every catalog entry is offered, so the
-  /// only way to attempt an oversized one is to say so explicitly here.
-  private func pollVisionDownload() async {
-    while !Task.isCancelled {
-      try? await Task.sleep(nanoseconds: 1_000_000_000)
-      guard let data = try? await runControl(arguments: ["vision-bridge", "pull-status"]),
-        let state = try? JSONDecoder().decode(VisionDownloadState.self, from: data)
-      else { continue }
-      visionDownload = state
-      if state.isRunning { continue }
-      // Terminal: refresh so the row flips to "in use" and the engine label
-      // catches up, then report what happened.
-      await refresh()
-      message = state.status == "done"
-        ? "\(state.tag ?? "Model") downloaded. Restart Codex to refresh its picker."
-        : (state.error ?? "The download failed.")
-      visionDownload = nil
-      return
-    }
-  }
-
   private func applyModelSettings(
     arguments: [String],
     successMessage: String = "Model settings applied. Restart Codex to refresh its picker."
@@ -2392,36 +2315,7 @@ struct RouterModel: Decodable, Identifiable {
 struct ModelSettingsSnapshot: Decodable {
   let subagents: SubagentSettingsSnapshot
   let picker: PickerSettingsSnapshot
-  let toolResultSpill: ToolResultSpillSnapshot?
   let visionBridge: VisionBridgeSnapshot?
-}
-
-// Go 侧 control --json 的 toolResultSpill 块（internal/state/spill.go）。
-// spill = 首过境确定性截断：超阈值工具结果落盘+回执，前缀缓存友好。
-struct ToolResultSpillSnapshot: Decodable {
-  let enabled: Bool
-  let maxBytes: Int?
-  let stats: ToolResultSpillStats?
-}
-
-struct ToolResultSpillStats: Decodable {
-  let requests: Int?
-  let resultsSpilled: Int?
-  let bytesSaved: Int?
-  let estimatedTokensSaved: Int?
-
-  var savingsSummary: String? {
-    guard let requests, requests > 0, let estimatedTokensSaved, let bytesSaved else { return nil }
-    let tokens = Self.compactCount(estimatedTokensSaved)
-    let megabytes = String(format: "%.1f", Double(bytesSaved) / 1_048_576)
-    return "Saved ~\(tokens) tokens (\(megabytes) MB) across \(requests) requests"
-  }
-
-  static func compactCount(_ value: Int) -> String {
-    if value >= 1_000_000 { return String(format: "%.1fM", Double(value) / 1_000_000) }
-    if value >= 1_000 { return String(format: "%.1fk", Double(value) / 1_000) }
-    return String(value)
-  }
 }
 
 
@@ -2431,55 +2325,13 @@ struct LocalCatalogSnapshot: Decodable {
 }
 
 
-/// A model/tag worth displaying, already rated against this machine's memory
-/// by the router. Cloud aliases are intentionally visible but non-downloadable.
-
-/// A model that can only read images. Ranked by what it actually scored
-/// against a known image, never by size alone.
-
-
-struct VisionEngineOption: Decodable, Identifiable, Equatable {
-  let slug: String
-  let displayName: String
-  // The reasoning levels this model itself declares. Older routers do not send
-  // them, and some models declare none, so an empty list means "no level to
-  // choose" rather than "no levels allowed".
-  let efforts: [String]?
-  var id: String { slug }
-}
-
+/// The vision bridge snapshot. The reading engine is fixed to the native
+/// vision model of the signed-in ChatGPT session, so there is no engine
+/// choice to carry — only whether the bridge is on and what it resolves to.
 struct VisionBridgeSnapshot: Decodable {
   let enabled: Bool
-  let engine: String?
-  let local: VisionLocalPin?
   let resolvedEngine: String?
   let resolvedEngineName: String?
-  let hostMemGib: Double?
-  let paidEngines: [VisionEngineOption]
-  // Vision models from the signed-in ChatGPT session. Older routers do not send
-  // this, so it defaults to empty rather than failing the whole decode.
-  let nativeEngines: [VisionEngineOption]?
-  /// Pinned reasoning effort, `nil` when the reader runs at its own default.
-  let effort: String?
-  let download: VisionDownloadState?
-}
-
-struct VisionLocalPin: Decodable, Equatable {
-  let model: String?
-}
-
-struct VisionDownloadState: Decodable, Equatable {
-  let tag: String?
-  let status: String
-  let detail: String?
-  let percent: Int?
-  let error: String?
-  // These timestamps let the tray reject an older terminal record when the
-  // operator retries the same tag while a refresh is in flight.
-  let startedAt: Double?
-  let updatedAt: Double?
-
-  var isRunning: Bool { status == "downloading" }
 }
 
 struct SubagentSettingsSnapshot: Decodable {
@@ -2929,36 +2781,6 @@ private struct TrayView: View {
       )
     }
 
-    if let spillStats = target?.modelSettings?.toolResultSpill?.stats,
-       let spillRequests = spillStats.requests, spillRequests > 0 {
-      sectionLabel("Context savings", detail: "\(spillRequests) requests compacted all-time")
-      VStack(alignment: .leading, spacing: 8) {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-          VStack(alignment: .leading, spacing: 2) {
-            Text("Oversized tool results saved to disk, receipts inline")
-              .font(.system(size: 10, weight: .medium))
-              .lineLimit(1)
-            if let summary = spillStats.savingsSummary {
-              Text(summary)
-                .font(.system(size: 8))
-                .foregroundStyle(routerMuted)
-                .lineLimit(1)
-            }
-          }
-          Spacer(minLength: 8)
-          Text("~\(compactTokenCount(Double(spillStats.estimatedTokensSaved ?? 0))) tok")
-            .font(.system(size: 15, weight: .semibold, design: .monospaced))
-            .foregroundStyle(routerMint)
-            .monospacedDigit()
-        }
-      }
-      .padding(9)
-      .background(
-        Color.primary.opacity(0.045),
-        in: RoundedRectangle(cornerRadius: 9, style: .continuous)
-      )
-    }
-
     sectionLabel(
       routerLocalized("Live requests"),
       detail: store.activeRequests.isEmpty ? routerLocalized("None") : "\(store.activeRequests.count)"
@@ -3228,16 +3050,6 @@ private struct TrayView: View {
         set: { enabled in Task { await store.setLoginFree(enabled) } }
       ),
       isDisabled: store.providerOperation != nil || store.signedRouting
-    )
-    settingRow(
-      title: routerLocalized("Spill oversized tool results"),
-      detail: target.modelSettings?.toolResultSpill?.stats?.savingsSummary
-        ?? routerLocalized("On by default · oversized results saved to disk with a pointer receipt"),
-      isOn: Binding(
-        get: { target.modelSettings?.toolResultSpill?.enabled ?? true },
-        set: { enabled in Task { await store.setToolResultSpillEnabled(enabled) } }
-      ),
-      isDisabled: store.providerOperation != nil
     )
     maintenanceRow
     AccordionPanel(
@@ -3552,126 +3364,17 @@ private struct TrayView: View {
           ),
           disabled: busy
         )
-        // The row stays put when the switch flips. Showing and hiding it
-        // resized the whole panel on every toggle, and because the state only
-        // settles after the control command returns, the jump happened twice.
-        HStack(spacing: 8) {
-          Text(routerLocalized("Engine"))
-            .font(.system(size: 11, weight: .medium))
-            // The one label that must never compress; it is four characters
-            // and the menu beside it is what should give way.
-            .fixedSize()
-          Spacer(minLength: 8)
-          engineMenu
-        }
-        .padding(.horizontal, 2)
-        .opacity(vision?.enabled == true ? 1 : 0.45)
-        .disabled(vision?.enabled != true)
       }
     }
 
-    @ViewBuilder private var engineMenu: some View {
-      Menu {
-        // No "Auto" entry. It was labelled "cheapest paid model", but the
-        // ranking behind it scored cost by testing slugs against
-        // /flash|haiku|mini|lite|small|turbo/ -- which matches none of the
-        // engines a typical install has, so they tied and the winner fell out
-        // of alphabetical order. The menu now offers only models the operator
-        // can actually evaluate, and a fresh install starts on a named default.
-        if !(vision?.paidEngines ?? []).isEmpty {
-          Section(routerLocalized("Paid (cloud)")) {
-            ForEach(vision?.paidEngines ?? []) { option in
-              engineEntry(option)
-            }
-          }
-        }
-        if !(vision?.nativeEngines ?? []).isEmpty {
-          Section(routerLocalized("Your ChatGPT plan")) {
-            ForEach(vision?.nativeEngines ?? []) { option in
-              engineEntry(option)
-            }
-          }
-        }
-      } label: {
-        HStack(spacing: 4) {
-          Text(currentEngineLabel)
-            .lineLimit(1)
-            // A label reads "Auto · MiniMax M3 (opencode Go) · high": the ends
-            // carry the meaning, so the middle is what goes.
-            .truncationMode(.middle)
-          Image(systemName: "chevron.up.chevron.down")
-            .font(.system(size: 8))
-            .fixedSize()
-        }
-        .font(.system(size: 10, weight: .medium))
-        .foregroundStyle(routerMint)
-      }
-      .menuStyle(.borderlessButton)
-      // Not fixedSize: that asks for the label's ideal width and ignores the
-      // 352pt popover, so a long engine name pushed the row off the panel
-      // instead of truncating. A ceiling lets it shrink and keeps the chevron
-      // on screen.
-      .frame(maxWidth: 230, alignment: .trailing)
-      .help(currentEngineLabel)
-      .disabled(busy)
-    }
-
-    // Hovering a model opens its own levels, so picking the reader and how hard
-    // it reads is one gesture. A model that declares no levels stays a plain
-    // button: there would be nothing behind the submenu.
-    @ViewBuilder private func engineEntry(_ option: VisionEngineOption) -> some View {
-      let efforts = option.efforts ?? []
-      if efforts.isEmpty {
-        Button(engineEntryLabel(option, selected: isSelectedEngine(option.slug))) {
-          Task { await store.setVisionBridgeEngine(option.slug) }
-        }
-      } else {
-        Menu(engineEntryLabel(option, selected: isSelectedEngine(option.slug))) {
-          Button(effortEntryLabel(routerLocalized("Model default"), selected: isSelectedEngine(option.slug) && vision?.effort == nil)) {
-            Task { await store.setVisionBridgeEngine(option.slug, effort: "default") }
-          }
-          ForEach(efforts, id: \.self) { effort in
-            Button(
-              effortEntryLabel(
-                effort.capitalized,
-                selected: isSelectedEngine(option.slug) && vision?.effort == effort
-              )
-            ) {
-              Task { await store.setVisionBridgeEngine(option.slug, effort: effort) }
-            }
-          }
-        }
-      }
-    }
-
-    private func isSelectedEngine(_ slug: String) -> Bool { vision?.engine == slug }
-
-    private func engineEntryLabel(_ option: VisionEngineOption, selected: Bool) -> String {
-      selected ? "\u{2713} \(option.displayName)" : option.displayName
-    }
-
-    private func effortEntryLabel(_ title: String, selected: Bool) -> String {
-      selected ? "\u{2713} \(title)" : title
-    }
 
     private var vision: VisionBridgeSnapshot? { settings?.visionBridge }
 
+    // The engine is fixed (native, from the signed-in ChatGPT session); the
+    // label only reports what the bridge resolved to.
     private var currentEngineLabel: String {
       guard let vision else { return routerLocalized("none") }
-      if vision.engine == "local" {
-        return "\(routerLocalized("Local")) · \(vision.local?.model ?? routerLocalized("MODEL"))"
-      }
-      let suffix = vision.effort.map { " · \($0)" } ?? ""
-      if vision.engine == nil {
-        // While a change is in flight the snapshot can arrive with the choice
-        // recorded but nothing resolved yet. "Auto" alone is true throughout;
-        // "Auto · none" was a claim that flashed and then contradicted itself.
-        guard let resolved = vision.resolvedEngineName ?? vision.resolvedEngine else {
-          return "\(routerLocalized("Auto"))\(suffix)"
-        }
-        return "\(routerLocalized("Auto")) · \(resolved)\(suffix)"
-      }
-      return "\(vision.resolvedEngineName ?? vision.resolvedEngine ?? vision.engine ?? routerLocalized("none"))\(suffix)"
+      return vision.resolvedEngineName ?? vision.resolvedEngine ?? routerLocalized("none")
     }
 
     private var hiddenModels: Set<String> {
@@ -4968,59 +4671,91 @@ func usageResetCaption(_ date: Date) -> String {
 private struct StatusBeacon: View {
   @Environment(\.accessibilityReduceMotion) private var reduceMotion
   let state: RouterActivityState
-  @State private var breathing = false
 
   var body: some View {
     HStack(spacing: 6) {
-      ZStack {
-        Circle()
-          .fill(state.tint.opacity(0.18))
-          .frame(width: 14, height: 14)
-          .scaleEffect((state == .generating || state == .starting) && breathing ? 1.28 : 0.9)
-        Circle()
-          .fill(state.tint)
-          .frame(width: 7, height: 7)
-      }
+      // 呼吸点走 CALayer 动画而非 SwiftUI 时间线。曾两次尝试 TimelineView
+      // （withAnimation(repeatForever) → .animation(minimumInterval:) →
+      // .periodic）都失败，根因不在 schedule：AppKit 窗口里任何活跃
+      // TimelineView 都会拖 NSHostingView 以显示帧率跑 layout pass
+      // （2026-08-18 实测生成态 16-27% CPU，采样 UpdateCycle →
+      // CA::Transaction::commit → NSHostingView.layout → ViewGraph
+      // render，更新栈直指本视图）。CABasicAnimation 由 WindowServer
+      // 在 render server 进程插值，App 进程零帧成本。
+      BreathingBeaconDot(tint: state.tint, breathing: isBreathing)
+        .frame(width: 14, height: 14)
+        .accessibilityHidden(true)
       Text(state.label)
         .font(.system(size: 10, weight: .medium))
     }
     .foregroundStyle(state.tint)
-    .onAppear { animate() }
-    .onChange(of: state) { _ in animate() }
   }
 
-  private func animate() {
-    breathing = false
-    guard state == .generating || state == .starting, !reduceMotion else { return }
-    withAnimation(.easeInOut(duration: 0.72).repeatForever(autoreverses: true)) {
-      breathing = true
-    }
+  private var isBreathing: Bool {
+    IslandAnimation.beaconBreathing(state: state, reduceMotion: reduceMotion)
   }
 }
 
-private struct OperationPulse: View {
-  @Environment(\.accessibilityReduceMotion) private var reduceMotion
-  let tint: Color
-  @State private var pulsing = false
+/// BreathingBeaconDot 的载体视图：14pt 光晕 + 7pt 实心圆两层。
+/// 呼吸 = 光晕层 transform.scale 的 autoreverse 循环动画（0.9→1.28，
+/// 0.72s 单程，与旧 TimelineView 版 1.44s 余弦往返同节拍）。
+@MainActor
+private final class BeaconDotView: NSView {
+  private let halo = CAShapeLayer()
+  private let core = CAShapeLayer()
+  private var isAnimating = false
 
-  var body: some View {
-    ZStack {
-      Circle()
-        .stroke(tint.opacity(0.34), lineWidth: 1)
-        .frame(width: 12, height: 12)
-        .scaleEffect(pulsing ? 1.35 : 0.65)
-        .opacity(pulsing ? 0 : 0.9)
-      Circle()
-        .fill(tint)
-        .frame(width: 6, height: 6)
+  override init(frame frameRect: NSRect) {
+    super.init(frame: frameRect)
+    wantsLayer = true
+    halo.path = CGPath(ellipseIn: bounds, transform: nil)
+    core.path = CGPath(
+      ellipseIn: NSRect(x: 3.5, y: 3.5, width: 7, height: 7),
+      transform: nil
+    )
+    layer?.addSublayer(halo)
+    layer?.addSublayer(core)
+  }
+
+  @available(*, unavailable)
+  required init?(coder: NSCoder) {
+    fatalError("BeaconDotView is created in code only")
+  }
+
+  func apply(tint: NSColor, breathing: Bool) {
+    CATransaction.begin()
+    // 结构/颜色变化不做隐式 CA 过渡；动画只由显式 add 的 keyframe 驱动。
+    CATransaction.setDisableActions(true)
+    halo.backgroundColor = tint.withAlphaComponent(0.18).cgColor
+    core.backgroundColor = tint.cgColor
+    if breathing, !isAnimating {
+      let scale = CABasicAnimation(keyPath: "transform.scale")
+      scale.fromValue = 0.9
+      scale.toValue = 1.28
+      scale.duration = 0.72
+      scale.autoreverses = true
+      scale.repeatCount = .infinity
+      scale.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+      halo.add(scale, forKey: "breath")
+      isAnimating = true
+    } else if !breathing, isAnimating {
+      halo.removeAnimation(forKey: "breath")
+      isAnimating = false
     }
-    .frame(width: 14, height: 14)
-    .onAppear {
-      guard !reduceMotion else { return }
-      withAnimation(.easeOut(duration: 0.9).repeatForever(autoreverses: false)) {
-        pulsing = true
-      }
-    }
+    CATransaction.commit()
+  }
+}
+
+private struct BreathingBeaconDot: NSViewRepresentable {
+  let tint: Color
+  let breathing: Bool
+
+  func makeNSView(context: Context) -> BeaconDotView {
+    BeaconDotView(frame: NSRect(x: 0, y: 0, width: 14, height: 14))
+  }
+
+  func updateNSView(_ view: BeaconDotView, context: Context) {
+    view.apply(tint: NSColor(tint), breathing: breathing)
   }
 }
 

@@ -28,7 +28,7 @@ func cmdInstall(args []string) error {
 	stateDir := fs.String("state", state.DefaultDir(), "state directory")
 	configDir := fs.String("config", "", "registry config directory override (default: embedded registry)")
 	port := fs.Int("port", defaultPort(), "listen port")
-	providers := fs.String("providers", "zai-coding,opencode-go", "comma-separated provider ids to enable")
+	providers := fs.String("providers", "zai-coding,opencode-go,litellm", "comma-separated provider ids to enable")
 	codexBinary := fs.String("codex", "codex", "codex CLI binary (for native catalog capture)")
 	dryRun := fs.Bool("dry-run", false, "print planned actions without writing")
 	if err := fs.Parse(args); err != nil {

@@ -10,7 +10,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/loyd/codex-router/internal/registry"
 	"github.com/loyd/codex-router/internal/vision"
 )
 
@@ -148,44 +147,37 @@ func TestVisionBridgeDisabledPassthrough(t *testing.T) {
 	}
 }
 
-func writeStateFile(t *testing.T, srv *Server, name, content string) {
-	t.Helper()
-	if err := os.WriteFile(srv.opt.State.Dir+"/"+name, []byte(content), 0o600); err != nil {
-		t.Fatal(err)
-	}
-}
-
-// anthropic 协议引擎端到端：pin 的 messages 变体引擎读图走 /messages
-// （x-api-key + image source 块），证据文本替换进 chat 上游 ——
-// 2026-08-16 前 qwen3.7-max 作为 pin 每次结构性失败，只能靠原生
-// 引擎回退。
-func TestVisionBridgeAnthropicEngine(t *testing.T) {
-	var anthropicCalls int
-	anthropicInput := map[string]any{}
-	anthropicUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		anthropicCalls++
-		if r.URL.Path != "/messages" {
-			t.Errorf("anthropic describe path = %s", r.URL.Path)
-		}
-		if r.Header.Get("x-api-key") != "test-opencode-key" {
-			t.Errorf("anthropic describe must send x-api-key, got %q", r.Header.Get("x-api-key"))
-		}
-		if r.Header.Get("anthropic-version") == "" {
-			t.Error("anthropic describe must send anthropic-version")
-		}
-		var body map[string]any
-		json.NewDecoder(r.Body).Decode(&body)
-		anthropicInput["body"] = body
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"content":[{"type":"text","text":"## Summary\nA qwen dialog via the anthropic path."}]}`)
+// 会话级缓存端到端：Codex 每轮重发完整历史（同图 + 新问题）。第一轮
+// 真正读图并写入缓存；第二轮必须命中缓存（Question 变化不影响命中）
+// 且证据文本照常注入 —— 读图引擎整个会话只被调用一次。
+func TestVisionSessionCacheSecondTurnHits(t *testing.T) {
+	var nativeCalls int
+	nativeDescribe := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		nativeCalls++
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "event: response.output_text.delta\n")
+		fmt.Fprint(w, "data: {\"type\":\"response.output_text.delta\",\"delta\":\"## Summary\\nA cached red dialog.\"}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
 	}))
-	defer anthropicUpstream.Close()
+	defer nativeDescribe.Close()
 
-	chatUpstreamInput := map[string]any{}
+	var evidenceTurns int
 	chatUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]any
 		json.NewDecoder(r.Body).Decode(&body)
-		chatUpstreamInput["messages"] = body["messages"]
+		for _, raw := range body["messages"].([]any) {
+			if m, ok := raw.(map[string]any); ok && m["role"] == "user" {
+				if parts, ok := m["content"].([]any); ok {
+					for _, partRaw := range parts {
+						if part, ok := partRaw.(map[string]any); ok {
+							if text, _ := part["text"].(string); strings.Contains(text, "A cached red dialog") {
+								evidenceTurns++
+							}
+						}
+					}
+				}
+			}
+		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n")
 		fmt.Fprint(w, "data: [DONE]\n\n")
@@ -195,71 +187,56 @@ func TestVisionBridgeAnthropicEngine(t *testing.T) {
 	srv, ts := newTestServer(t)
 	srv.opt.Registry.Providers["zai-coding"].BaseURL = chatUpstream.URL
 	srv.opt.Registry.Providers["zai-coding"].BaseURLEnv = ""
+	srv.opt.NativeBase = nativeDescribe.URL
 	t.Setenv("ZAI_API_KEY", "")
-	// 注入 anthropic 协议引擎（messages 变体）+ 对应 provider。
-	srv.opt.Registry.Providers["opencode-go-messages"] = &registry.Provider{
-		ID: "opencode-go-messages", DisplayName: "opencode Go Messages", Kind: "openai-compatible",
-		OwnedBy: "opencode", VariantOf: "opencode-go", Protocol: "anthropic",
-		BaseURL: anthropicUpstream.URL, BaseURLEnv: "",
-		Credential: registry.Credential{File: "opencode-go-api-key.secret"},
-	}
-	srv.opt.Registry.Models = append(srv.opt.Registry.Models, &registry.Model{
-		Slug: "opencode-go-messages/qwen3.7-max", GatewayModel: "opencode-go-messages-qwen3-7-max",
-		UpstreamModel: "qwen3.7-max", Provider: "opencode-go-messages", Listed: true,
-		DisplayName: "Qwen3.7 Max (opencode Go)", Priority: 43,
-		InputModalities: []string{"text", "image"},
-	})
-	writeStateFile(t, srv, "vision-bridge.json", `{"enabled": true, "engine": "opencode-go-messages/qwen3.7-max"}`)
 	callerKey, _ := srv.opt.State.CallerKey()
 
-	req, _ := http.NewRequest(http.MethodPost,
-		ts.URL+CallerPathPrefix+"/"+callerKey+"/v1/responses",
-		strings.NewReader(`{
+	merged := map[string]any{"models": []any{
+		map[string]any{"slug": "gpt-5.6-sol", "display_name": "GPT-5.6-Sol",
+			"visibility": "list", "input_modalities": "text, image", "priority": 5},
+	}}
+	raw, _ := json.Marshal(merged)
+	writeStateFile(t, srv, "merged-models.json", string(raw))
+
+	// 第二轮的提问变了（Codex 下一轮的真实形态：历史图片重发 + 新问题），
+	// 但 session 与图片字节相同 → 必须命中缓存。
+	turns := []string{"what does this say?", "and what about the button labels?"}
+	for _, question := range turns {
+		body := fmt.Sprintf(`{
 			"model": "zai-coding/glm-5.3",
 			"input": [{"type":"message","role":"user","content":[
-				{"type":"input_text","text":"what does this say?"},
-				{"type":"input_image","image_url":"data:image/png;base64,AAAB"}
+				{"type":"input_text","text":"<image path=\"/tmp/err.png\">"},
+				{"type":"input_image","image_url":"data:image/png;base64,AAAB"},
+				{"type":"input_text","text":%q}
 			]}],
 			"stream": true
-		}`))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer codex-session")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-
-	if anthropicCalls == 0 {
-		t.Fatal("pinned anthropic engine must be consulted")
-	}
-	body := anthropicInput["body"].(map[string]any)
-	if body["model"] != "qwen3.7-max" {
-		t.Errorf("anthropic model must be upstream id, got %v", body["model"])
-	}
-	blocks := body["messages"].([]any)[0].(map[string]any)["content"].([]any)
-	image := blocks[1].(map[string]any)
-	source := image["source"].(map[string]any)
-	if source["media_type"] != "image/png" || source["data"] != "AAAB" {
-		t.Errorf("anthropic image source wrong: %v", source)
-	}
-	messages := chatUpstreamInput["messages"].([]any)
-	foundEvidence := false
-	for _, raw := range messages {
-		if m, ok := raw.(map[string]any); ok && m["role"] == "user" {
-			if parts, ok := m["content"].([]any); ok {
-				for _, partRaw := range parts {
-					if part, ok := partRaw.(map[string]any); ok {
-						if text, ok := part["text"].(string); ok && strings.Contains(text, "qwen dialog via the anthropic path") {
-							foundEvidence = true
-						}
-					}
-				}
-			}
+		}`, question)
+		req, _ := http.NewRequest(http.MethodPost,
+			ts.URL+CallerPathPrefix+"/"+callerKey+"/v1/responses",
+			strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer codex-session")
+		req.Header.Set("Chatgpt-Account-Id", "acct-1")
+		req.Header.Set("X-Codex-Turn-Metadata", `{"session_name":"cache-e2e"}`)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
 		}
+		resp.Body.Close()
 	}
-	if !foundEvidence {
-		t.Errorf("anthropic evidence must replace the image upstream:\n%v", chatUpstreamInput)
+
+	if nativeCalls != 1 {
+		t.Errorf("describe engine must run exactly once per session (got %d calls)", nativeCalls)
+	}
+	if evidenceTurns != 2 {
+		t.Errorf("evidence must be injected on every turn (got %d of 2)", evidenceTurns)
+	}
+}
+
+func writeStateFile(t *testing.T, srv *Server, name, content string) {
+	t.Helper()
+	if err := os.WriteFile(srv.opt.State.Dir+"/"+name, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
 	}
 }
 

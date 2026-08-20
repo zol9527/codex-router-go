@@ -78,3 +78,64 @@ struct IslandModeTests {
     )
   }
 }
+
+@Suite("Activity polling")
+struct ActivityPollingTests {
+  @Test("active work keeps the responsive interval")
+  func activeWorkKeepsFastInterval() {
+    #expect(
+      RouterStore.activityPollingInterval(
+        surfacesVisible: true,
+        activeRequestCount: 1,
+        activityState: .idle
+      ) == 350_000_000
+    )
+    #expect(
+      RouterStore.activityPollingInterval(
+        surfacesVisible: true,
+        activeRequestCount: 0,
+        activityState: .generating
+      ) == 350_000_000
+    )
+  }
+
+  @Test("idle polling slows down, and hidden idle polling slows further")
+  func idlePollingSlowsDown() {
+    #expect(
+      RouterStore.activityPollingInterval(
+        surfacesVisible: true,
+        activeRequestCount: 0,
+        activityState: .idle
+      ) == 1_000_000_000
+    )
+    #expect(
+      RouterStore.activityPollingInterval(
+        surfacesVisible: false,
+        activeRequestCount: 0,
+        activityState: .idle
+      ) == 3_000_000_000
+    )
+  }
+
+  @Test("health retries stay responsive while the router is starting")
+  func startingStateStaysResponsive() {
+    #expect(
+      RouterStore.activityPollingInterval(
+        surfacesVisible: false,
+        activeRequestCount: 0,
+        activityState: .starting
+      ) == 350_000_000
+    )
+  }
+}
+
+@Suite("Thinking Orb energy")
+struct ThinkingOrbEnergyTests {
+  @Test("only generating keeps the animated orb running")
+  func onlyGeneratingRunsAnimation() {
+    #expect(ThinkingOrbView.shouldRunAnimation(state: .generating))
+    #expect(!ThinkingOrbView.shouldRunAnimation(state: .idle))
+    #expect(!ThinkingOrbView.shouldRunAnimation(state: .starting))
+    #expect(!ThinkingOrbView.shouldRunAnimation(state: .error))
+  }
+}

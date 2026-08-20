@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "providers": [
+    {
+      "id": "litellm",
+      "displayName": "LiteLLM",
+      "kind": "openai-compatible",
+      "ownedBy": "litellm",
+      "baseUrlEnv": "LITELLM_BASE_URL",
+      "defaultContextWindow": 131072,
+      "planNote": "Configure baseUrl at runtime; no deployment address is embedded in this repository.",
+      "credential": {
+        "environment": [
+          "LITELLM_API_KEY"
+        ],
+        "file": "litellm-api-key.secret",
+        "legacyFiles": [],
+        "keychainServices": [
+          "codex-router-litellm"
+        ],
+        "prompt": "LiteLLM virtual key or master key"
+      }
+    }
+  ]
+}

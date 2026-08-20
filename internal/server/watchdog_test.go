@@ -63,7 +63,7 @@ func TestIdleWatchdogBeforeLivenessReturns504(t *testing.T) {
 
 // 看门狗（响应体空闲）：liveness（reasoning）已过、头已提交后上游挂死
 // → 只能截断（不得 writeJSON 二次提交头）；client 收到部分内容后流
-// 结束，且不触发隐形重试（liveness 红线）。
+// 结束，且 Router 不会追加请求。
 func TestIdleWatchdogMidStreamTruncates(t *testing.T) {
 	var calls int
 	block := make(chan struct{})
@@ -110,7 +110,7 @@ func TestIdleWatchdogMidStreamTruncates(t *testing.T) {
 		t.Errorf("truncated stream must not carry a completion event:\n%s", body)
 	}
 	if calls != 1 {
-		t.Errorf("liveness proven, no silent retry allowed, calls=%d", calls)
+		t.Errorf("liveness proven, Router must not append a request, calls=%d", calls)
 	}
 	if raw := readUsageRaw(t, recorder); !strings.Contains(raw, `"streamAborted":true`) {
 		t.Errorf("usage must record streamAborted: %s", raw)

@@ -50,15 +50,22 @@ var wsDialer = &websocket.Dialer{
 // errRoutedFrameOnNativePipe：原生管道上出现路由帧的哨兵错误。
 var errRoutedFrameOnNativePipe = errors.New("routed frame on native pipe")
 
-// wsWatchdog 是方向相关的上游静默看门狗：客户端发过数据帧、上游此后
-// 零回帧并持续超过窗口 → 判定黑洞，主动拆管（2026-08-16 13:44 实发：
-// 握手 101 通但上游帧被吞 ~10 分钟，调用方只能干等）。
-// 跨 turn 空闲（无待答请求）是合法状态，不拆。
+// wsWatchdog 承担一条管道的两份状态：
+//   - 方向相关的上游静默看门狗：客户端发过数据帧、上游此后零回帧并
+//     持续超过窗口 → 判定黑洞，主动拆管（2026-08-16 13:44 实发：握手
+//     101 通但上游帧被吞 ~10 分钟，调用方只能干等）。跨 turn 空闲
+//     （无待答请求）是合法状态，不拆。
+//   - 在途 turn 跟踪（turnActive）：客户端发数据帧置位；上游回 turn
+//     结束事件（response.completed/failed/incomplete/cancelled）复位。
+//     activity 上报用它把"管道存活"收窄成"turn 在途"——Codex 每次
+//     对话开一条 preconnect 管道且长期不关（2026-08-18 实发 7 条挂
+//     管道把 state 永远顶在 generating），空闲管道不得计入。
 type wsWatchdog struct {
 	timeout      time.Duration
 	lastClientTx atomic.Int64 // 客户端帧到达本路由的时刻（unix nanos）
 	lastUpstream atomic.Int64 // 上游帧到达本路由的时刻（unix nanos）
 	tripped      atomic.Bool
+	turnActive   atomic.Bool // 在途 turn：见类型注释第二点
 }
 
 // check 判定是否触发。触发即置位（幂等）并返回 true。
@@ -134,13 +141,16 @@ func (s *Server) handleResponsesWebSocket(w http.ResponseWriter, r *http.Request
 // serveWSPipe 承担一条已建立管道的生命周期：活动状态上报、双向帧
 // 搬运、上游静默看门狗、收线。任一侧出错即整体拆除。
 func (s *Server) serveWSPipe(client, upstream *websocket.Conn, r *http.Request) {
-	setRoute, finish := s.beginRequest()
+	// 看门狗先建：activity 的 inFlight 判定挂它身上。activity 生命周期
+	// 仍是管道级（拆管时 finish），但上报窗口收窄成"turn 在途"——空闲
+	// 管道不计入 generating。
+	wd := &wsWatchdog{timeout: s.wsSilent}
+	setRoute, finish := s.beginActivity(wd.inFlight)
 	session := sessionNameFromHeaders(r.Header)
 	started := time.Now()
 	logf("ws pipe opened")
 
 	// 上游静默看门狗：待答请求超窗口无上游帧 → 拆管让调用方重连。
-	wd := &wsWatchdog{timeout: s.wsSilent}
 	wdStop := make(chan struct{})
 	defer close(wdStop)
 	if wd.timeout > 0 {
@@ -163,15 +173,66 @@ func (s *Server) serveWSPipe(client, upstream *websocket.Conn, r *http.Request) 
 		}()
 	}
 
+	// 上游 keepalive ping：跨 turn 空闲是合法状态（看门狗不拆），但链路上
+	// 的中间设备会按空闲超时收割 TCP —— 2026-08-19 实证：上游腿经 Surge
+	// TUN，194 条空闲管道在 ~30 分钟被 1006 unexpected EOF / RST 砍断，
+	// Codex 下一次使用才发现管道已死、亮"正在重新连接"。周期 ping 让链路
+	// 始终有流量，空闲管道不再被收割。客户端腿是本地回环，无中间设备，
+	// 不需要保活。
+	//
+	// 空闲封顶（idle cap）：keepalive 的代价是管道不再被中间设备意外回
+	// 收 —— 若调用方泄漏管道（Codex 桌面端有挂起管道前科），会永久累积。
+	// 连续无数据帧超过封顶窗口的管道主动发 close 1000 干净关闭：调用方
+	// 下次使用按需重连（毫秒级 preconnect），体验不差于被 1006 砍。
+	if s.wsKeepalive > 0 {
+		go func() {
+			ticker := time.NewTicker(s.wsKeepalive)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-wdStop:
+					return
+				case <-ticker.C:
+					// WriteControl 可与搬运协程的 WriteMessage 并发（gorilla
+					// 契约）。写失败 = 上游连接已坏：立即拆管让调用方重连，
+					// 而不是留一条下次使用时才暴露的死管道。
+					if err := upstream.WriteControl(websocket.PingMessage, nil,
+						time.Now().Add(5*time.Second)); err != nil {
+						_ = client.Close()
+						_ = upstream.Close()
+						return
+					}
+					last := wd.lastClientTx.Load()
+					if u := wd.lastUpstream.Load(); u > last {
+						last = u
+					}
+					if last == 0 {
+						last = started.UnixNano() // 建管后从未有过数据帧
+					}
+					if time.Since(time.Unix(0, last)) > s.wsKeepaliveIdleCap {
+						logf("ws pipe idle cap: no data frames for %v; closing cleanly", s.wsKeepaliveIdleCap)
+						deadline := time.Now().Add(time.Second)
+						closeMsg := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "idle")
+						_ = client.WriteControl(websocket.CloseMessage, closeMsg, deadline)
+						_ = upstream.WriteControl(websocket.CloseMessage, closeMsg, deadline)
+						_ = client.Close()
+						_ = upstream.Close()
+						return
+					}
+				}
+			}
+		}()
+	}
+
 	done := make(chan error, 2)
 	go func() {
-		done <- relayFrames(upstream, client, nil, wd.noteUpstream)
+		done <- relayFrames(upstream, client, nil, wd.noteUpstreamTurnDone)
 	}()
 	go func() {
 		done <- relayFrames(client, upstream, func(model string) {
 			// 首帧上报活动状态（与 HTTP native 路径同一入口）。
 			setRoute("openai", model, session)
-		}, wd.noteClient)
+		}, func([]byte) { wd.noteClient() })
 	}()
 	err := <-done
 
@@ -195,14 +256,37 @@ func (s *Server) serveWSPipe(client, upstream *websocket.Conn, r *http.Request) 
 }
 
 // noteUpstream/noteClient 由两侧搬运协程在读到帧时回调（看门狗指纹）。
+// 客户端数据帧同时置位在途 turn —— Responses over WS 的客户端帧就是
+// 请求（response.create / response.cancel），都期待上游回事件收尾。
 func (wd *wsWatchdog) noteUpstream() { wd.lastUpstream.Store(time.Now().UnixNano()) }
-func (wd *wsWatchdog) noteClient()   { wd.lastClientTx.Store(time.Now().UnixNano()) }
+func (wd *wsWatchdog) noteClient() {
+	wd.lastClientTx.Store(time.Now().UnixNano())
+	wd.turnActive.Store(true)
+}
+
+// noteUpstreamTurnDone 在读到上游帧时回调：更新静默指纹，若是 turn
+// 结束事件则复位在途 turn。
+func (wd *wsWatchdog) noteUpstreamTurnDone(data []byte) {
+	wd.lastUpstream.Store(time.Now().UnixNano())
+	if frameTurnDone(data) {
+		wd.turnActive.Store(false)
+	}
+}
+
+// inFlight 报告是否存在待收尾的 turn（activity 上报用；nil-safe）。
+func (wd *wsWatchdog) inFlight() bool {
+	if wd == nil {
+		return false
+	}
+	return wd.turnActive.Load()
+}
 
 // relayFrames 单向搬运帧。控制帧（ping/pong/close）由 gorilla 在各自
 // 连接上就地处理，不跨侧转发 —— 与通用 WS 代理的 hop-by-hop 语义一致。
 // onModel 在首个带 model 字段的文本帧上回调一次；onFrame 在每次读到
-// 帧时回调（看门狗的活性指纹）。
-func relayFrames(src, dst *websocket.Conn, onModel func(string), onFrame func()) error {
+// 数据帧时回调（携带原始帧内容：上游侧判 turn 结束事件，客户端侧只
+// 更新活性指纹）。
+func relayFrames(src, dst *websocket.Conn, onModel func(string), onFrame func(data []byte)) error {
 	reported := false
 	for {
 		mtype, data, err := src.ReadMessage()
@@ -210,7 +294,7 @@ func relayFrames(src, dst *websocket.Conn, onModel func(string), onFrame func())
 			return err
 		}
 		if onFrame != nil {
-			onFrame()
+			onFrame(data)
 		}
 		if mtype == websocket.TextMessage {
 			model := frameModel(data)
@@ -270,6 +354,24 @@ func frameModel(data []byte) string {
 		return ""
 	}
 	return probe.Model
+}
+
+// frameTurnDone 判断上游帧是否为 turn 结束事件。Responses 事件流的
+// 终态四类（completed/failed/incomplete/cancelled）；其余事件（流式
+// delta、item 增量等）一律视为 turn 仍在途 —— 保守方向：宁可多亮
+// 一会儿 generating，不把生成中的流误报成 idle。解析失败同判。
+func frameTurnDone(data []byte) bool {
+	var probe struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return false
+	}
+	switch probe.Type {
+	case "response.completed", "response.failed", "response.incomplete", "response.cancelled":
+		return true
+	}
+	return false
 }
 
 // parseRoutingHintModel 解析 x-codex-routing-hint（"model=slug" 或

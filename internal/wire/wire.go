@@ -35,6 +35,12 @@ type Request struct {
 	// 伪装成 function，响应翻译需要知道哪些名字要还原成
 	// custom_tool_call）。非 chat 协议为空。
 	CustomTools []string
+	// OmittedItemTypes / OmittedPartTypes：翻译期因类型未知被降级的
+	// input item / content part 类型名（占位符替换或丢弃）。非空说明
+	// 客户端协议形状未被翻译器完全覆盖，内容可能静默丢失——server
+	// 层负责告警日志。非 chat 协议为空。
+	OmittedItemTypes []string
+	OmittedPartTypes []string
 }
 
 // StreamOptions 携带响应翻译所需的会话上下文。

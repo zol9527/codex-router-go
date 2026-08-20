@@ -2,9 +2,8 @@
 // 视觉模型代读，转录文本替换进回合。桥改变的是"到达模型的内容"而非
 // 模型自身能力 —— 注册表保持诚实的 modality 声明。
 //
-// 规格来源：vision-bridge.mjs（证据合同、引擎解析、替换、缓存）与
-// 旧 AGENTS.md 的 vision bridge 章节（一图一购、并发共享、重试与
-// 回退、fail-closed 语义）。
+// 规格来源：vision-bridge.mjs（证据合同、引擎解析与替换）与旧
+// AGENTS.md 的 vision bridge 章节（fail-closed 语义）。
 package vision
 
 import (
@@ -78,11 +77,7 @@ func FocusInstructions(question string) string {
 
 // Settings 是 vision-bridge.json 的形状。
 type Settings struct {
-	Enabled      *bool  `json:"enabled,omitempty"`
-	Engine       string `json:"engine,omitempty"`    // pin 的引擎 slug；"local" 特指本地
-	Defaulted    bool   `json:"defaulted,omitempty"` // engine 是默认值而非操作者选择
-	LocalModel   string `json:"localModel,omitempty"`
-	LocalBaseURL string `json:"localBaseUrl,omitempty"`
+	Enabled *bool `json:"enabled,omitempty"`
 	// Effort 是操作者 pin 的读图推理档；空 = 跟随会话档，
 	// "default" 由写入端归一为空（把档位交还给引擎自己的默认）。
 	Effort string `json:"effort,omitempty"`
@@ -117,15 +112,6 @@ func WriteSettings(stateDir string, settings Settings) error {
 	}
 	return os.Rename(name, filepath.Join(stateDir, "vision-bridge.json"))
 }
-
-// LocalEngineSlug 是本地引擎的固定 pin 名。
-const LocalEngineSlug = "local"
-
-// Defaults for local engine。
-const (
-	DefaultLocalVisionBaseURL = "http://127.0.0.1:11434/v1"
-	DefaultLocalVisionModel   = "qwen2.5vl:3b"
-)
 
 // State 门控语义（结构性，非哨兵）：
 //   - 无文件 = 没人回答过 → 当前默认（开）适用；
