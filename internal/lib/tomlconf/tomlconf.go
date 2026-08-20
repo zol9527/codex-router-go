@@ -95,17 +95,66 @@ func (d *Document) RemoveTable(table string) {
 }
 
 // Render 按插入序输出 TOML 文本。只产出解析器自己认的形状 ——
-// 读写同一套转义，round-trip 永不产生自己读不回的文件。
+// 读写同一套转义（Quote），round-trip 永不产生自己读不回的文件。
 func (d *Document) Render() string {
 	var sb strings.Builder
 	for _, table := range d.order {
 		fmt.Fprintf(&sb, "[%s]\n", table)
 		for _, key := range d.keyOrder[table] {
-			fmt.Fprintf(&sb, "%s = %q\n", key, d.tables[table][key])
+			fmt.Fprintf(&sb, "%s = %s\n", key, Quote(d.tables[table][key]))
 		}
 		sb.WriteString("\n")
 	}
 	return sb.String()
+}
+
+// Quote 把任意字符串编码为 TOML basic string（含引号）。这是仓库里
+// 唯一一份 TOML 转义实现 —— 手术写路径（Render/UpsertKey）与宿主
+// 配置标记块（codexconfig）共用。控制字符一律 \uXXXX：Go %q 会产出
+// \x.. 形，那不是合法 TOML basic string，读路径（decodeBasicString）
+// 也不认 —— 用 Quote 才兑现"写出的永远读得回"。
+func Quote(value string) string {
+	var sb strings.Builder
+	sb.WriteByte('"')
+	for _, r := range value {
+		switch r {
+		case '"':
+			sb.WriteString(`\"`)
+		case '\\':
+			sb.WriteString(`\\`)
+		case '\n':
+			sb.WriteString(`\n`)
+		case '\t':
+			sb.WriteString(`\t`)
+		case '\r':
+			sb.WriteString(`\r`)
+		default:
+			if r < 0x20 || r == 0x7f {
+				fmt.Fprintf(&sb, `\u%04X`, r)
+				continue
+			}
+			sb.WriteRune(r)
+		}
+	}
+	sb.WriteByte('"')
+	return sb.String()
+}
+
+// ParseKeyValue 解析单行 `key = "basic string"`（容忍行内注释与首尾
+// 空白），返回解码后的值。非 basic string 赋值（数字/布尔/单引号/
+// 断引号）与表头、空行一律 ok=false —— 供宿主文件的只读探针使用，
+// 不因形状不合而报错（与 Parse 的 fail-closed 语义互补：探针不碰
+// 文件，只认领自己认识的行）。
+func ParseKeyValue(line string) (key, value string, ok bool) {
+	trimmed := strings.TrimSpace(stripComment(line))
+	if trimmed == "" || strings.HasPrefix(trimmed, "[") {
+		return "", "", false
+	}
+	k, v, err := parseAssignment(trimmed, 0)
+	if err != nil {
+		return "", "", false
+	}
+	return k, v, true
 }
 
 // Parse 解析文档。任何不认识的形状返回带行号的错误。
@@ -264,7 +313,7 @@ func UpsertKey(source, table, key, value string) (string, error) {
 		return "", err
 	}
 	lines := strings.Split(source, "\n")
-	entry := fmt.Sprintf("%s = %q", key, value)
+	entry := fmt.Sprintf("%s = %s", key, Quote(value))
 	start, end := tableSpan(lines, table)
 	if start < 0 {
 		// 文末新建表；保证与上文之间恰有一个空行分隔。

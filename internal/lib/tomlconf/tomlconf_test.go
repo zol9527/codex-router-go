@@ -209,3 +209,54 @@ func TestExpandEnvWithFallbackOrder(t *testing.T) {
 		t.Errorf("non-ref shape must stay verbatim, got %q", got)
 	}
 }
+
+func TestQuoteRoundTrip(t *testing.T) {
+	// Quote 是仓库唯一一份 TOML 转义：控制字符必须走 \uXXXX
+	// （Go %q 的 \x.. 不是合法 TOML），写出的形状 decodeBasicString
+	// 必须原样读回。
+	values := []string{
+		"plain",
+		`with "quotes" and \ backslash`,
+		"tab\tnewline\ncr\r",
+		"ctrl\x01\x02\x7f",
+		"unicode 中文 🧩",
+		"",
+	}
+	for _, v := range values {
+		quoted := Quote(v)
+		doc, err := Parse("[t]\nk = " + quoted + "\n")
+		if err != nil {
+			t.Errorf("Quote(%q) -> %s 不可解析: %v", v, quoted, err)
+			continue
+		}
+		if got, _ := doc.Get("t", "k"); got != v {
+			t.Errorf("round-trip diverged: %q != %q", got, v)
+		}
+	}
+}
+
+func TestParseKeyValue(t *testing.T) {
+	cases := []struct {
+		line   string
+		key    string
+		value  string
+		wantOK bool
+	}{
+		{`base_url = "https://x.dev"`, "base_url", "https://x.dev", true},
+		{`  key = "v"  # trailing comment`, "key", "v", true},
+		{`escaped = "a\"b"`, "escaped", `a"b`, true},
+		{`[table]`, "", "", false},
+		{`num = 42`, "", "", false},
+		{`lit = 'single'`, "", "", false},
+		{`broken = "unterminated`, "", "", false},
+		{``, "", "", false},
+		{`# only comment`, "", "", false},
+	}
+	for _, c := range cases {
+		k, v, ok := ParseKeyValue(c.line)
+		if ok != c.wantOK || (ok && (k != c.key || v != c.value)) {
+			t.Errorf("ParseKeyValue(%q) = (%q, %q, %v), want (%q, %q, %v)",
+				c.line, k, v, ok, c.key, c.value, c.wantOK)
+		}
+	}
+}

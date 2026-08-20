@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"github.com/loyd/codex-router/internal/lib/tomlconf"
 )
 
 const (
@@ -43,14 +45,14 @@ type RouterConfig struct {
 func rootBlock(cfg RouterConfig, addRealtimeCall, addRealtimeWebSocket bool, realtimeCallBaseURL string) string {
 	lines := []string{
 		startMarker,
-		fmt.Sprintf("openai_base_url = %s", tomlString(cfg.BaseURL)),
-		fmt.Sprintf("model_catalog_json = %s", tomlString(cfg.CatalogPath)),
+		fmt.Sprintf("openai_base_url = %s", tomlconf.Quote(cfg.BaseURL)),
+		fmt.Sprintf("model_catalog_json = %s", tomlconf.Quote(cfg.CatalogPath)),
 	}
 	if addRealtimeCall {
-		lines = append(lines, fmt.Sprintf("%s = %s", realtimeCallBaseURLKey, tomlString(realtimeCallBaseURL)))
+		lines = append(lines, fmt.Sprintf("%s = %s", realtimeCallBaseURLKey, tomlconf.Quote(realtimeCallBaseURL)))
 	}
 	if addRealtimeWebSocket {
-		lines = append(lines, fmt.Sprintf("%s = %s", realtimeWebSocketBaseURLKey, tomlString(defaultRealtimeWebSocketBaseURL)))
+		lines = append(lines, fmt.Sprintf("%s = %s", realtimeWebSocketBaseURLKey, tomlconf.Quote(defaultRealtimeWebSocketBaseURL)))
 	}
 	lines = append(lines, endMarker)
 	return strings.Join(lines, "\n")
@@ -62,39 +64,11 @@ func providerBlock(cfg RouterConfig) string {
 		providerStart,
 		"[model_providers." + providerID + "]",
 		`name = "Codex Router (external models)"`,
-		fmt.Sprintf("base_url = %s", tomlString(cfg.BaseURL)),
+		fmt.Sprintf("base_url = %s", tomlconf.Quote(cfg.BaseURL)),
 		`wire_api = "responses"`,
 		`supports_standalone_web_search = true`,
 		providerEnd,
 	}, "\n")
-}
-
-func tomlString(value string) string {
-	// JSON 字符串就是合法 TOML 基本字符串（转义规则兼容）。
-	return mustJSON(value)
-}
-
-func mustJSON(value string) string {
-	var buf strings.Builder
-	buf.WriteByte('"')
-	for _, r := range value {
-		switch r {
-		case '"':
-			buf.WriteString(`\"`)
-		case '\\':
-			buf.WriteString(`\\`)
-		case '\n':
-			buf.WriteString(`\n`)
-		case '\t':
-			buf.WriteString(`\t`)
-		case '\r':
-			buf.WriteString(`\r`)
-		default:
-			buf.WriteRune(r)
-		}
-	}
-	buf.WriteByte('"')
-	return buf.String()
 }
 
 // removeBlock 抠掉一个标记块（含）与其紧邻的前导空行。
@@ -278,16 +252,16 @@ func rootValue(lines []string, key string) (string, bool) {
 		if strings.HasPrefix(trimmed, "[") {
 			return "", false
 		}
-		if value, ok := tomlValue(line, key); ok {
-			return value, true
+		if k, v, ok := tomlconf.ParseKeyValue(line); ok && k == key {
+			return v, true
 		}
 	}
 	return "", false
 }
 
 func lineHasTomlValue(line, key, want string) bool {
-	value, ok := tomlValue(line, key)
-	return ok && value == want
+	k, v, ok := tomlconf.ParseKeyValue(line)
+	return ok && k == key && v == want
 }
 
 // Status 报告集成状态（脱敏：不回完整 base URL）。
@@ -311,23 +285,14 @@ func Status(configPath string) (installed bool, baseURL string, catalogPath stri
 		if !inBlock {
 			continue
 		}
-		if v, ok := tomlValue(line, "openai_base_url"); ok {
+		if k, v, ok := tomlconf.ParseKeyValue(line); ok && k == "openai_base_url" {
 			baseURL = v
 		}
-		if v, ok := tomlValue(line, "model_catalog_json"); ok {
+		if k, v, ok := tomlconf.ParseKeyValue(line); ok && k == "model_catalog_json" {
 			catalogPath = v
 		}
 	}
 	return
-}
-
-func tomlValue(line, key string) (string, bool) {
-	pattern := regexp.MustCompile(`^\s*` + regexp.QuoteMeta(key) + `\s*=\s*"(.*)"\s*(?:#.*)?$`)
-	m := pattern.FindStringSubmatch(line)
-	if m == nil {
-		return "", false
-	}
-	return m[1], true
 }
 
 func joinNamed(base, catalog bool) string {
