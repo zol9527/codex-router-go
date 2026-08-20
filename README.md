@@ -147,8 +147,8 @@ zai HTTP 流挂 8 分半、原生 WSS 管道零回帧 10 分钟、Surge fake-IP 
 
 ## 扩展协议
 
-provider 在注册表里声明协议（`internal/registry/config/`），
-`internal/wire/` 是协议抽象层：**新协议 = 新增一个包实现
+provider 在注册表里声明协议（`internal/domain/registry/config/`），
+`internal/domain/wire/` 是协议抽象层：**新协议 = 新增一个包实现
 `wire.Protocol` 接口 + 注册**，服务端零改动。内置两种：
 
 - `chat-completions`（默认）：Responses ↔ chat-completions 双向翻译
@@ -197,11 +197,13 @@ go build ./... && go test ./...          # Go 侧（12 个测试包）
 ./scripts/build-macos-tray-app.sh        # 重建 App（含内嵌 Go 二进制）
 ```
 
-目录：`cmd/codex-router/`（CLI 入口）· `internal/wire/`（协议层）·
-`internal/translate/`（纯翻译库）· `internal/server/`（HTTP 服务）·
-`internal/registry/`（注册表 + 内嵌 config）· `internal/state/`、
-`internal/cred/`、`internal/tomlconf/`、`internal/usage/`、`internal/vision/` ·
-`apps/macos/ModelRouterTray/`（Swift App）。
+`internal/` 按语义四层组织（ADR-0005，依赖边只朝下，`internal/arch`
+测试钉住）：`cmd/codex-router/`（薄入口）+ `internal/app/cli/`（命令
+实现）· `app/`（server、controlplane、codexconfig —— 对外表面）·
+`engine/`（routing、nativebackend、catalog、discover —— 任务执行）·
+`domain/`（registry、translate、wire、state、cred、usage、vision ——
+领域数据与接缝）· `lib/`（httpx、tomlconf、modelmeta —— 共享实现
+单点归宿）· `apps/macos/ModelRouterTray/`（Swift App）。
 
 状态目录 `~/.codex-router`；`GO-REWRITE-PLAN.md` 是设计与迁移的
 权威记录。

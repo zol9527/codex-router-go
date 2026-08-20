@@ -1,6 +1,6 @@
 // ControlContract.swift —— tray 与 codex-router 控制面之间的 JSON 契约。
 //
-// 这里的 Decodable 结构与 Go 侧 internal/controlplane 的类型化 Snapshot
+// 这里的 Decodable 结构与 Go 侧 internal/app/controlplane 的类型化 Snapshot
 // 对端：加字段两边同步改；Go 侧输出 null 数组会让这里的 [T] 解码直接
 // 失败（契约测试钉住）。RouterError / RouterHealth / RouterActivity
 // 原为 ModelRouterTrayApp.swift 的文件私有类型，拆分后改为模块内可见。
