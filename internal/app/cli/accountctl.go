@@ -1,4 +1,4 @@
-package main
+package cli
 
 // 配额卡片命令：account（ChatGPT 原生订阅）与 provider-usage
 //（zai/opencode 账号端点 + usage-events 聚合）。

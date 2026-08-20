@@ -1,4 +1,4 @@
-package main
+package cli
 
 import (
 	"slices"
@@ -22,7 +22,7 @@ func TestControlSetProviderToggle(t *testing.T) {
 	}
 
 	// litellm on（tray 原始形状：尾部带 --targets codex）。
-	if err := cmdControl([]string{"set", "litellm", "on", "--targets", "codex", "--state", dir}); err != nil {
+	if err := cmdControl([]string{"set", "litellm", "on", "--targets", "codex", "--state", dir}, "test"); err != nil {
 		t.Fatalf("set litellm on: %v", err)
 	}
 	if got := st.EnabledProviders(); !slices.Contains(got, "litellm") {
@@ -30,7 +30,7 @@ func TestControlSetProviderToggle(t *testing.T) {
 	}
 
 	// litellm off。
-	if err := cmdControl([]string{"set", "litellm", "off", "--targets", "codex", "--state", dir}); err != nil {
+	if err := cmdControl([]string{"set", "litellm", "off", "--targets", "codex", "--state", dir}, "test"); err != nil {
 		t.Fatalf("set litellm off: %v", err)
 	}
 	if got := st.EnabledProviders(); slices.Contains(got, "litellm") {
@@ -41,13 +41,13 @@ func TestControlSetProviderToggle(t *testing.T) {
 	}
 
 	// 既有 provider 关闭再打开（移除分支）。
-	if err := cmdControl([]string{"set", "zai-coding", "off", "--state", dir}); err != nil {
+	if err := cmdControl([]string{"set", "zai-coding", "off", "--state", dir}, "test"); err != nil {
 		t.Fatalf("set zai-coding off: %v", err)
 	}
 	if got := st.EnabledProviders(); slices.Contains(got, "zai-coding") {
 		t.Fatalf("zai-coding must be disabled after set off, got %v", got)
 	}
-	if err := cmdControl([]string{"set", "zai-coding", "on", "--state", dir}); err != nil {
+	if err := cmdControl([]string{"set", "zai-coding", "on", "--state", dir}, "test"); err != nil {
 		t.Fatalf("set zai-coding on: %v", err)
 	}
 	if got := st.EnabledProviders(); !slices.Contains(got, "zai-coding") {
@@ -58,7 +58,7 @@ func TestControlSetProviderToggle(t *testing.T) {
 // 未知 provider 必须报错（tray 会回滚 UI 开关态）。
 func TestControlSetProviderUnknown(t *testing.T) {
 	dir := t.TempDir()
-	if err := cmdControl([]string{"set", "no-such-provider", "on", "--state", dir}); err == nil {
+	if err := cmdControl([]string{"set", "no-such-provider", "on", "--state", dir}, "test"); err == nil {
 		t.Fatal("unknown provider must error")
 	}
 }
@@ -67,7 +67,7 @@ func TestControlSetProviderUnknown(t *testing.T) {
 func TestControlSetProviderIdempotent(t *testing.T) {
 	dir := t.TempDir()
 	for range 2 {
-		if err := cmdControl([]string{"set", "litellm", "on", "--state", dir}); err != nil {
+		if err := cmdControl([]string{"set", "litellm", "on", "--state", dir}, "test"); err != nil {
 			t.Fatalf("set litellm on: %v", err)
 		}
 	}
@@ -86,7 +86,7 @@ func TestControlSetProviderIdempotent(t *testing.T) {
 		t.Fatalf("repeated on must not duplicate, got %v", got)
 	}
 	for range 2 {
-		if err := cmdControl([]string{"set", "litellm", "off", "--state", dir}); err != nil {
+		if err := cmdControl([]string{"set", "litellm", "off", "--state", dir}, "test"); err != nil {
 			t.Fatalf("set litellm off: %v", err)
 		}
 	}

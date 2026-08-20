@@ -1,4 +1,4 @@
-package main
+package cli
 
 // vision-bridge 的 control 面板命令。读图引擎固定为 native（调用方的
 // ChatGPT 会话），没有引擎选择；这里只剩开关、档位与状态。

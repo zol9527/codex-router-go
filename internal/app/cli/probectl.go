@@ -1,4 +1,4 @@
-package main
+package cli
 
 // control probe：上游行为探针。直接打 provider 端点（绕过 serve 的
 // 翻译管道），把"上游当不可信边界"运营化——上游的行为漂移（静默丢

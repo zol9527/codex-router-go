@@ -1,4 +1,4 @@
-package main
+package cli
 
 // vision-bridge control 动作与快照块的形状测试：这些是 tray 设置页
 // 视觉卡的调用面 —— Swift 侧按钮一次失败就是一次"按钮不成功"，

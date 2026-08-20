@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 
@@ -225,25 +224,15 @@ func (s *Server) recordTurn(event usage.Event) {
 	}
 }
 
-// providerBaseURL 解析 provider 的上游地址（env 覆盖 > config base_url >
-// 注册表默认）。config 档服务自托管 provider（如 LiteLLM）：注册表不
-// 内嵌部署地址，运行时从 config.toml 的 provider 表读取。
+// providerBaseURL 委托 registry.ResolveBaseURL（规则全仓库唯一一份：
+// env 覆盖 > config base_url > 注册表默认，config 档服务自托管
+// provider 如 LiteLLM）。State 为 nil 时跳过 config 档（测试语境）。
 func (s *Server) providerBaseURL(p *registry.Provider) string {
-	if p.BaseURLEnv != "" {
-		if v := os.Getenv(p.BaseURLEnv); v != "" {
-			return v
-		}
-	}
-	family := p.ID
-	if p.VariantOf != "" {
-		family = p.VariantOf
-	}
+	var configBaseURL func(family string) string
 	if s.opt.State != nil {
-		if v := strings.TrimSpace(s.opt.State.ReadConfigBaseURL(family)); v != "" {
-			return v
-		}
+		configBaseURL = s.opt.State.ReadConfigBaseURL
 	}
-	return p.BaseURL
+	return registry.ResolveBaseURL(p, configBaseURL)
 }
 
 func cloneMap(source map[string]any) map[string]any {

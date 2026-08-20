@@ -1,4 +1,4 @@
-package main
+package cli
 
 import (
 	"bufio"
@@ -27,7 +27,7 @@ import (
 // cmdControl：tray 的控制面。子命令集合是旧 bin/control 的核心裁剪：
 // --json / service / providers / credential。tray 通过
 // `codex-router control <args>` 调用（bin/control 改写 exec 目标后零改动）。
-func cmdControl(args []string) error {
+func cmdControl(args []string, version string) error {
 	if len(args) == 0 {
 		controlUsage()
 		return nil
@@ -101,7 +101,7 @@ func cmdControl(args []string) error {
 
 	switch {
 	case len(rest) == 1 && rest[0] == "--json":
-		return controlJSON(st, reg)
+		return controlJSON(st, reg, version)
 	case len(rest) >= 1 && rest[0] == "service":
 		return controlService(rest[1:])
 	case len(rest) >= 1 && rest[0] == "providers" && len(rest) >= 3 && rest[1] == "enable":
@@ -208,7 +208,7 @@ func cutControlCommand(rest []string) string {
 // controlJSON 是 tray 五分钟轮询的主快照。契约形状归
 // internal/app/controlplane（类型化 Snapshot，与 Swift RouterSnapshot
 // 解码器锚定）；这里只做依赖装配与 stdout 输出。
-func controlJSON(st *state.State, reg *registry.Registry) error {
+func controlJSON(st *state.State, reg *registry.Registry, version string) error {
 	marshal := func(v any) json.RawMessage {
 		raw, err := json.Marshal(v)
 		if err != nil {

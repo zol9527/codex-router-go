@@ -1,4 +1,4 @@
-package main
+package cli
 
 // codex shim：PATH 上一个名为 codex 的包装，验证 router 活着后
 // exec 真 codex。移植 codex-shim.mjs 的安全约束：

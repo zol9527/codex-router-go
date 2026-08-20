@@ -254,6 +254,29 @@ func (r *Registry) CanonicalProviderID(id string) string {
 	return id
 }
 
+// ResolveBaseURL 解析 provider 的上游地址，规则全仓库唯一一份：
+// env 覆盖 > 操作者 config.toml 的 provider 表 base_url（变体归并到
+// 家族主项）> 注册表默认。configBaseURL 由调用方注入（server 传
+// State 的读取方法，CLI 同理），registry 保持零状态目录依赖；
+// 传 nil 跳过 config 档。
+func ResolveBaseURL(p *Provider, configBaseURL func(family string) string) string {
+	if p.BaseURLEnv != "" {
+		if v := os.Getenv(p.BaseURLEnv); v != "" {
+			return v
+		}
+	}
+	family := p.ID
+	if p.VariantOf != "" {
+		family = p.VariantOf
+	}
+	if configBaseURL != nil {
+		if v := strings.TrimSpace(configBaseURL(family)); v != "" {
+			return v
+		}
+	}
+	return p.BaseURL
+}
+
 // BySlug 按 slug 查模型（未注册返回 nil）。
 func (r *Registry) BySlug(slug string) *Model {
 	return r.bySlug[slug]

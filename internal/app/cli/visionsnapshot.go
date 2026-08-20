@@ -1,4 +1,4 @@
-package main
+package cli
 
 // control --json 的 visionBridge 区块：tray 设置页视觉卡的数据源。
 // 形状以 Swift 端 VisionBridgeSnapshot 解码器为准（enabled/

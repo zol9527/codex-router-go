@@ -1,12 +1,10 @@
-package main
+package cli
 
 import (
 	"context"
 	"flag"
 	"fmt"
 	"net/http"
-	"os"
-	"strings"
 	"time"
 
 	"github.com/loyd/codex-router/internal/domain/cred"
@@ -15,23 +13,10 @@ import (
 	"github.com/loyd/codex-router/internal/engine/discover"
 )
 
-// providerBaseURL 与 server.(*Server).providerBaseURL 同规则：
-// env 覆盖 > config.toml 的 provider 表 base_url > 注册表默认。
+// providerBaseURL 委托 registry.ResolveBaseURL（规则全仓库唯一一份）。
 // config 档服务自托管 provider（如 LiteLLM）：注册表不内嵌部署地址。
 func providerBaseURL(st *state.State, p *registry.Provider) string {
-	if p.BaseURLEnv != "" {
-		if v := os.Getenv(p.BaseURLEnv); v != "" {
-			return v
-		}
-	}
-	family := p.ID
-	if p.VariantOf != "" {
-		family = p.VariantOf
-	}
-	if v := strings.TrimSpace(st.ReadConfigBaseURL(family)); v != "" {
-		return v
-	}
-	return p.BaseURL
+	return registry.ResolveBaseURL(p, st.ReadConfigBaseURL)
 }
 
 // cmdDiscover：只读的模型发现 —— 实时请求 provider 的 /v1/models，
