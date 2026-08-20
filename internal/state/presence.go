@@ -139,9 +139,10 @@ func ServiceFollowsHostApps(stateDir string) bool {
 	return EffectivePresenceMode(stateDir) == PresenceFollowCodex
 }
 
-// PresenceSnapshot 是 control --json 的 presence 块。tray 的
-// RouterPresence 四个字段全部非可选 —— harnessPublished 随 dsh 目标
-// 砍掉后仍须发显式 false，缺键会让 tray 整个快照解码失败。
+// PresenceSnapshot 是 control --json 的 presence 块（以 RawMessage 挂进
+// controlplane.Snapshot）。tray 的 RouterPresence 四个字段全部非可选 ——
+// harnessPublished 随 dsh 目标砍掉后仍须发显式 false，缺键会让 tray
+// 整个快照解码失败（顶层形状契约见 internal/controlplane/contract.go）。
 func PresenceSnapshot(stateDir string) map[string]any {
 	return map[string]any{
 		"mode":             ReadPresenceMode(stateDir),

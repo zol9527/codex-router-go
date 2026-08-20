@@ -38,8 +38,9 @@ flowchart LR
 
 | 路径 | 职责 |
 | --- | --- |
-| `cmd/codex-router/` | CLI 入口：`serve`、`install`、`uninstall`、`discover`、`doctor`、`control`、`shim` 等子命令。 |
+| `cmd/codex-router/` | CLI 入口：`serve`、`install`、`uninstall`、`discover`、`doctor`、`control`、`shim` 等子命令；control 是薄适配，契约与生命周期归 `internal/controlplane`。 |
 | `internal/server/` | HTTP transport：路由、认证、Responses 分流、WS 代理、错误翻译、usage 记录，以及把 HTTP 响应绑定到 routing 接缝。 |
+| `internal/controlplane/` | tray 控制面契约与服务生命周期：`control --json` 的类型化 Snapshot（与 Swift `ControlContract.swift` 解码器锚定）、provider 展示顺序、detached 启动与 pidfile 停止。 |
 | `internal/routing/` | 一次 routed turn 的完整编排：输入归一化、视觉桥、工具/namespace 适配、wire 调用、流式守卫、错误收尾与 usage 计量。 |
 | `internal/nativebackend/` | 原生 ChatGPT/Codex 后端适配：白名单请求头、会话凭据兜底、响应转发和图片描述。 |
 | `internal/registry/` | 内嵌供应商与模型注册表；加载 `config/` 目录并建立 `slug` / `gatewayModel` 索引。 |
@@ -54,7 +55,7 @@ flowchart LR
 | `internal/usage/` | 记录 `usage-events.jsonl`，维护配额、限流、供应商用量统计。 |
 | `internal/vision/` | 图片桥：文本模型无法直接读图时，由本地视觉模型先读图并转成文字描述。 |
 | `internal/httpx/` | HTTP 客户端、压缩、超时、SSE / 流式传输基础设施。 |
-| `apps/macos/ModelRouterTray/` | macOS Swift / SwiftUI App：托盘、主窗口、设置页、服务托管、模型管理。 |
+| `apps/macos/ModelRouterTray/` | macOS Swift / SwiftUI App：托盘、主窗口、设置页、服务托管、模型管理。契约解码在 `ControlContract.swift`（与 Go `internal/controlplane` 对端），服务生命周期在 `ServiceLifecycle.swift`（App 托管路径 + Codex 桌面重启），control 进程执行在 `ControlClient.swift`（RouterControlClient）。 |
 | `skills/` | 项目相关 Codex 技能说明。 |
 | `docs/` | 研究与架构文档。 |
 | `scripts/` | macOS App / 桌面托盘 / 图标等构建脚本。 |
@@ -175,16 +176,16 @@ POST /v1/search/...
 
 ## 7. 协议抽象
 
-`internal/wire` 是协议扩展点。每个协议实现 `wire.Protocol` 并在 `init()` 中注册；`routing.Runner` 只面向接口，不感知具体供应商协议。
+`internal/wire` 是协议扩展点。每个协议实现 `wire.Protocol`（请求方向：`Name` / `Prepare` / `NeedsResponseTranslation`）并在 `init()` 中注册；`routing.Runner` 只面向接口，不感知具体供应商协议。响应方向按能力拆分：需要把上游响应翻译回 Responses 的协议额外实现 `wire.ResponseTranslator`（流式 + 非流式翻译），直通协议不实现 —— 每个协议只承诺自己做得到的事，没有 panic 占位。请求画像（effort 阶梯、参数清洗）是 `Prepare` 的私有阶段，不出现在接口上。
 
 当前有两条协议路径：
 
 | 协议注册名 | 适用供应商 | 请求方向 | 响应方向 |
 | --- | --- | --- | --- |
-| `chat-completions` | 仅支持 Chat Completions 的 OpenAI-compatible 供应商 | Responses → Chat Completions | Chat SSE → Responses SSE |
-| `responses` | 原生支持 Responses 的供应商 | 保留协议字段，仅还原上游模型名并剥除 Codex 专属标记 | 字节 / JSON 直通 |
+| `chat-completions` | 仅支持 Chat Completions 的 OpenAI-compatible 供应商 | Responses → Chat Completions | Chat SSE → Responses SSE（实现 `ResponseTranslator`） |
+| `responses` | 原生支持 Responses 的供应商 | 保留协议字段，仅还原上游模型名并剥除 Codex 专属标记 | 字节 / JSON 直通（不实现 `ResponseTranslator`） |
 
-新增协议时实现并注册 `wire.Protocol`，再在 provider 注册表中声明对应协议即可，不需要修改 server 主管线。
+新增协议时实现并注册 `wire.Protocol`（翻译协议再加 `wire.ResponseTranslator`），再在 provider 注册表中声明对应协议即可，不需要修改 server 主管线。
 
 ## 8. 模型注册表
 

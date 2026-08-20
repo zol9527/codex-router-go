@@ -15,11 +15,9 @@ import (
 	"time"
 
 	"github.com/loyd/codex-router/internal/httpx"
-	"github.com/loyd/codex-router/internal/nativebackend"
 	"github.com/loyd/codex-router/internal/registry"
 	"github.com/loyd/codex-router/internal/translate"
 	"github.com/loyd/codex-router/internal/usage"
-	"github.com/loyd/codex-router/internal/vision"
 	"github.com/loyd/codex-router/internal/wire"
 	_ "github.com/loyd/codex-router/internal/wire/chatcompletion"
 	_ "github.com/loyd/codex-router/internal/wire/responses"
@@ -43,18 +41,16 @@ type ErrorTranslator func(status int, bodyText, modelName, providerName, provide
 type VisionBridge func(ctx context.Context, header http.Header, payload map[string]any, model *registry.Model)
 
 // Runner 是 Routing Turn 的外部 interface。主回合与压缩共享私有
-// implementation，中间阶段不外泄。
+// implementation，中间阶段不外泄。native 中继与读图桥不在此列：
+// 两者都依赖 server 的会话状态（collab 归一化、vision 缓存），由
+// NormalizeInput / BridgeVision 注入，routing 不直接持有 nativebackend。
 type Runner struct {
 	Registry               func() *registry.Registry
-	Credential             func(provider *registry.Provider) string
-	Native                 nativebackend.Client
-	VisionCache            *vision.SessionCache
 	Client                 *http.Client
 	Idle                   time.Duration
 	Version                string
 	Recorder               *usage.Recorder
 	RateLimits             *usage.RateLimitStore
-	StateDir               string
 	NormalizeInput         func(context.Context, []any) []any
 	BridgeVision           VisionBridge
 	ProviderBaseURL        func(*registry.Provider) string
@@ -192,8 +188,9 @@ func (sr *StreamRelay) FinishFlushWith(payload []byte) error {
 
 // RunAttempt 执行一次上游请求并增量翻译。它是 Routing Turn 与 HTTP
 // transport 之间的最小稳定接缝；调用方负责选择协议、错误码和最终 usage。
+// proto 必须是翻译协议（wire.ResponseTranslator）—— 直通协议不走流翻译。
 func (r *Runner) RunAttempt(ctx context.Context, target string, headers map[string]string,
-	body []byte, model *registry.Model, proto wire.Protocol, opts wire.StreamOptions,
+	body []byte, model *registry.Model, proto wire.ResponseTranslator, opts wire.StreamOptions,
 	relay *StreamRelay) (*AttemptOutcome, error) {
 	if ctx == nil {
 		ctx = context.Background()

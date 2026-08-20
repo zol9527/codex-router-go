@@ -48,10 +48,6 @@ func (Protocol) Prepare(responsesRequest map[string]any, model *registry.Model) 
 	}, nil
 }
 
-// ApplyRequestProfile 已在 Prepare 内完成；接口方法保留为空操作
-// （Prepare 是协议实现的自留地，server 不单独调用）。
-func (Protocol) ApplyRequestProfile(_ map[string]any, _ string, _ *registry.Model) {}
-
 // NeedsResponseTranslation：chat 响应必须转回 Responses。
 func (Protocol) NeedsResponseTranslation() bool { return true }
 

@@ -6,8 +6,6 @@ package server
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -109,11 +107,12 @@ func (s *Server) visionCandidates(header http.Header) []vision.Engine {
 }
 
 func (s *Server) hasUpstreamAuthorization(header http.Header) bool {
-	authorization := strings.TrimSpace(header.Get("Authorization"))
-	if authorization == "" {
+	if strings.TrimSpace(header.Get("Authorization")) == "" {
 		return false
 	}
-	return !s.isRouterLocalToken(authorization)
+	// 纯空白 Authorization 先行判空后，本地密钥判定语义与
+	// CallerHasCredential 完全一致（非 bearer 方案按外部凭据处理）。
+	return s.native.CallerHasCredential(header)
 }
 
 // describeCaller 装配读图调用：native 单路。native 路径经闭包捕获
@@ -134,71 +133,4 @@ func (s *Server) describeNative(ctx context.Context, engine vision.Engine, effor
 		Engine: engine, Effort: effort, Question: question, DataURL: dataURL,
 		Header: header, MaxBytes: 8 << 20,
 	})
-}
-
-// parseNativeTranscriptStream 从 native /responses 的 SSE 流提取文本：
-// 聚合 response.output_text.delta；completed 事件携带的完整 output
-// 作兜底（两种形态都在流里，先到先用）。
-func parseNativeTranscriptStream(payload []byte) (string, error) {
-	var deltas strings.Builder
-	completed := json.RawMessage(nil)
-	for _, line := range strings.Split(string(payload), "\n") {
-		line = strings.TrimRight(line, "\r")
-		if !strings.HasPrefix(line, "data:") {
-			continue
-		}
-		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if data == "" || data == "[DONE]" {
-			continue
-		}
-		var event struct {
-			Type     string          `json:"type"`
-			Delta    string          `json:"delta"`
-			Response json.RawMessage `json:"response"`
-		}
-		if err := json.Unmarshal([]byte(data), &event); err != nil {
-			continue
-		}
-		switch event.Type {
-		case "response.output_text.delta":
-			deltas.WriteString(event.Delta)
-		case "response.completed":
-			completed = event.Response
-		}
-	}
-	if text := deltas.String(); strings.TrimSpace(text) != "" {
-		return text, nil
-	}
-	if len(completed) > 0 {
-		return parseNativeTranscript(completed)
-	}
-	return "", fmt.Errorf("native engine returned no transcript")
-}
-
-// parseNativeTranscript 从 native /responses 响应对象提取文本
-// （completed 事件的 response 兜底路径）。
-func parseNativeTranscript(payload []byte) (string, error) {
-	var parsed struct {
-		Output []struct {
-			Content []struct {
-				Text string `json:"text"`
-			} `json:"content"`
-		} `json:"output"`
-	}
-	if err := json.Unmarshal(payload, &parsed); err != nil {
-		return "", err
-	}
-	var texts []string
-	for _, item := range parsed.Output {
-		for _, part := range item.Content {
-			if part.Text != "" {
-				texts = append(texts, part.Text)
-			}
-		}
-	}
-	joined := strings.Join(texts, "\n")
-	if strings.TrimSpace(joined) == "" {
-		return "", fmt.Errorf("native engine returned no transcript")
-	}
-	return joined, nil
 }

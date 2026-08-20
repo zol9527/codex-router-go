@@ -244,13 +244,11 @@ func New(opt Options) (*Server, error) {
 	}
 	server.routeRunner = &routing.Runner{
 		Registry:       server.registry,
-		Native:         server.native,
 		Client:         server.client,
 		Idle:           server.upstreamIdle,
 		Version:        Version,
 		Recorder:       server.opt.Usage,
 		RateLimits:     server.opt.RateLimits,
-		StateDir:       server.opt.State.Dir,
 		NormalizeInput: server.normalizeRoutedAgentInput,
 		BridgeVision: func(ctx context.Context, header http.Header, payload map[string]any, model *registry.Model) {
 			server.bridgeVision(ctx, header, payload, model)

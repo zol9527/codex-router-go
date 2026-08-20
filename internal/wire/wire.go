@@ -71,7 +71,9 @@ type StreamTranslator interface {
 	SubstitutedInputTokens() int
 }
 
-// Protocol 是一条协议路径的完整适配。
+// Protocol 是一条协议路径的最小完整适配：请求方向。每个协议实现都
+// 能诚实地实现全部方法 —— 画像施加（effort 阶梯、参数清洗）属于
+// Prepare 的私有阶段（作用于上游协议字段），不再外露为接口方法。
 type Protocol interface {
 	// Name 是协议注册名（"chat-completions"、"responses"）。
 	Name() string
@@ -80,15 +82,26 @@ type Protocol interface {
 	// NeedsResponseTranslation 报告上游响应是否需要转回 Responses：
 	// 直通协议为 false（上游本来就是 Responses，字节原样转发）。
 	NeedsResponseTranslation() bool
+}
+
+// ResponseTranslator 是翻译协议（NeedsResponseTranslation=true）的
+// 响应方向能力。直通协议不实现该接口 —— 上游响应原样转发，不存在
+// "翻译"实现，接口拆分让每个协议只承诺自己做得到的事。
+type ResponseTranslator interface {
 	// NewStreamTranslator 创建上游 SSE → Responses SSE 的流转换器。
-	// 仅 NeedsResponseTranslation 为 true 的协议被调用。
 	NewStreamTranslator(model *registry.Model, opts StreamOptions) StreamTranslator
 	// TranslateNonStream 把非流式上游响应整体翻译成 Responses JSON。
 	TranslateNonStream(upstreamBody map[string]any, model *registry.Model, opts StreamOptions) map[string]any
-	// ApplyRequestProfile 施加模型的上游请求画像（effort 阶梯、参数清洗）。
-	// Prepare 内部完成 model 替换后调用，职责在协议实现里因为画像
-	// 作用于上游协议的字段（chat 的 reasoning_effort / responses 的 reasoning）。
-	ApplyRequestProfile(body map[string]any, requestedEffort string, model *registry.Model)
+}
+
+// TranslatorFor 断言协议的响应翻译能力。NeedsResponseTranslation=true
+// 的协议必须同时实现 ResponseTranslator —— 违反即注册期契约错误，
+// 拒绝静默降级。
+func TranslatorFor(p Protocol) (ResponseTranslator, error) {
+	if t, ok := p.(ResponseTranslator); ok {
+		return t, nil
+	}
+	return nil, fmt.Errorf("protocol %q needs response translation but implements no ResponseTranslator", p.Name())
 }
 
 // ---- 注册表 ----

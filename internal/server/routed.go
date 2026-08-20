@@ -100,7 +100,6 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request, route s
 	// 避免并发请求共享可变 recorder 指针。
 	runner.Recorder = s.opt.Usage
 	runner.RateLimits = s.opt.RateLimits
-	runner.Native = s.native
 	runner.Client = s.client
 	runner.Idle = s.upstreamIdle
 	runner.Run(routing.Request{
@@ -116,7 +115,7 @@ func (s *Server) handleNativeTurn(w http.ResponseWriter, r *http.Request, route 
 
 	setRoute("openai", requestedModel, sessionNameFromHeaders(r.Header))
 	native := payload
-	if s.callerBroughtNoUpstreamCredential(r) {
+	if !s.native.CallerHasCredential(r.Header) {
 		native = cloneMap(payload)
 		native["store"] = false
 		for _, key := range nativeUnsupportedParams {

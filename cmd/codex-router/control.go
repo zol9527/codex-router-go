@@ -3,12 +3,10 @@ package main
 import (
 	"bufio"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -18,6 +16,7 @@ import (
 	"context"
 	"github.com/loyd/codex-router/internal/catalog"
 	"github.com/loyd/codex-router/internal/configfile"
+	"github.com/loyd/codex-router/internal/controlplane"
 
 	"github.com/loyd/codex-router/internal/cred"
 	"github.com/loyd/codex-router/internal/discover"
@@ -206,96 +205,28 @@ func cutControlCommand(rest []string) string {
 	return ""
 }
 
-// controlJSON 是 tray 五分钟轮询的主快照。形状必须对齐 tray 的
-// RouterSnapshot 解码器（ModelRouterTrayApp.swift）：
-//
-//	targets: {codex: {target, configured, active, enabledProviders,
-//	                  providers[], models[]}} —— 字典而非扁平字段；
-//	presence 四个字段全部非可选，缺 harnessPublished 会让整个快照
-//	解码失败，面板落到「路由不可用」。
+// controlJSON 是 tray 五分钟轮询的主快照。契约形状归
+// internal/controlplane（类型化 Snapshot，与 Swift RouterSnapshot
+// 解码器锚定）；这里只做依赖装配与 stdout 输出。
 func controlJSON(st *state.State, reg *registry.Registry) error {
-	enabled := st.EnabledProviders()
-	enabledSet := map[string]bool{}
-	for _, id := range enabled {
-		enabledSet[id] = true
-	}
-	resolver := cred.New(st)
-
-	providers := []map[string]any{}
-	models := []map[string]any{}
-	for _, id := range orderedProviderIDs(reg) {
-		p := reg.Providers[id]
-		if p == nil || p.VariantOf != "" {
-			continue // 变体跟随家族主项，不单独展示
+	marshal := func(v any) json.RawMessage {
+		raw, err := json.Marshal(v)
+		if err != nil {
+			return json.RawMessage("{}")
 		}
-		_, source := resolver.Resolve(p)
-		providers = append(providers, map[string]any{
-			"id": p.ID, "displayName": p.DisplayName, "kind": p.Kind,
-			"enabled":              enabledSet[p.ID],
-			"credentialConfigured": source != "",
-			"credentialSource":     source,
-		})
+		return raw
 	}
-	hidden := state.ReadPickerHidden(st.Dir)
-	// 分身裁决与 catalog 同规：注册表证明 OR 本地声明，disabled/隐藏
-	// 一票否决。UI 看到的必须是有效版本而不是注册表原始值 —— 否则
-	// 本地声明的模型（declared）在设置页里凭空消失。
-	subagentSettings := state.ReadSubagentSettings(st.Dir)
-	resolvedSubagents := map[string]*registry.Model{}
-	for _, m := range catalog.ApplySubagentMultiAgent(reg.Models, subagentSettings, hidden) {
-		resolvedSubagents[m.Slug] = m
-	}
-	declaredSubagents := map[string]bool{}
-	for _, slug := range subagentSettings.Declared {
-		declaredSubagents[slug] = true
-	}
-	for _, m := range reg.Models {
-		if !m.Listed || !st.ProviderEnabled(m.Provider, reg.CanonicalProviderID) {
-			continue
-		}
-		entry := map[string]any{
-			"slug": m.Slug, "displayName": m.DisplayName,
-			"provider": reg.CanonicalProviderID(m.Provider),
-			// RouterModel.enabled 非可选：能进这张表的模型都是
-			// 已启用 provider 下的已发布模型，恒为 true。
-			"enabled": st.ProviderEnabled(m.Provider, reg.CanonicalProviderID),
-			// visible = 未被 picker 隐藏；multiAgentVersion 供分身
-			// UI 判断候选资格（nil = v1，取裁决后的有效值）。
-			"visible": !hidden[m.Slug],
-			// proven = 注册表证明；declared = 本地声明。UI 据此区分
-			// 开关语义：证明过的走 disabled 收窄，未证明的走声明通道。
-			"proven":   m.MultiAgentVersion == "v2",
-			"declared": declaredSubagents[m.Slug],
-		}
-		if resolved := resolvedSubagents[m.Slug]; resolved != nil && resolved.MultiAgentVersion == "v2" {
-			entry["multiAgentVersion"] = "v2"
-		}
-		models = append(models, entry)
-	}
-	target := map[string]any{
-		"target":           "codex",
-		"configured":       true,
-		"active":           probeURL(fmt.Sprintf("http://127.0.0.1:%d/health", defaultPort())),
-		"enabledProviders": enabled,
-		"providers":        providers,
-		"models":           models,
-		// App 设置页的「Subagent models / Model picker」区块数据源
-		//（tray 的 ModelSettingsSnapshot 解码器）。
-		"modelSettings": map[string]any{
-			"subagents": state.SubagentSettingsSnapshot(st.Dir),
-			"picker":    state.PickerSnapshot(st.Dir),
-			// 视觉卡数据源：enabled/engine/effort/引擎列表/下载状态。
-			"visionBridge": visionBridgeSnapshot(st, reg),
-		},
-	}
-	payload := map[string]any{
-		"targets": map[string]any{"codex": target},
-		"version": version,
+	snapshot := controlplane.BuildSnapshot(controlplane.SnapshotDeps{
+		State: st, Reg: reg, Version: version,
+		Active: probeURL(fmt.Sprintf("http://127.0.0.1:%d/health", defaultPort())),
 		// presence 块：tray 读 effectiveMode 而非自行推导
 		//（两边各自推导必然漂移）。
-		"presence": state.PresenceSnapshot(st.Dir),
-	}
-	raw, err := json.MarshalIndent(payload, "", "  ")
+		Presence:     marshal(state.PresenceSnapshot(st.Dir)),
+		Subagents:    marshal(state.SubagentSettingsSnapshot(st.Dir)),
+		Picker:       marshal(state.PickerSnapshot(st.Dir)),
+		VisionBridge: marshal(visionBridgeSnapshot(st, reg)),
+	})
+	raw, err := json.MarshalIndent(snapshot, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -303,110 +234,39 @@ func controlJSON(st *state.State, reg *registry.Registry) error {
 	return nil
 }
 
-func orderedProviderIDs(reg *registry.Registry) []string {
-	return []string{"zai-coding", "opencode-go", "litellm"}
-}
-
 // controlService：App 化后的服务面 —— 不再经 launchd，直接管进程。
 // 常态下服务由 Model Router App 作为子进程托管（App 退出它也退出）；
 // 这里的 start 是终端救急路径（分离进程，App 之外存活），stop 对
 // pidfile 里的进程发 SIGTERM —— App 托管的与终端拉起的都一样能停。
+// 生命周期实现归 internal/controlplane；这里只做命令面适配。
 func controlService(args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("service requires start|stop|restart|status")
 	}
-	action := args[0]
-	switch action {
+	svc := controlplane.Service{
+		StateDir: state.DefaultDir(), Port: defaultPort(),
+		BinaryPath: selfBinaryPath, Out: os.Stdout,
+	}
+	switch args[0] {
 	case "status":
-		running := probeURL(fmt.Sprintf("http://127.0.0.1:%d/health", defaultPort()))
-		fmt.Printf("service: %s\n", map[bool]string{true: "running", false: "stopped"}[running])
+		fmt.Printf("service: %s\n", map[bool]string{true: "running", false: "stopped"}[svc.Running()])
 		return nil
-	case "start", "restart":
-		if action == "restart" {
-			if err := stopServiceByPidfile(); err != nil {
-				return err
-			}
+	case "start":
+		return svc.StartDetached()
+	case "restart":
+		if err := svc.StopByPidfile(); err != nil {
+			return err
 		}
-		return startServiceDetached()
+		return svc.StartDetached()
 	case "stop":
-		if err := stopServiceByPidfile(); err != nil {
+		if err := svc.StopByPidfile(); err != nil {
 			return err
 		}
 		fmt.Println("service: stopped")
 		return nil
 	default:
-		return fmt.Errorf("unknown service action %q", action)
+		return fmt.Errorf("unknown service action %q", args[0])
 	}
-}
-
-// startServiceDetached 分离进程拉起 serve（终端救急：App 没开时也能有
-// 服务）。Setsid 脱离会话，stderr 追加进 router.log 保留线索。
-func startServiceDetached() error {
-	if probeURL(fmt.Sprintf("http://127.0.0.1:%d/health", defaultPort())) {
-		fmt.Println("service: already running")
-		return nil
-	}
-	exe, err := selfBinaryPath()
-	if err != nil {
-		return err
-	}
-	logFile, err := os.OpenFile(filepath.Join(state.DefaultDir(), "router.log"),
-		os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
-	if err != nil {
-		logFile = nil
-	}
-	cmd := exec.Command(exe, "serve",
-		"--state", state.DefaultDir(), "--port", fmt.Sprintf("%d", defaultPort()))
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	if logFile != nil {
-		cmd.Stdout = logFile
-		cmd.Stderr = logFile
-	}
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("spawn serve: %w", err)
-	}
-	if logFile != nil {
-		defer logFile.Close()
-	}
-	// 等 /health 就绪再报成功 —— 立即返回会让调用方误判。
-	for i := 0; i < 40; i++ {
-		time.Sleep(250 * time.Millisecond)
-		if probeURL(fmt.Sprintf("http://127.0.0.1:%d/health", defaultPort())) {
-			fmt.Println("service: started")
-			return nil
-		}
-	}
-	return fmt.Errorf("serve spawned but /health did not come up within 10s (see router.log)")
-}
-
-// stopServiceByPidfile 读状态目录的 pidfile，对进程发 SIGTERM。
-// pidfile 缺失/进程已死都视为已停止（清掉陈旧文件）。
-func stopServiceByPidfile() error {
-	pidfile := filepath.Join(state.DefaultDir(), "router.pid")
-	raw, err := os.ReadFile(pidfile)
-	if err != nil {
-		if probeURL(fmt.Sprintf("http://127.0.0.1:%d/health", defaultPort())) {
-			return fmt.Errorf("service is answering /health but wrote no pidfile; stop it from its owner (the app or its terminal)")
-		}
-		return nil
-	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
-	if err != nil || pid <= 0 {
-		os.Remove(pidfile)
-		return nil
-	}
-	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
-		return fmt.Errorf("signal %d: %w", pid, err)
-	}
-	// 等优雅退出（最长 5s），超时不强杀 —— 请求有 10s 的排空预算。
-	for i := 0; i < 20; i++ {
-		time.Sleep(250 * time.Millisecond)
-		if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
-			os.Remove(pidfile)
-			return nil
-		}
-	}
-	return nil
 }
 
 // controlProvidersList 的 JSON 输出形状对齐 tray 的
@@ -422,11 +282,7 @@ func controlProvidersList(st *state.State, reg *registry.Registry, asJSON bool) 
 	}
 	if asJSON {
 		entries := []map[string]any{}
-		for _, id := range orderedProviderIDs(reg) {
-			p := reg.Providers[id]
-			if p == nil || p.VariantOf != "" {
-				continue
-			}
+		for _, p := range controlplane.OrderedProviders(reg, func(id string) bool { return enabled[id] }) {
 			_, source := resolver.Resolve(p)
 			entries = append(entries, map[string]any{
 				"id": p.ID, "displayName": p.DisplayName, "kind": p.Kind,
@@ -438,11 +294,7 @@ func controlProvidersList(st *state.State, reg *registry.Registry, asJSON bool) 
 		fmt.Println(string(raw))
 		return nil
 	}
-	for _, id := range orderedProviderIDs(reg) {
-		p := reg.Providers[id]
-		if p == nil {
-			continue
-		}
+	for _, p := range controlplane.OrderedProviders(reg, func(id string) bool { return enabled[id] }) {
 		_, source := resolver.Resolve(p)
 		status := "disabled"
 		if enabled[p.ID] {

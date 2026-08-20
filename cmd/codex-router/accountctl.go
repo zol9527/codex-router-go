@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/loyd/codex-router/internal/controlplane"
 	"github.com/loyd/codex-router/internal/cred"
 	"github.com/loyd/codex-router/internal/registry"
 	"github.com/loyd/codex-router/internal/state"
@@ -50,7 +51,7 @@ func controlProviderUsage(stateDir string, reg *registry.Registry) error {
 	seeds := []usage.ProviderSeed{
 		{ID: "openai", DisplayName: "ChatGPT (native)", CredentialType: "oauth"},
 	}
-	for _, id := range orderedProviderIDs(reg) {
+	for _, id := range controlplane.ProviderOrder() {
 		p := reg.Providers[id]
 		if p == nil || p.VariantOf != "" {
 			continue

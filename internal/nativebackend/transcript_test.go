@@ -1,4 +1,4 @@
-package server
+package nativebackend
 
 import (
 	"strings"
@@ -8,7 +8,7 @@ import (
 // native 代读必须走流式：后端对非流式 400 {"detail":"Stream must be set
 // to true"}（2026-08-16 错误体实锤）。解析聚合 output_text delta，
 // completed 的完整 output 兜底。
-func TestParseNativeTranscriptStream(t *testing.T) {
+func TestParseTranscriptStream(t *testing.T) {
 	sse := "event: response.output_item.added\n" +
 		"data: {\"type\":\"response.output_item.added\"}\n\n" +
 		"event: response.output_text.delta\n" +
@@ -16,7 +16,7 @@ func TestParseNativeTranscriptStream(t *testing.T) {
 		"event: response.output_text.delta\n" +
 		"data: {\"type\":\"response.output_text.delta\",\"delta\":\"a dialog.\"}\n\n" +
 		"data: [DONE]\n\n"
-	got, err := parseNativeTranscriptStream([]byte(sse))
+	got, err := ParseTranscriptStream([]byte(sse))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -26,7 +26,7 @@ func TestParseNativeTranscriptStream(t *testing.T) {
 
 	// 无 delta 时回落 completed 的完整 output。
 	completedOnly := "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"content\":[{\"text\":\"from completed\"}]}]}}\n\n"
-	got, err = parseNativeTranscriptStream([]byte(completedOnly))
+	got, err = ParseTranscriptStream([]byte(completedOnly))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -34,7 +34,7 @@ func TestParseNativeTranscriptStream(t *testing.T) {
 		t.Errorf("completed fallback wrong: %q", got)
 	}
 
-	if _, err := parseNativeTranscriptStream([]byte("data: {\"type\":\"response.created\"}\n\ndata: [DONE]\n\n")); err == nil {
+	if _, err := ParseTranscriptStream([]byte("data: {\"type\":\"response.created\"}\n\ndata: [DONE]\n\n")); err == nil {
 		t.Error("empty stream must error")
 	}
 }

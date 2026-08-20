@@ -39,23 +39,9 @@ func (Protocol) Prepare(responsesRequest map[string]any, model *registry.Model) 
 	}, nil
 }
 
-// ApplyRequestTranslation：直通协议不施加画像（Responses 字段上游
-// 原样认得；effort 等控制由 Codex 的 reasoning 对象自带）。
-func (Protocol) ApplyRequestProfile(_ map[string]any, _ string, _ *registry.Model) {}
-
 // NeedsResponseTranslation：上游本来就是 Responses —— 直通。
+// 直通协议不实现 ResponseTranslator：响应字节原样转发，不存在翻译。
 func (Protocol) NeedsResponseTranslation() bool { return false }
-
-// NewStreamTranslator / TranslateNonStream：直通协议不会被调用
-// （server 对 NeedsResponseTranslation=false 的响应原样转发）；
-// 实现为防御性 panic，误用时立刻暴露而不是悄悄错误翻译。
-func (Protocol) NewStreamTranslator(_ *registry.Model, _ wire.StreamOptions) wire.StreamTranslator {
-	panic("responses protocol relays bytes verbatim; no stream translation exists")
-}
-
-func (Protocol) TranslateNonStream(_ map[string]any, _ *registry.Model, _ wire.StreamOptions) map[string]any {
-	panic("responses protocol relays bytes verbatim; no non-stream translation exists")
-}
 
 func init() {
 	wire.Register(Protocol{})

@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/loyd/codex-router/internal/httpx"
@@ -71,6 +70,16 @@ func (r *Runner) Run(request Request) {
 		request.Sink.WriteJSON(http.StatusInternalServerError, errBody("protocol_unavailable", err.Error()))
 		return
 	}
+	// 直通协议响应字节原样转发；翻译协议必须实现 ResponseTranslator
+	//（注册期契约，违反即显式失败，不静默降级）。
+	var translator wire.ResponseTranslator
+	if proto.NeedsResponseTranslation() {
+		translator, err = wire.TranslatorFor(proto)
+		if err != nil {
+			request.Sink.WriteJSON(http.StatusInternalServerError, errBody("protocol_unavailable", err.Error()))
+			return
+		}
+	}
 	prepared, err := proto.Prepare(request.Payload, request.Model)
 	if err != nil {
 		request.Sink.WriteJSON(http.StatusBadRequest, errBody("invalid_request_error", err.Error()))
@@ -95,10 +104,10 @@ func (r *Runner) Run(request Request) {
 		return
 	}
 	if !prepared.Stream {
-		r.runNonStream(request, target, headers, normalized, proto, prepared, nsIndex, estimate, providerID, started)
+		r.runNonStream(request, target, headers, normalized, translator, prepared, nsIndex, estimate, providerID, started)
 		return
 	}
-	r.runStream(request, target, headers, normalized, proto, prepared, nsIndex, estimate, providerID, started)
+	r.runStream(request, target, headers, normalized, translator, prepared, nsIndex, estimate, providerID, started)
 }
 
 // RunCompaction 执行一次非流式 compaction provider 回合。
@@ -207,7 +216,18 @@ func (r *Runner) RunCompaction(request Request) (CompactionResult, bool) {
 			DurationMs: time.Since(started).Milliseconds()})
 		return CompactionResult{}, false
 	}
-	response := proto.TranslateNonStream(upstreamBody, request.Model, wire.StreamOptions{})
+	// 直通协议的 compaction 响应本来就是 Responses 形状，直接提取；
+	// 翻译协议才需要转回。（旧实现无条件调翻译方法，直通 provider
+	// 一配即 panic —— 接口拆分后这里显式分流。）
+	response := upstreamBody
+	if proto.NeedsResponseTranslation() {
+		translator, terr := wire.TranslatorFor(proto)
+		if terr != nil {
+			request.Sink.WriteJSON(http.StatusInternalServerError, errBody("protocol_unavailable", terr.Error()))
+			return CompactionResult{}, false
+		}
+		response = translator.TranslateNonStream(upstreamBody, request.Model, wire.StreamOptions{})
+	}
 	result := CompactionResult{Summary: extractCompactionSummary(response)}
 	result.PromptTokens, result.CompletionTokens = extractCompactionUsage(upstreamBody)
 	return result, true
@@ -317,7 +337,7 @@ func (r *Runner) runDirect(request Request, target string, headers map[string]st
 }
 
 func (r *Runner) runNonStream(request Request, target string, headers map[string]string,
-	body []byte, proto wire.Protocol, prepared *wire.Request, nsIndex *translate.NamespaceIndex,
+	body []byte, translator wire.ResponseTranslator, prepared *wire.Request, nsIndex *translate.NamespaceIndex,
 	estimate int, providerID string, started time.Time) {
 	resp, err := httpx.Fetch(request.Context, http.MethodPost, target, headers, body, r.client(), r.Idle)
 	if err != nil {
@@ -370,7 +390,7 @@ func (r *Runner) runNonStream(request Request, target string, headers map[string
 			DurationMs: time.Since(started).Milliseconds()})
 		return
 	}
-	response := proto.TranslateNonStream(upstreamBody, request.Model, wire.StreamOptions{
+	response := translator.TranslateNonStream(upstreamBody, request.Model, wire.StreamOptions{
 		SessionModel: request.Model.Slug, EstimateInput: estimate,
 		NamespaceIndex: nsIndex, CustomTools: prepared.CustomTools,
 	})
@@ -383,12 +403,12 @@ func (r *Runner) runNonStream(request Request, target string, headers map[string
 }
 
 func (r *Runner) runStream(request Request, target string, headers map[string]string,
-	body []byte, proto wire.Protocol, prepared *wire.Request, nsIndex *translate.NamespaceIndex,
+	body []byte, translator wire.ResponseTranslator, prepared *wire.Request, nsIndex *translate.NamespaceIndex,
 	estimate int, providerID string, started time.Time) {
 	relay := NewStreamRelay(request.Sink)
 	streamOpts := wire.StreamOptions{SessionModel: request.Model.Slug,
 		EstimateInput: estimate, NamespaceIndex: nsIndex, CustomTools: prepared.CustomTools}
-	first, firstErr := r.RunAttempt(request.Context, target, headers, body, request.Model, proto, streamOpts, relay)
+	first, firstErr := r.RunAttempt(request.Context, target, headers, body, request.Model, translator, streamOpts, relay)
 	if firstErr != nil {
 		var failure *UpstreamFailure
 		if errors.As(firstErr, &failure) {
@@ -566,45 +586,4 @@ func boolText(cond bool, text string) string {
 		return text
 	}
 	return ""
-}
-
-// 保留全局限流状态，避免同一错误形状在高并发下刷屏；日志输出通过
-// Runner.LogTranslationDegraded 注入，server 可继续复用原有审计测试。
-var (
-	degradationLogMu         sync.Mutex
-	degradationLogInterval   = 2 * time.Second
-	degradationLogLast       = map[string]time.Time{}
-	degradationLogSuppressed = map[string]int{}
-)
-
-// LogTranslationDegradation 是默认的翻译降级限流实现。
-func LogTranslationDegradation(prepared *wire.Request, model *registry.Model, logger func(string, ...any)) {
-	if len(prepared.OmittedItemTypes) == 0 && len(prepared.OmittedPartTypes) == 0 {
-		return
-	}
-	slug := ""
-	if model != nil {
-		slug = model.Slug
-	}
-	signature := fmt.Sprintf("%s|%v|%v", slug, prepared.OmittedItemTypes, prepared.OmittedPartTypes)
-	now := time.Now()
-	degradationLogMu.Lock()
-	defer degradationLogMu.Unlock()
-	if last, seen := degradationLogLast[signature]; seen && now.Sub(last) < degradationLogInterval {
-		degradationLogSuppressed[signature]++
-		return
-	}
-	suppressed := degradationLogSuppressed[signature]
-	delete(degradationLogSuppressed, signature)
-	degradationLogLast[signature] = now
-	if logger == nil {
-		return
-	}
-	if suppressed > 0 {
-		logger("chat translation degraded model=%s omitted_item_types=%v omitted_part_types=%v suppressed=%d/2s",
-			slug, prepared.OmittedItemTypes, prepared.OmittedPartTypes, suppressed)
-		return
-	}
-	logger("chat translation degraded model=%s omitted_item_types=%v omitted_part_types=%v",
-		slug, prepared.OmittedItemTypes, prepared.OmittedPartTypes)
 }

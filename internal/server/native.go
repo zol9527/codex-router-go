@@ -53,7 +53,7 @@ func (s *Server) handleNative(w http.ResponseWriter, r *http.Request, route stri
 	normalizeLegacyCustomToolIDs(payload)
 
 	// 凭据被替换的无会话调用方：归一到 native 端点的窄请求面。
-	if s.callerBroughtNoUpstreamCredential(r) {
+	if !s.native.CallerHasCredential(r.Header) {
 		payload["store"] = false
 		for _, key := range nativeUnsupportedParams {
 			delete(payload, key)
@@ -147,49 +147,9 @@ func (s *Server) relayNative(w http.ResponseWriter, resp *nativebackend.RelayRes
 }
 
 // callerForwardHeaders 提取白名单调用方头，并补齐上游凭据兜底。
-// HTTP native 透传与 WS 管道（wsproxy.go）共用。
 // callerForwardHeaders 保留给 WS transport；header 细节由 Native Backend 负责。
 func (s *Server) callerForwardHeaders(r *http.Request) map[string]string {
 	return s.native.Headers(r.Header)
-}
-
-// isRouterLocalToken 判断 bearer token 是否本路由自己的密钥。
-func (s *Server) isRouterLocalToken(header string) bool {
-	token := bearerToken(header)
-	if token == "" {
-		return false
-	}
-	internal := s.opt.State.InternalKey()
-	if subtleEqual(token, s.callerKey) {
-		return true
-	}
-	return internal != "" && subtleEqual(token, internal)
-}
-
-// callerBroughtNoUpstreamCredential：调用方没有携带（有效）上游凭据。
-func (s *Server) callerBroughtNoUpstreamCredential(r *http.Request) bool {
-	header := r.Header.Get("Authorization")
-	if header == "" {
-		return true
-	}
-	token := bearerToken(header)
-	if token == "" {
-		return false // 非 bearer 方案原样透传，不算"无凭据"
-	}
-	return s.isRouterLocalToken(header)
-}
-
-func bearerToken(header string) string {
-	trimmed := strings.TrimSpace(header)
-	const prefix = "bearer"
-	if len(trimmed) <= len(prefix) || !strings.EqualFold(trimmed[:len(prefix)], prefix) {
-		return ""
-	}
-	sep := trimmed[len(prefix)]
-	if sep != ' ' && sep != '\t' {
-		return ""
-	}
-	return strings.TrimSpace(trimmed[len(prefix)+1:])
 }
 
 func subtleEqual(a, b string) bool {
