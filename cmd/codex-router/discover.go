@@ -90,20 +90,29 @@ func cmdDiscover(args []string) error {
 		known[discover.NormalizeID(m.Slug)] = true
 	}
 	knownCount := 0
-	for _, id := range models {
-		if known[discover.NormalizeID(id)] {
+	for _, m := range models {
+		if known[discover.NormalizeID(m.ID)] {
 			knownCount++
 		}
 	}
 
 	fmt.Printf("provider %s (%s, credential: %s)\n", p.ID, baseURL, source)
 	fmt.Printf("upstream reports %d models; %d already routed\n\n", len(models), knownCount)
-	for _, id := range models {
-		if known[discover.NormalizeID(id)] {
-			fmt.Printf("  = %s\n", id)
-		} else {
-			fmt.Printf("  + %s   (not registered — control models add %s %q)\n", id, p.ID, id)
+	for _, m := range models {
+		if known[discover.NormalizeID(m.ID)] {
+			fmt.Printf("  = %s\n", m.ID)
+			continue
 		}
+		// 自报元数据随行走：货架声明的能力是部署级真值，注册时自动采信。
+		hint := ""
+		if m.MaxInputTokens > 0 {
+			hint = fmt.Sprintf("   [self-report %d in", int64(m.MaxInputTokens))
+			if m.MaxOutputTokens > 0 {
+				hint += fmt.Sprintf(" / %d out", int64(m.MaxOutputTokens))
+			}
+			hint += "]"
+		}
+		fmt.Printf("  + %s%s   (not registered — control models add %s %q)\n", m.ID, hint, p.ID, m.ID)
 	}
 	fmt.Println("\n= already routed   + available to register")
 	return nil

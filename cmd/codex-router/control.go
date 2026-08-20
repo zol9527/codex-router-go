@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -898,10 +899,11 @@ func controlModels(st *state.State, reg *registry.Registry, args []string) error
 		fmt.Printf("removed: %s\n", args[1])
 		return nil
 	case "add":
-		if len(args) < 3 {
-			return fmt.Errorf("usage: control models add PROVIDER <upstream-model-id>")
+		overrides, positional := parseModelAddFlags(args[1:])
+		if len(positional) < 2 {
+			return fmt.Errorf("usage: control models add PROVIDER <upstream-model-id> [--efforts minimal,high] [--default-effort high] [--context-window 1048576]")
 		}
-		return runModelSync(st, reg, args[1], args[2])
+		return runModelSync(st, reg, positional[0], positional[1], overrides)
 	case "sync":
 		targets := args[1:]
 		if action == "add" {
@@ -957,7 +959,7 @@ func runModelSyncAll(st *state.State, reg *registry.Registry, targets []string) 
 }
 
 // runModelSync 手动注册单个模型（不经过货架对照，直接建模）。
-func runModelSync(st *state.State, reg *registry.Registry, providerID, upstreamID string) error {
+func runModelSync(st *state.State, reg *registry.Registry, providerID, upstreamID string, overrides discover.ModelOverrides) error {
 	p := reg.Providers[reg.CanonicalProviderID(providerID)]
 	if p == nil {
 		return fmt.Errorf("unknown provider %q", providerID)
@@ -969,7 +971,10 @@ func runModelSync(st *state.State, reg *registry.Registry, providerID, upstreamI
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	entry := discover.BuildEntry(reg, p, upstreamID, st.Dir, ctx)
+	// 单模型注册同样采信上游自报元数据（部署级真值）；货架拉不到
+	// （私有模型未列出、断网）就回落本地猜测链，注册本身不受阻。
+	self := discover.FetchSelfReport(ctx, &http.Client{Timeout: 20 * time.Second}, providerBaseURL(st, p), credential, upstreamID)
+	entry := discover.BuildEntry(reg, p, upstreamID, st.Dir, ctx, self, overrides)
 	entries := registry.ReadUserModels(st.Dir)
 	for _, e := range entries {
 		if e.Model.Slug == entry.Model.Slug {
@@ -987,6 +992,47 @@ func runModelSync(st *state.State, reg *registry.Registry, providerID, upstreamI
 	}
 	signalServerRegistryReload()
 	return nil
+}
+
+// parseModelAddFlags 从 models add 参数里分离覆盖项与位置参数：
+// 位置参数是 PROVIDER 与上游模型 ID，--efforts/--default-effort/
+// --context-window 各取一个后随值。覆盖值与位置参数可任意交错，
+// 缺值的开关按原样留在位置参数里（后续 provider 校验自然报错）。
+func parseModelAddFlags(args []string) (discover.ModelOverrides, []string) {
+	var ov discover.ModelOverrides
+	var positional []string
+	for i := 0; i < len(args); i++ {
+		takeValue := func() (string, bool) {
+			if i+1 >= len(args) {
+				return "", false
+			}
+			i++
+			return args[i], true
+		}
+		switch args[i] {
+		case "--efforts":
+			if v, ok := takeValue(); ok {
+				for _, part := range strings.Split(v, ",") {
+					if part = strings.TrimSpace(part); part != "" {
+						ov.Efforts = append(ov.Efforts, part)
+					}
+				}
+			}
+		case "--default-effort":
+			if v, ok := takeValue(); ok {
+				ov.DefaultEffort = strings.TrimSpace(v)
+			}
+		case "--context-window":
+			if v, ok := takeValue(); ok {
+				if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+					ov.ContextWindow = n
+				}
+			}
+		default:
+			positional = append(positional, args[i])
+		}
+	}
+	return ov, positional
 }
 
 // signalServerRegistryReload 向 serve 进程发 SIGUSR1（读 router.pid）。

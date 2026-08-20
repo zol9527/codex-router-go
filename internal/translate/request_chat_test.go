@@ -259,27 +259,40 @@ func TestOmittedTypesCollected(t *testing.T) {
 	}
 }
 
-// GLM effort 阶梯：请求档钳到模型声明档。
-func TestGLMEffort(t *testing.T) {
+// effort 区间映射：请求档归到绝对距离最近的声明档（平手取低），
+// 顶档取模型最高声明档。相比旧 glmEffort 的"就近向下"语义，中点
+// 归属保意图（deepseek [minimal,high] 收 medium → high，不再静默
+// 塌到 minimal）；未知/缺失请求档返回 ""（调用方删参或透传，不再
+// 冒充 high —— 让模型自身默认接管）。
+func TestClampEffort(t *testing.T) {
 	cases := []struct {
 		requested string
 		levels    []string
 		want      string
 	}{
+		// GLM-5.3 [low, high, max]：与旧"就近向下"完全一致（medium 平手取低）
 		{"low", []string{"low", "high", "max"}, "low"},
 		{"medium", []string{"low", "high", "max"}, "low"},
 		{"high", []string{"low", "high", "max"}, "high"},
 		{"xhigh", []string{"low", "high", "max"}, "max"},
 		{"ultra", []string{"low", "high", "max"}, "max"},
-		{"low", []string{"high", "max"}, "high"}, // 低于下限落在下限
-		{"max", []string{"high", "max"}, "max"},
-		{"high", []string{"max"}, "max"},           // 单档模型由外层删参数，钳制函数钳到唯一档
-		{"bogus", []string{"low", "high"}, "high"}, // 未知值按 high 对待（Node 版行为）
-		{"", []string{"low", "high"}, "high"},      // 缺失同样按 high
+		{"minimal", []string{"low", "high", "max"}, "low"}, // 低于下限落在下限
+		// deepseek [minimal, high]：区间语义的核心场景（2026-08-20
+		// explorer spawn 三连拒的直接解法）
+		{"low", []string{"minimal", "high"}, "minimal"},
+		{"medium", []string{"minimal", "high"}, "high"}, // 距 high 1 级、距 minimal 2 级
+		{"high", []string{"minimal", "high"}, "high"},
+		{"xhigh", []string{"minimal", "high"}, "high"}, // 顶档取最高声明档
+		{"minimal", []string{"minimal", "high"}, "minimal"},
+		// 单档/异常
+		{"high", []string{"max"}, "max"},              // 单档模型由外层删参数，钳制函数钳到唯一档
+		{"bogus", []string{"low", "high"}, ""},        // 未知值不再冒充 high（语义变化）
+		{"", []string{"low", "high"}, ""},             // 缺失同样返回空
+		{"high", []string{"turbo", "ultra"}, "ultra"}, // 阶梯外的声明名被过滤，只认 ultra
 	}
 	for _, tc := range cases {
-		if got := glmEffort(tc.requested, tc.levels); got != tc.want {
-			t.Errorf("glmEffort(%q, %v) = %q, want %q", tc.requested, tc.levels, got, tc.want)
+		if got := ClampEffort(tc.requested, tc.levels); got != tc.want {
+			t.Errorf("ClampEffort(%q, %v) = %q, want %q", tc.requested, tc.levels, got, tc.want)
 		}
 	}
 }
@@ -550,5 +563,25 @@ func TestCustomToolCallNonStream(t *testing.T) {
 	}
 	if item["call_id"] != "call_y" {
 		t.Errorf("custom_tool_call call_id must survive, got %v", item["call_id"])
+	}
+}
+
+// 空 profile（自定义模型）的 effort 区间钳制：声明 [minimal, high] 的
+// 模型收到 medium 请求时发上游 high（距离最近档），杜绝"Codex 词汇
+// 档位上游不认"的 400；未声明档位的模型保持原样透传。
+func TestApplyRequestProfileDefaultClampsEffort(t *testing.T) {
+	body := map[string]any{"model": "volcengine/deepseek-v4-flash"}
+	ApplyRequestProfile(body, "medium", &registry.Model{
+		Slug: "litellm/deepseek", RequestProfile: "",
+		ReasoningLevels: []registry.ReasoningLevel{{Effort: "minimal"}, {Effort: "high"}},
+	})
+	if got := body["reasoning_effort"]; got != "high" {
+		t.Errorf("medium must clamp to high, got %v", got)
+	}
+
+	body = map[string]any{"model": "plain"}
+	ApplyRequestProfile(body, "high", &registry.Model{Slug: "litellm/plain", RequestProfile: ""})
+	if got := body["reasoning_effort"]; got != "high" {
+		t.Errorf("undeclared levels must pass through, got %v", got)
 	}
 }

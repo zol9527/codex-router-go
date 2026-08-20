@@ -14,6 +14,7 @@ import (
 
 	"github.com/loyd/codex-router/internal/registry"
 	"github.com/loyd/codex-router/internal/state"
+	"github.com/loyd/codex-router/internal/translate"
 )
 
 // NativeModel 是 Codex 原生目录里的一个条目（只声明本 fork 读取的字段，
@@ -40,6 +41,25 @@ func RoutedModel(template NativeModel, m *registry.Model) NativeModel {
 		}
 		levels = append(levels, entry)
 	}
+	// effort 空集兜底：桌面端 ReasoningEffort 拒绝空字符串（"reasoning_effort
+	// must not be empty"，2026-08-20 litellm 动态收录实发：一条模型缺
+	// effort 元数据就让整个 model_catalog_json 解析失败、picker 全灭）。
+	// 未知模型没有元数据命中时给单一 medium 档，default 与档位一致。
+	defaultEffort := m.DefaultEffort
+	if defaultEffort == "" {
+		defaultEffort = "medium"
+	}
+	if len(levels) == 0 {
+		levels = []any{map[string]any{
+			"effort": defaultEffort, "description": "Reasoning effort",
+		}}
+	}
+	// 区间展开：真实档位按原名保留（既有 agent 文件/设置可能引用），
+	// Codex 词汇档位按最近声明档补进发布集 —— Codex 对 spawn 的
+	// reasoning_effort 校验发生在请求到达 router 之前，发布集不覆盖
+	// Codex 词汇就会像 2026-08-20 explorer 那样三连拒后静默 fallback
+	// 到内置代理。展开档在请求侧由 ClampEffort 映回真实档位发上游。
+	levels = expandReasoningLevels(levels)
 
 	next["slug"] = m.Slug
 	next["display_name"] = m.DisplayName
@@ -47,7 +67,7 @@ func RoutedModel(template NativeModel, m *registry.Model) NativeModel {
 	next["priority"] = m.Priority
 	next["visibility"] = "list"
 	next["supported_in_api"] = true
-	next["default_reasoning_level"] = m.DefaultEffort
+	next["default_reasoning_level"] = defaultEffort
 	next["supported_reasoning_levels"] = levels
 	next["context_window"] = m.ContextWindow
 	next["max_context_window"] = m.ContextWindow
@@ -94,6 +114,44 @@ func RoutedModel(template NativeModel, m *registry.Model) NativeModel {
 	}
 	next["multi_agent_version"] = multiAgent
 	return next
+}
+
+// expandReasoningLevels 把模型的真实档位集区间展开成 Codex 可请求的
+// 发布集：真实档位（含阶梯外的自定义名）按原序保留；每个尚未出现的
+// Codex 词汇档位（CodexEffortRungs）若能经 ClampEffort 映到某个真实
+// 档位，则以 "maps to X" 的描述补进。请求侧 ClampEffort 用同一份
+// 声明做逆映射，两层永远一致。
+func expandReasoningLevels(levels []any) []any {
+	declared := make([]string, 0, len(levels))
+	for _, raw := range levels {
+		if entry, ok := raw.(map[string]any); ok {
+			if effort, ok := entry["effort"].(string); ok && effort != "" {
+				declared = append(declared, effort)
+			}
+		}
+	}
+	if len(declared) == 0 {
+		return levels
+	}
+	published := make(map[string]bool, len(declared))
+	for _, name := range declared {
+		published[name] = true
+	}
+	expanded := append([]any{}, levels...)
+	for _, rung := range translate.CodexEffortRungs {
+		if published[rung] {
+			continue
+		}
+		mapped := translate.ClampEffort(rung, declared)
+		if mapped == "" {
+			continue
+		}
+		expanded = append(expanded, map[string]any{
+			"effort":      rung,
+			"description": fmt.Sprintf("Reasoning effort (maps to %s)", mapped),
+		})
+	}
+	return expanded
 }
 
 // FetchNative 抓取 Codex 原生目录：账号态优先，bundled 补充。

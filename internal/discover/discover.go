@@ -1,12 +1,14 @@
 // Package discover：实时模型发现与动态注册。
 //
-// 两个数据源各司其职：
-//   - provider 自己的 /v1/models —— 货架真值（有什么模型、确切 ID）
+// 数据源各司其职：
+//   - provider 自己的 /v1/models —— 货架真值（有什么模型、确切 ID），
+//     部分网关（LiteLLM model_info 体系）还随货架自报能力元数据
 //   - models.dev 开源库 —— 参数真值（上下文窗口、推理、视觉、描述）
 //
 // 注册优先级：models.dev 命中 → 精确参数；未命中 → 同家族克隆兜底
-// （effort 档位这类 models.dev 不表达的形状始终来自家族）。
-// 写入 user-models.json 覆盖层；内嵌注册表已收录的模型不重复注册。
+// （effort 档位这类 models.dev 不表达的形状始终来自家族）；上游自报
+// 的部署级窗口压过两者。写入 user-models.json 覆盖层；内嵌注册表
+// 已收录的模型不重复注册。
 package discover
 
 import (
@@ -24,8 +26,20 @@ import (
 	"github.com/loyd/codex-router/internal/registry"
 )
 
-// FetchModels 拉取 OpenAI 兼容的 /v1/models 全量列表（大小写/别名去重）。
-func FetchModels(ctx context.Context, client *http.Client, baseURL, credential string) ([]string, error) {
+// UpstreamModel 是 /v1/models 货架条目：模型 ID 加上游自报的能力元数据。
+// 自报字段（LiteLLM 的 model_info 体系等）是部署级真值 —— 云厂商托管的
+// 窗口可能与官方模型规格不同（2026-08-20 实证：litellm 代理对
+// volcengine/deepseek-v4-flash 自报 1M input，models.dev 查不到该前缀，
+// 本地猜测链兜到 128k），注册时压过全部本地来源。
+type UpstreamModel struct {
+	ID              string
+	MaxInputTokens  float64 // 上游自报输入上限；0 = 未报
+	MaxOutputTokens float64 // 上游自报输出上限；0 = 未报
+}
+
+// FetchModels 拉取 OpenAI 兼容的 /v1/models 全量列表（大小写/别名去重），
+// 连同上游自报的能力元数据一起返回（报了就有值，没报为零值）。
+func FetchModels(ctx context.Context, client *http.Client, baseURL, credential string) ([]UpstreamModel, error) {
 	url := strings.TrimRight(baseURL, "/") + "/models"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -48,15 +62,19 @@ func FetchModels(ctx context.Context, client *http.Client, baseURL, credential s
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("HTTP %d: %.200s", resp.StatusCode, string(body))
 	}
+	// 数值字段用 float64 接：部分网关按浮点编码（1000000.0），
+	// 直接落整型字段会让整个响应解析失败。
 	var payload struct {
 		Data []struct {
-			ID string `json:"id"`
+			ID              string  `json:"id"`
+			MaxInputTokens  float64 `json:"max_input_tokens"`
+			MaxOutputTokens float64 `json:"max_output_tokens"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, fmt.Errorf("parse response: %w", err)
 	}
-	ids := make([]string, 0, len(payload.Data))
+	models := make([]UpstreamModel, 0, len(payload.Data))
 	seen := map[string]bool{}
 	for _, m := range payload.Data {
 		key := NormalizeID(m.ID)
@@ -64,10 +82,30 @@ func FetchModels(ctx context.Context, client *http.Client, baseURL, credential s
 			continue
 		}
 		seen[key] = true
-		ids = append(ids, m.ID)
+		models = append(models, UpstreamModel{
+			ID:              m.ID,
+			MaxInputTokens:  m.MaxInputTokens,
+			MaxOutputTokens: m.MaxOutputTokens,
+		})
 	}
-	sort.Strings(ids)
-	return ids, nil
+	sort.Slice(models, func(i, j int) bool { return models[i].ID < models[j].ID })
+	return models, nil
+}
+
+// FetchSelfReport 从 /v1/models 里找单个模型的自报元数据（control
+// models add 的单模型注册路径）。货架拉取失败或条目缺失返回 nil ——
+// 注册不因此受阻，只是回落到本地猜测链。
+func FetchSelfReport(ctx context.Context, client *http.Client, baseURL, credential, upstreamID string) *UpstreamModel {
+	models, err := FetchModels(ctx, client, baseURL, credential)
+	if err != nil {
+		return nil
+	}
+	for i := range models {
+		if NormalizeID(models[i].ID) == NormalizeID(upstreamID) {
+			return &models[i]
+		}
+	}
+	return nil
 }
 
 // NormalizeID：上游常见 alias 后缀（:free）与大小写差异不应制造假差异。
@@ -100,7 +138,7 @@ func Sync(ctx context.Context, stateDir string, reg *registry.Registry, provider
 			baseURL = v
 		}
 	}
-	ids, err := FetchModels(ctx, &http.Client{Timeout: 20 * time.Second}, baseURL, credential)
+	shelf, err := FetchModels(ctx, &http.Client{Timeout: 20 * time.Second}, baseURL, credential)
 	if err != nil {
 		report.Err = err
 		return report
@@ -123,12 +161,13 @@ func Sync(ctx context.Context, stateDir string, reg *registry.Registry, provider
 		known[NormalizeID(e.Model.UpstreamModel)] = true
 	}
 
-	for _, id := range ids {
-		if known[NormalizeID(id)] {
-			report.Skipped = append(report.Skipped, id)
+	for i := range shelf {
+		m := &shelf[i]
+		if known[NormalizeID(m.ID)] {
+			report.Skipped = append(report.Skipped, m.ID)
 			continue
 		}
-		entry := buildEntry(p, id, familyCloneSource(reg, providerID, id), stateDir, ctx)
+		entry := buildEntry(p, m.ID, familyCloneSource(reg, providerID, m.ID), m, ModelOverrides{}, stateDir, ctx)
 		if entry.Model.Slug == "" || overlaySlugs[entry.Model.Slug] {
 			continue
 		}
@@ -181,12 +220,25 @@ func commonPrefixLen(a, b string) int {
 	return n
 }
 
+// ModelOverrides 是 control models add 的用户主权声明（--efforts/
+// --default-effort/--context-window）：优先级压过 self-report、
+// models.dev、家族克隆、provider 默认整条猜测链 —— 用户对自己部署
+// 的模型规格拥有最终解释权（模型官方 1M 而网关自报缺失/缩水这类
+// 场景，唯一可靠的来源就是用户本人）。零值字段表示未声明，不覆盖。
+type ModelOverrides struct {
+	Efforts       []string // 真实档位列表（规范阶梯词汇或上游原生名）
+	DefaultEffort string   // 默认档位；随 --efforts 声明而缺省时取首档
+	ContextWindow int      // 上下文窗口（token）
+}
+
 // BuildEntry 用 models.dev 元数据（命中）或家族克隆（兜底）为一个
 // 上游模型构建覆盖层条目。克隆先铺底（effort 档位/画像/compHash 这类
-// 家族形状），models.dev 命中后覆盖可确定的字段。
-func BuildEntry(reg *registry.Registry, p *registry.Provider, upstreamID, stateDir string, ctx context.Context) registry.UserModelEntry {
+// 家族形状），models.dev 命中后覆盖可确定的字段；self（上游自报元数据，
+// 可为 nil）压过两级本地来源；ov（用户主权声明，零值字段不覆盖）
+// 最后落笔压过一切。
+func BuildEntry(reg *registry.Registry, p *registry.Provider, upstreamID, stateDir string, ctx context.Context, self *UpstreamModel, ov ModelOverrides) registry.UserModelEntry {
 	clone := familyCloneSource(reg, p.ID, upstreamID)
-	return buildEntry(p, upstreamID, clone, stateDir, ctx)
+	return buildEntry(p, upstreamID, clone, self, ov, stateDir, ctx)
 }
 
 // acronyms 是派生显示名时按全大写处理的模型家族缩写。
@@ -230,7 +282,7 @@ func planSuffix(display string) string {
 	return ""
 }
 
-func buildEntry(p *registry.Provider, upstreamID string, clone *registry.Model, stateDir string, ctx context.Context) registry.UserModelEntry {
+func buildEntry(p *registry.Provider, upstreamID string, clone *registry.Model, self *UpstreamModel, ov ModelOverrides, stateDir string, ctx context.Context) registry.UserModelEntry {
 	now := time.Now().UTC().Format(time.RFC3339)
 	family := p.ID
 	if p.VariantOf != "" {
@@ -275,6 +327,13 @@ func buildEntry(p *registry.Provider, upstreamID string, clone *registry.Model, 
 	} else if p.DefaultContextWindow > 0 {
 		model.ContextWindow = p.DefaultContextWindow
 		model.AutoCompact = p.DefaultContextWindow * 9 / 10
+		// 未知模型没有 effort 元数据：给单一 medium 档兜底。桌面端
+		// ReasoningEffort 拒绝空串，落空的 default_reasoning_level 会让
+		// 整个 catalog 解析失败（2026-08-20 litellm 实发）。
+		model.DefaultEffort = "medium"
+		model.ReasoningLevels = []registry.ReasoningLevel{
+			{Effort: "medium", Description: "Reasoning effort"},
+		}
 	}
 	entry := registry.UserModelEntry{Model: model, Source: "clone", AddedAt: now}
 
@@ -295,6 +354,32 @@ func buildEntry(p *registry.Provider, upstreamID string, clone *registry.Model, 
 			}
 			entry.Source = "modelsdev"
 		}
+	}
+	// 上游自报窗口最后落笔：部署级真值压过 models.dev/克隆/默认三级
+	// 本地来源。语义映射取保守侧 —— Codex 的 context_window 是含输出
+	// 的总预算而 max_input_tokens 是输入上限，对齐输入上限等于让输出
+	// 预算从输入里扣（宁可早压缩，不虚标溢出）。
+	if self != nil && self.MaxInputTokens > 0 {
+		model.ContextWindow = int(self.MaxInputTokens)
+		model.AutoCompact = int(self.MaxInputTokens * 9 / 10)
+	}
+	// 用户主权声明最后落笔：显式覆盖压过全部来源（含 self-report）。
+	if len(ov.Efforts) > 0 {
+		model.ReasoningLevels = nil
+		for _, effort := range ov.Efforts {
+			model.ReasoningLevels = append(model.ReasoningLevels,
+				registry.ReasoningLevel{Effort: effort, Description: "Reasoning effort"})
+		}
+		if ov.DefaultEffort == "" {
+			model.DefaultEffort = ov.Efforts[0]
+		}
+	}
+	if ov.DefaultEffort != "" {
+		model.DefaultEffort = ov.DefaultEffort
+	}
+	if ov.ContextWindow > 0 {
+		model.ContextWindow = ov.ContextWindow
+		model.AutoCompact = ov.ContextWindow * 9 / 10
 	}
 	entry.Model = model
 	return entry
