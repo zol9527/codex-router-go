@@ -441,21 +441,33 @@ func (r *Runner) runStream(request Request, target string, headers map[string]st
 	}
 
 	if !first.Translator.HasContent() {
-		if !relay.HeadersWritten() && !relay.HasWriteError() && request.Context.Err() == nil {
-			if err := relay.FinishFlushWith(stripTerminalCompletion(first.Events.Bytes())); err != nil {
-				r.record(request, usage.Event{Model: request.Model.Slug, Provider: providerID,
-					Status: 0, DurationMs: time.Since(started).Milliseconds()})
-				return
+		// 空补全有界重试（per-provider 显式开启）：重试拿到内容则改用
+		// 第二次结果走成功路径；错误结局已写回则直接结束；其余情况
+		// （未开启/重试仍空）维持下方原空补全收尾。
+		second, retryRelay, handled := r.attemptEmptyRetry(request, target, headers, body,
+			translator, streamOpts, relay, providerID, started)
+		if handled {
+			return
+		}
+		if second != nil {
+			first, relay = second, retryRelay
+		} else {
+			if !relay.HeadersWritten() && !relay.HasWriteError() && request.Context.Err() == nil {
+				if err := relay.FinishFlushWith(stripTerminalCompletion(first.Events.Bytes())); err != nil {
+					r.record(request, usage.Event{Model: request.Model.Slug, Provider: providerID,
+						Status: 0, DurationMs: time.Since(started).Milliseconds()})
+					return
+				}
 			}
+			if relay.HeadersWritten() {
+				_ = request.Sink.Write([]byte("event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"empty_completion\",\"message\":\"The model returned an empty completion. The router did not retry it.\"}}}\n\n"))
+				_ = request.Sink.Write([]byte("data: [DONE]\n\n"))
+				request.Sink.Flush()
+			}
+			r.record(request, usage.Event{Model: request.Model.Slug, Provider: providerID,
+				Status: http.StatusBadGateway, DurationMs: time.Since(started).Milliseconds(), EmptyCompletion: true})
+			return
 		}
-		if relay.HeadersWritten() {
-			_ = request.Sink.Write([]byte("event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"empty_completion\",\"message\":\"The model returned an empty completion. The router did not retry it.\"}}}\n\n"))
-			_ = request.Sink.Write([]byte("data: [DONE]\n\n"))
-			request.Sink.Flush()
-		}
-		r.record(request, usage.Event{Model: request.Model.Slug, Provider: providerID,
-			Status: http.StatusBadGateway, DurationMs: time.Since(started).Milliseconds(), EmptyCompletion: true})
-		return
 	}
 
 	if !relay.HeadersWritten() && !relay.HasWriteError() && request.Context.Err() == nil {
@@ -473,6 +485,60 @@ func (r *Runner) runStream(request Request, target string, headers map[string]st
 		"status", 200, "duration_ms", time.Since(started).Milliseconds(),
 		"in", first.Translator.PromptTokens(), "out", first.Translator.OutputTokens(),
 		"estimated_input", first.Translator.SubstitutedInputTokens() > 0)
+}
+
+// attemptEmptyRetry 在首轮空补全后做至多一次透明重试。返回值约定：
+//   - second != nil：重试拿到内容，调用方改用该结果与配套的新 relay
+//     走成功路径（首轮 relay 从未提交，直接丢弃即无痕）；
+//   - handled：重试以错误告终，错误响应与计量行已写回，调用方直接结束；
+//   - 两者皆零值：未重试（开关未开/响应头已提交/调用方已断开）或
+//     重试仍为空，调用方维持原空补全收尾。
+//
+// 只在首轮未向调用方提交任何响应头时重试：StreamRelay 在首个活性
+// 事件前保持缓冲，空补全时必然未提交，重放对调用方完全无痕。每次
+// 上游调用都真实计费，首次空补全先落一条审计行（emptyRetry=true）
+// 再发重试，SpendLogs 对账不缺账。重试上限恒为 1：ark 空补全是
+// 时间簇发的非确定失败，一次重试可吸收大部分；无限重试的配额风险
+//（GLM 空参数 exec 死循环教训）由硬上限封死。
+func (r *Runner) attemptEmptyRetry(request Request, target string, headers map[string]string,
+	body []byte, translator wire.ResponseTranslator, streamOpts wire.StreamOptions,
+	relay *StreamRelay, providerID string, started time.Time) (second *AttemptOutcome, retryRelay *StreamRelay, handled bool) {
+
+	if r.RetryEmptyCompletion == nil || request.Provider == nil || !r.RetryEmptyCompletion(request.Provider) {
+		return nil, nil, false
+	}
+	// 响应头已提交（空补全正常不会走到，防御性保留）或调用方已断开
+	// 时不重试：前者无法无痕重放，后者重试结果无人接收。
+	if relay.HeadersWritten() || relay.HasWriteError() || request.Context.Err() != nil {
+		return nil, nil, false
+	}
+	r.record(request, usage.Event{Model: request.Model.Slug, Provider: providerID,
+		Status: http.StatusBadGateway, DurationMs: time.Since(started).Milliseconds(),
+		EmptyCompletion: true, EmptyRetry: true})
+	r.logWarn(request, "empty completion; retrying once", "model", request.Model.Slug,
+		"provider", request.Provider.ID, "duration_ms", time.Since(started).Milliseconds())
+	retryRelay = NewStreamRelay(request.Sink)
+	second, secondErr := r.RunAttempt(request.Context, target, headers, body, request.Model,
+		translator, streamOpts, retryRelay)
+	if secondErr != nil {
+		var failure *UpstreamFailure
+		if errors.As(secondErr, &failure) {
+			// RunAttempt 在读到响应体之前就拦截 >=400，此时重试 relay
+			// 必未提交，可安全写回 JSON 错误。
+			r.writeUpstreamError(request, failure, started)
+			r.record(request, usage.Event{Model: request.Model.Slug, Provider: providerID,
+				Status: failure.Status, DurationMs: time.Since(started).Milliseconds()})
+			return nil, nil, true
+		}
+		// 网络层/读流中断：交给 failLiveStream 统一收尾（区分 relay
+		// 是否已提交，可能带 stream_interrupted 标记）。
+		r.failLiveStream(request, secondErr, retryRelay, second.Translator, started, usage.Event{})
+		return nil, nil, true
+	}
+	if !second.Translator.HasContent() {
+		return nil, nil, false
+	}
+	return second, retryRelay, false
 }
 
 func (r *Runner) failLiveStream(request Request, err error, relay *StreamRelay,

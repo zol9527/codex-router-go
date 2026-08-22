@@ -57,6 +57,12 @@ type Runner struct {
 	ProviderBaseURL        func(*registry.Provider) string
 	TranslateProviderError ErrorTranslator
 	LogTranslationDegraded func(*wire.Request, *registry.Model)
+	// RetryEmptyCompletion 判定某 provider 是否开启"空补全有界重试"
+	//（上游 200 流正常收尾但零内容时，路由器再试一次）。nil = 全局
+	// 关闭。默认关闭是刻意的：GLM 空参数 exec 死循环的教训是重试必须
+	// 显式 opt-in（见 attemptEmptyRetry），由操作者在 config.toml 按
+	// provider 开启，绝不全局默认。
+	RetryEmptyCompletion func(*registry.Provider) bool
 }
 
 // Request 是一次 Routing Turn 的完整输入。

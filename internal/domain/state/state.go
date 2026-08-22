@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 
@@ -323,6 +324,29 @@ func (s *State) ReadConfigBaseURL(table string) string {
 	}
 	fallback := s.envFileFallback(doc)
 	return strings.TrimSpace(tomlconf.ExpandEnvWith(value, fallback))
+}
+
+// ReadConfigRetryEmpty 读取 provider 表的可选布尔开关
+// retry_empty_completion（空补全有界重试）。与 ReadConfigBaseURL 同一
+// 读取路径：每次调用重读 config.toml，改配置热生效。注意本文件的
+// 值一律是带引号字符串（tomlconf 子集），故写 "true"/"false"。缺省、
+// 解析失败或任何非 true 字面量一律 false —— 重试是选择性行为，永不
+// 因配置笔误意外开启。
+func (s *State) ReadConfigRetryEmpty(table string) bool {
+	raw, err := os.ReadFile(s.ConfigPath())
+	if err != nil {
+		return false
+	}
+	doc, err := tomlconf.Parse(string(raw))
+	if err != nil {
+		return false
+	}
+	value, ok := doc.Get(table, "retry_empty_completion")
+	if !ok {
+		return false
+	}
+	parsed, err := strconv.ParseBool(strings.TrimSpace(value))
+	return err == nil && parsed
 }
 
 // envFileFallback 读取 config.toml [env].file 指向的 dotenv 环境文件。

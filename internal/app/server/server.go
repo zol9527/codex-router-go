@@ -254,6 +254,7 @@ func New(opt Options) (*Server, error) {
 			server.bridgeVision(ctx, header, payload, model)
 		},
 		ProviderBaseURL:        server.providerBaseURL,
+		RetryEmptyCompletion:   server.providerRetryEmpty,
 		TranslateProviderError: translateProviderError,
 		LogTranslationDegraded: func(prepared *wire.Request, model *registry.Model) {
 			logTranslationDegradation(prepared, model)

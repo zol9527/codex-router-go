@@ -427,6 +427,10 @@ const configTemplate = `# Model Router 凭证配置（Claude Code 式）。
 
 [litellm]
 # api_key = "sk-..."
+# retry_empty_completion = "true" # 空补全（上游 200 但零内容）时路由器
+#                                 # 透明重试一次；仅建议对已知存在该上游
+#                                 # 故障的 provider 开启，默认关闭（注意
+#                                 # 本文件值一律为带引号字符串）
 `
 
 // controlConfig：config 子命令。init —— 文件不存在则写模板（0600）

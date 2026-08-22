@@ -243,6 +243,20 @@ func (s *Server) providerBaseURL(p *registry.Provider) string {
 	return registry.ResolveBaseURL(p, configBaseURL)
 }
 
+// providerRetryEmpty 读 config.toml provider 表的 retry_empty_completion
+// 开关（热生效，与 base_url 同一读取路径）。State 为 nil（测试语境）
+// 时恒 false。家族归并同 ResolveBaseURL：协议变体沿家族主表取配置。
+func (s *Server) providerRetryEmpty(p *registry.Provider) bool {
+	if p == nil || s.opt.State == nil {
+		return false
+	}
+	family := p.ID
+	if p.VariantOf != "" {
+		family = p.VariantOf
+	}
+	return s.opt.State.ReadConfigRetryEmpty(family)
+}
+
 func cloneMap(source map[string]any) map[string]any {
 	out := make(map[string]any, len(source))
 	for k, v := range source {
