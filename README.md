@@ -1,3 +1,5 @@
+`cc-switch` and other tools has achieved those features.
+
 # Model Router
 
 > 基于 [duolahypercho/codex-router](https://github.com/duolahypercho/codex-router)；
